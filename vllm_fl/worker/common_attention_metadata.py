@@ -10,7 +10,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 from vllm_fl.compilation.graph import Graph
 
@@ -35,6 +35,7 @@ def supports_accelerator_graph() -> bool:
 def _compute_slot_mapping_graph_kernel(
     max_num_tokens,
     query_start_loc_ptr,
+    seq_lens_ptr,
     positions_ptr,
     block_table_ptr,
     block_table_stride,
@@ -43,6 +44,7 @@ def _compute_slot_mapping_graph_kernel(
     TOTAL_CP_WORLD_SIZE: tl.constexpr,
     TOTAL_CP_RANK: tl.constexpr,
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
     PAD_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -61,6 +63,21 @@ def _compute_slot_mapping_graph_kernel(
 
     start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
     end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
+
+    # Padded request rows are not refreshed by BlockTable.commit_block_table().
+    # Clear them in the existing per-group producer instead of launching one
+    # eager fill per cache group. seq_lens is a fixed-address device buffer, so
+    # the same captured shape can replay with a different actual request count.
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    if seq_len == 0:
+        row_offset = req_idx * block_table_stride
+        for i in range(0, block_table_stride, BLOCK_SIZE):
+            offsets = i + tl.arange(0, BLOCK_SIZE)
+            tl.store(
+                block_table_ptr + row_offset + offsets,
+                NULL_BLOCK_ID,
+                mask=offsets < block_table_stride,
+            )
 
     virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
     row_offset = req_idx * block_table_stride
@@ -123,6 +140,7 @@ def compute_common_attention_metadata(
         _compute_slot_mapping_graph_kernel[(num_reqs + 1,)](
             table.max_num_batched_tokens,
             query_start_loc,
+            seq_lens,
             positions,
             table.block_table.gpu,
             table.block_table.gpu.stride(0),
@@ -131,6 +149,7 @@ def compute_common_attention_metadata(
             TOTAL_CP_WORLD_SIZE=total_cp_world_size,
             TOTAL_CP_RANK=total_cp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=table.cp_kv_cache_interleave_size,
+            NULL_BLOCK_ID=NULL_BLOCK_ID,
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
         )

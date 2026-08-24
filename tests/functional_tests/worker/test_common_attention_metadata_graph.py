@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 from vllm_fl.worker.common_attention_metadata import (
@@ -29,6 +30,10 @@ def _make_block_table(device: torch.device) -> MultiGroupBlockTable:
     )
     table.add_row(([2, 3, 4, 5], [6, 7]), 0)
     table.add_row(([8, 9, 10, 11], [12, 13]), 1)
+    # Simulate stale rows left by a previous larger batch. A real step commits
+    # only active rows; the metadata producer must clear the padded suffix.
+    table.add_row(([14, 15, 16, 17], [18, 19]), 2)
+    table.add_row(([20, 21, 22, 23], [24, 25]), 3)
     table.commit_block_table(4)
     return table
 
@@ -53,6 +58,21 @@ def _expected_slots(
                 )
         expected.append(result)
     return expected
+
+
+def _assert_zero_seq_rows_use_null_block(
+    table: MultiGroupBlockTable,
+    seq_lens: torch.Tensor,
+) -> None:
+    zero_rows = torch.nonzero(seq_lens == 0, as_tuple=False).flatten().cpu().tolist()
+    for group in table.block_tables:
+        for row in zero_rows:
+            torch.testing.assert_close(
+                group.block_table.gpu[row],
+                torch.full_like(group.block_table.gpu[row], NULL_BLOCK_ID),
+                rtol=0,
+                atol=0,
+            )
 
 
 def _assert_matches_vllm_slot_mapping(
@@ -138,12 +158,14 @@ def test_common_attention_metadata_graph_replay_uses_updated_metadata(
         rtol=0,
         atol=0,
     )
+    _assert_zero_seq_rows_use_null_block(table, seq_lens)
 
+    table.commit_block_table(3)
     query_start_loc.copy_(
-        torch.tensor([0, 1, 3, 3, 3], dtype=torch.int32, device=device)
+        torch.tensor([0, 1, 3, 4, 4], dtype=torch.int32, device=device)
     )
-    positions[:3].copy_(torch.tensor([3, 10, 11], dtype=torch.int64, device=device))
-    seq_lens.copy_(torch.tensor([7, 15, 0, 0], dtype=torch.int32, device=device))
+    positions[:4].copy_(torch.tensor([3, 10, 11, 2], dtype=torch.int64, device=device))
+    seq_lens.copy_(torch.tensor([7, 15, 9, 0], dtype=torch.int32, device=device))
     used_graph = runner.run(
         table,
         4,
@@ -163,10 +185,11 @@ def test_common_attention_metadata_graph_replay_uses_updated_metadata(
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
     torch.testing.assert_close(
         num_computed_tokens.cpu(),
-        torch.tensor([6, 13, 0, 0], dtype=torch.int32),
+        torch.tensor([6, 13, 8, 0], dtype=torch.int32),
         rtol=0,
         atol=0,
     )
+    _assert_zero_seq_rows_use_null_block(table, seq_lens)
 
 
 def test_common_attention_metadata_graph_off_runs_eager(
@@ -280,3 +303,51 @@ def test_common_attention_metadata_graph_unavailable_falls_back_to_eager(
         rtol=0,
         atol=0,
     )
+
+
+def test_common_attention_metadata_clears_long_context_padded_rows(
+    device: torch.device,
+) -> None:
+    num_groups = 8
+    num_reqs_padded = 64
+    num_actual_reqs = 62
+    table = MultiGroupBlockTable(
+        max_num_reqs=num_reqs_padded,
+        max_model_len=16512,
+        max_num_batched_tokens=16384,
+        pin_memory=False,
+        device=device,
+        block_sizes=[16] * num_groups,
+        kernel_block_sizes=[16] * num_groups,
+        max_num_blocks=[1025] * num_groups,
+    )
+    for group in table.block_tables:
+        group.block_table.cpu.fill_(1)
+    table.commit_block_table(num_reqs_padded)
+
+    query_start_loc = torch.arange(
+        num_reqs_padded + 1, dtype=torch.int32, device=device
+    )
+    query_start_loc[num_actual_reqs:].fill_(num_actual_reqs)
+    positions = torch.zeros(16384, dtype=torch.int64, device=device)
+    positions[:num_actual_reqs].fill_(16383)
+    seq_lens = torch.zeros(num_reqs_padded, dtype=torch.int32, device=device)
+    seq_lens[:num_actual_reqs].fill_(16384)
+    num_computed_tokens = torch.empty(num_reqs_padded, dtype=torch.int32, device=device)
+
+    compute_common_attention_metadata(
+        table,
+        num_reqs_padded,
+        query_start_loc,
+        positions,
+        seq_lens,
+        num_computed_tokens,
+    )
+    current_platform.torch_device_fn.synchronize()
+
+    for group in table.block_tables:
+        assert torch.all(group.block_table.gpu[num_actual_reqs:] == NULL_BLOCK_ID)
+        assert torch.all(group.block_table.gpu[num_actual_reqs - 1] == 1)
+        assert torch.all(group.slot_mapping.gpu[num_actual_reqs:] == -1)
+    assert torch.all(num_computed_tokens[:num_actual_reqs] == 16383)
+    assert torch.all(num_computed_tokens[num_actual_reqs:] == 0)
