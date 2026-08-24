@@ -333,6 +333,9 @@ def test_common_attention_metadata_clears_long_context_padded_rows(
     positions[:num_actual_reqs].fill_(16383)
     seq_lens = torch.zeros(num_reqs_padded, dtype=torch.int32, device=device)
     seq_lens[:num_actual_reqs].fill_(16384)
+    # seq_len alone does not identify padding; an active row may transiently
+    # carry zero while still owning scheduled query tokens.
+    seq_lens[0] = 0
     num_computed_tokens = torch.empty(num_reqs_padded, dtype=torch.int32, device=device)
 
     compute_common_attention_metadata(
@@ -349,5 +352,8 @@ def test_common_attention_metadata_clears_long_context_padded_rows(
         assert torch.all(group.block_table.gpu[num_actual_reqs:] == NULL_BLOCK_ID)
         assert torch.all(group.block_table.gpu[num_actual_reqs - 1] == 1)
         assert torch.all(group.slot_mapping.gpu[num_actual_reqs:] == -1)
-    assert torch.all(num_computed_tokens[:num_actual_reqs] == 16383)
+    assert num_computed_tokens[0] == -1
+    assert torch.all(num_computed_tokens[1:num_actual_reqs] == 16383)
     assert torch.all(num_computed_tokens[num_actual_reqs:] == 0)
+    for group in table.block_tables:
+        assert torch.all(group.block_table.gpu[0] == 1)

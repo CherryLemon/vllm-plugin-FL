@@ -35,7 +35,6 @@ def supports_accelerator_graph() -> bool:
 def _compute_slot_mapping_graph_kernel(
     max_num_tokens,
     query_start_loc_ptr,
-    seq_lens_ptr,
     positions_ptr,
     block_table_ptr,
     block_table_stride,
@@ -66,10 +65,12 @@ def _compute_slot_mapping_graph_kernel(
 
     # Padded request rows are not refreshed by BlockTable.commit_block_table().
     # Clear them in the existing per-group producer instead of launching one
-    # eager fill per cache group. seq_lens is a fixed-address device buffer, so
-    # the same captured shape can replay with a different actual request count.
-    seq_len = tl.load(seq_lens_ptr + req_idx)
-    if seq_len == 0:
+    # eager fill per cache group. query_start_loc is a fixed-address device
+    # buffer, so the same captured shape can replay with a different actual
+    # request count.
+    # A graph-padded row has no scheduled query tokens. Do not use seq_len as
+    # the predicate: valid scheduler rows can transiently carry seq_len == 0.
+    if start_idx == end_idx:
         row_offset = req_idx * block_table_stride
         for i in range(0, block_table_stride, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
@@ -140,7 +141,6 @@ def compute_common_attention_metadata(
         _compute_slot_mapping_graph_kernel[(num_reqs + 1,)](
             table.max_num_batched_tokens,
             query_start_loc,
-            seq_lens,
             positions,
             table.block_table.gpu,
             table.block_table.gpu.stride(0),
