@@ -258,6 +258,33 @@ class WorkerFL(WorkerBase):
             # Resolve policy before capturing native mm. An override is valid
             # only when FlagGems retains ownership of aten::mm.
             whitelist, blacklist = get_flag_gems_whitelist_blacklist()
+            # Qwen3.8-Flash-Next exposes a multi-GiB transposed PLE cache.
+            # FlagGems index_select can materialize that complete view, while
+            # native ATen accesses only the requested rows. Merge the
+            # model-scoped exclusions with platform defaults; do not mutate
+            # global policy or affect other models.
+            from vllm_fl.patches.qwen3_8_flash_next import (
+                apply_native_index_select_policy,
+                needs_native_index_select,
+                should_skip_generic_flaggems_aten,
+            )
+
+            whitelist, blacklist = apply_native_index_select_policy(
+                vllm_config,
+                whitelist,
+                blacklist,
+                vendor_name=getattr(current_platform, "vendor_name", None),
+            )
+            if not whitelist and needs_native_index_select(vllm_config):
+                logger.info(
+                    "[Qwen3.8-Flash-Next] Using native PLE runtime primitives"
+                )
+
+            skip_generic_flaggems_aten = should_skip_generic_flaggems_aten(
+                vllm_config,
+                vendor_name=getattr(current_platform, "vendor_name", None),
+                whitelist=whitelist,
+            )
             mm_dispatch_enabled = is_mm_dispatch_enabled(whitelist, blacklist)
             native_mm_kernel = None
             if shape_aware_mm_enabled and mm_dispatch_enabled:
@@ -270,7 +297,13 @@ class WorkerFL(WorkerBase):
             should_record = (rank == 0)
 
             # Use whitelist if specified (takes precedence over blacklist)
-            if whitelist:
+            if skip_generic_flaggems_aten:
+                logger.info(
+                    "[Qwen3.8-Flash-Next] NVIDIA keeps native ATen for generic "
+                    "tensor operations; explicit FlagOS/OOT kernels remain "
+                    "enabled"
+                )
+            elif whitelist:
                 logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
                 flag_gems.only_enable(
                     include=whitelist,
