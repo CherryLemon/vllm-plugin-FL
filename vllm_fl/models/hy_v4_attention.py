@@ -11,8 +11,6 @@ The per-head learnable sink is supported through `.flashmla_sparse`, which
 subclasses the platform's sparse MLA backend to forward ``attn_sink``.
 """
 
-import os
-from contextlib import suppress
 from types import SimpleNamespace
 from typing import cast
 
@@ -176,119 +174,6 @@ def _make_hy4_flaggems_mla_prefill_backend() -> type:
     return FlagGemsMLAPrefillBackend
 
 
-def _install_hy4_empty_build_mxfp8_fallback() -> bool:
-    """Use the vLLM MXFP8 emulation paths when ``vllm._C`` is absent.
-
-    HY4's serialized checkpoint uses ModelOpt MXFP8 weights.  The CUDA kernel
-    registry normally prefers Marlin for those weights, but Marlin's weight
-    repack and GEMM entry points are part of the optional vLLM extension.  The
-    wheel used by the empty-build check deliberately omits that extension.
-    Keep the fallback model-local: dense MXFP8 layers use vLLM's load-time
-    MXFP8-to-BF16 emulation kernel and routed experts use the corresponding
-    Triton implementation.  Other models and full vLLM installations keep
-    their normal kernel selection.
-    """
-    # The empty-build wheel can leave either the legacy extension or the
-    # stable libtorch extension absent.  Only enter this path when neither
-    # extension exposes the native Marlin repack operation.  Checking the op
-    # as well as the import is intentional: a stub package may be importable
-    # while still not exporting the ABI used by ModelOpt.
-    native_marlin_repack = False
-    for extension_name in ("vllm._C", "vllm._C_stable_libtorch"):
-        try:
-            __import__(extension_name)
-        except (ImportError, OSError):
-            continue
-        try:
-            native_marlin_repack = hasattr(
-                torch.ops._C, "gptq_marlin_repack"
-            )
-        except (AttributeError, RuntimeError):
-            native_marlin_repack = False
-        if native_marlin_repack:
-            return False
-
-    # Keeping every MXFP8 expert's BF16 expansion resident would exceed an
-    # 80-GiB H100 during the 16-way EP load (the compressed checkpoint fits,
-    # while a transient ``w13`` expansion can request another ~1.5 GiB).
-    # EmulationMxfp8LinearKernel and Mxfp8EmulationTritonExperts both support
-    # the compressed representation and dequantize per operation, so make
-    # that memory-safe mode the empty-build default before importing vLLM's
-    # lazy environment module.
-    os.environ.setdefault("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "0")
-
-    import vllm.envs as envs
-    import vllm.model_executor.kernels.linear as linear_kernels
-    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
-    import vllm.model_executor.layers.quantization.modelopt as modelopt
-    from vllm.model_executor.kernels.linear.mxfp8.emulation import (
-        EmulationMxfp8LinearKernel,
-    )
-    from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
-        Mxfp8LinearLayerConfig,
-    )
-    from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
-        Mxfp8EmulationTritonExperts,
-    )
-    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
-
-    if getattr(linear_kernels, "_hy4_mxfp8_fallback", False):
-        return True
-
-    # ``envs.VLLM_DISABLED_KERNELS`` is a lazy property in vLLM 0.24.  An
-    # in-place append mutates a newly-created list and is discarded on the
-    # next lookup.  Persist the value in the real environment and unwrap the
-    # optional env cache so the kernel registry observes the Marlin disable.
-    disabled = [
-        item
-        for item in os.environ.get("VLLM_DISABLED_KERNELS", "").split(",")
-        if item
-    ]
-    if "MarlinMxfp8LinearKernel" not in disabled:
-        disabled.append("MarlinMxfp8LinearKernel")
-        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(disabled)
-    with suppress(AttributeError, AssertionError):
-        envs.disable_envs_cache()
-
-    # ``modelopt.py`` imported this function by value, so disabling Marlin in
-    # the registry alone is not enough for a future reordered registry.  The
-    # direct wrapper is the model's capability-gated selector and guarantees
-    # that no ``torch.ops._C`` entry is touched during weight loading.
-    def init_hy4_mxfp8_linear_kernel():
-        logger.info_once(
-            "Using EmulationMxfp8LinearKernel for HY4 empty-build MXFP8 GEMM"
-        )
-        return EmulationMxfp8LinearKernel(Mxfp8LinearLayerConfig())
-
-    init_hy4_mxfp8_linear_kernel._hy4_empty_build_fallback = True
-    modelopt.init_mxfp8_linear_kernel = init_hy4_mxfp8_linear_kernel
-    # Keep the public kernel module in sync for callers that access the
-    # selector through its defining module rather than modelopt.py.
-    linear_kernels.init_mxfp8_linear_kernel = init_hy4_mxfp8_linear_kernel
-
-    def select_hy4_mxfp8_moe_backend(config):
-        del config
-        logger.info_once(
-            "Using 'emulation' MXFP8 MoE backend for HY4 empty-build"
-        )
-        return Fp8MoeBackend.EMULATION, Mxfp8EmulationTritonExperts
-
-    # modelopt.py imported the selector by value, therefore patch both its
-    # module and the already-imported reference used by the HY4 quant method.
-    mxfp8_oracle.select_mxfp8_moe_backend = select_hy4_mxfp8_moe_backend
-    modelopt.select_mxfp8_moe_backend = select_hy4_mxfp8_moe_backend
-    linear_kernels._hy4_mxfp8_fallback = True
-
-    # Keep this local marker for diagnostics and make the intended linear
-    # fallback explicit if a future registry reorders candidates unexpectedly.
-    linear_kernels._hy4_mxfp8_fallback_kernel = EmulationMxfp8LinearKernel
-    logger.warning_once(
-        "HY4: vLLM._C is unavailable; using load-time BF16 MXFP8 emulation "
-        "for dense linear and Triton emulation experts for MoE."
-    )
-    return True
-
-
 def _install_hy4_flaggems_fallback() -> bool:
     """Use FlagGems DSA/MLA kernels when the vLLM wheel omits DeepGEMM.
 
@@ -304,7 +189,6 @@ def _install_hy4_flaggems_fallback() -> bool:
         ``True`` when the fallback was installed, ``False`` when DeepGEMM is
         present and the native path should be retained.
     """
-    _install_hy4_empty_build_mxfp8_fallback()
     import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 
     if getattr(sparse_indexer, "_hy4_flaggems_fallback", False):
