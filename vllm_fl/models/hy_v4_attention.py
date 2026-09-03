@@ -242,6 +242,34 @@ def _install_hy4_flaggems_fallback() -> bool:
         return False
 
     try:
+        # FlagGems 5.3.3 advertises Triton TLE support for this runtime, but
+        # the bundled Triton TLE language module is missing ``cumsum``.  Its
+        # TLE top-k kernels therefore fail while Triton is hashing/compiling
+        # the kernel, before any device code can run.  Select the portable
+        # non-TLE kernels (the module keeps both implementations) for HY4's
+        # local fallback.  This does not alter the global FlagGems setting for
+        # other models.
+        import importlib
+
+        top_k_prefill_module = importlib.import_module(
+            "flag_gems.fused.top_k_per_row_prefill"
+        )
+        top_k_decode_module = importlib.import_module(
+            "flag_gems.fused.top_k_per_row_decode"
+        )
+        top_k_prefill_module.HAS_TLE = False
+        top_k_decode_module.HAS_TLE = False
+        # Triton's dependency walker still visits the constexpr-disabled TLE
+        # branch while compiling the non-TLE kernels.  Give that walker a
+        # cache-key-compatible cumsum symbol; the branch is never emitted
+        # because HAS_TLE is false, while the non-TLE path uses tl.cumsum.
+        import triton.language as tl
+
+        for top_k_module in (top_k_prefill_module, top_k_decode_module):
+            tle = getattr(top_k_module, "tle", None)
+            if tle is not None and not hasattr(tle, "cumsum"):
+                tle.cumsum = tl.cumsum
+
         from flag_gems.fused import (
             concat_and_cache_mla as flaggems_concat_and_cache_mla,
             cp_gather_indexer_k_quant_cache,
