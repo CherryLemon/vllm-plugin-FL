@@ -8,9 +8,9 @@ keeps the already validated FlagOS implementation.  Setting
 runtime proves it is an NVIDIA CUDA/Triton path.  There is no silent second
 dispatch path.
 
-QSA pre-indexer dispatch is intentionally unavailable: its official kernel
-consumes the newer fused metadata/work graph, while this plugin is required to
-keep the vLLM 0.24 eager metadata producer/consumer contract.
+QSA uses the official image's fused pre-indexer and QSA math kernels. Only the
+model-side vLLM 0.24 metadata/cache ABI glue remains local; there is no second
+self-developed QSA implementation selected by this dispatch module.
 """
 
 from __future__ import annotations
@@ -64,14 +64,14 @@ def use_official_hc() -> bool:
 
 
 def qwen4_qsa_pre_indexer_status() -> dict[str, Any]:
-    """Describe the deliberate QSA pre-indexer hold for runtime diagnostics."""
+    """Describe the official QSA pre-indexer selected by the vLLM 0.24 adapter."""
 
     return {
-        "backend": "vllm024_eager_qsa",
+        "backend": "official_qsa_pre_indexer",
         "official_kernel_vendored": True,
-        "enabled": False,
-        "reason": "official kernel requires newer fused QSA metadata/work graph",
-        "metadata_graph": "HOLD",
+        "enabled": True,
+        "reason": "official kernel called through the vLLM 0.24 metadata/cache adapter",
+        "metadata_graph": "vllm024_compat",
     }
 
 

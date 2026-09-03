@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cross-vendor QSA owner with FlagTree/Triton kernels."""
+"""vLLM 0.24 ABI owner around the official Qwen4 QSA kernels."""
 
 from __future__ import annotations
 
@@ -92,12 +92,11 @@ def _unpack_qsa_kv_cache(
 
 
 class Qwen3_8FlashNextQSAAttentionBackend(AttentionBackend):
-    """Main K/V cache owner for the Triton QSA transaction.
+    """Main K/V cache owner for the official QSA transaction.
 
-    QSA performs cache update and sparse attention in its model custom op, so
-    it needs vLLM only for cache allocation and device-side metadata building.
-    Owning those interfaces directly avoids coupling the model to a vendor's
-    FlashAttention extension or cache-update ABI.
+    The class is only the vLLM 0.24 integration boundary. All QSA math,
+    selection, sparse attention, and side-cache updates are dispatched through
+    ``vendor.official.qsa``.
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
@@ -105,7 +104,7 @@ class Qwen3_8FlashNextQSAAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "QWEN38_FLASH_NEXT_QSA_FLAGTREE"
+        return "QWEN38_FLASH_NEXT_QSA_OFFICIAL"
 
     @staticmethod
     def get_impl_cls():
@@ -393,7 +392,6 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.topk_indices_buffer[:num_tokens],
                 main_metadata.block_table,
                 side_metadata.token_to_req[:num_tokens],
-                self.scaling,
                 output[:num_tokens],
             )
 

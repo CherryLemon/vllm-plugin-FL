@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Vendored math source; kept under the plugin namespace for the vLLM 0.24
-# adapter. QSA metadata/pre-indexer graph integration remains explicitly
-# HOLD.
+# adapter. This module is the sole runtime owner for QSA scoring, selection,
+# sparse attention, cache stores, and group compression.
 """Triton kernels for the Qwen3.8-Flash-Next weight-free QSA path."""
 
 from __future__ import annotations

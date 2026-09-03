@@ -133,7 +133,6 @@ def test_qsa_cuda_store_and_compress_match_reference():
     ops = _load_qsa_ops()
     device = torch.device("cuda")
     torch.manual_seed(20)
-    table = _qsa_geometry(device)
     cache = torch.full((4, 4, 1, 8), -1.0, dtype=torch.bfloat16, device=device)
     rows = torch.randn(4, 8, dtype=torch.bfloat16, device=device)
     slots = torch.tensor([8, 11, -1, 99], dtype=torch.int64, device=device)
@@ -141,17 +140,58 @@ def test_qsa_cuda_store_and_compress_match_reference():
     ops.qsa_store_cache_rows(cache, slots, rows)
     torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)
 
-    raw = torch.randn(4, 4, 1, 8, dtype=torch.bfloat16, device=device)
+    # The official compressor consumes this step's rows plus a one-block
+    # per-request circular state.  Seed the three committed rows in each ring
+    # so the expected means are deterministic and exercise the cross-step
+    # boundary rather than the former self-developed cache signature.
+    state = torch.zeros(4, 4, 1, 8, dtype=torch.bfloat16, device=device)
+    state[2, :3, 0] = torch.arange(24, dtype=torch.float32, device=device).reshape(
+        3, 8
+    )
+    state[1, :3, 0] = (
+        100 + torch.arange(24, dtype=torch.float32, device=device)
+    ).reshape(3, 8)
+    raw_step = torch.stack(
+        [
+            torch.full((8,), 24, dtype=torch.float32, device=device),
+            torch.full((8,), 124, dtype=torch.float32, device=device),
+        ]
+    ).to(torch.bfloat16).view(2, 1, 8)
+    state_table = torch.tensor([[2], [1]], dtype=torch.int32, device=device)
     req = torch.tensor([0, 1], dtype=torch.int32, device=device)
     logical = torch.tensor([3, 7], dtype=torch.int64, device=device)
+    raw_positions = logical.view(2, 1, 1).expand(-1, 1, 3).contiguous()
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
     compressed_slots = torch.tensor([0, 1], dtype=torch.int64, device=device)
-    expected_pool, expected_pos = qsa_compress_groups_reference(
-        raw.cpu(), table.cpu(), req.cpu(), logical.cpu(), compressed_slots.cpu(), 4
+    expected_pool = torch.stack(
+        [
+            torch.cat([state[2, :3, 0], raw_step[0, 0]], dim=0)
+            .reshape(4, 8)
+            .float()
+            .mean(0),
+            torch.cat([state[1, :3, 0], raw_step[1, 0]], dim=0)
+            .reshape(4, 8)
+            .float()
+            .mean(0),
+        ]
+    ).to(torch.bfloat16).view(2, 1, 8)
+    expected_pos = torch.tensor(
+        [[0, 0, 0], [4, 4, 4]], dtype=torch.int64, device=device
     )
     actual_pool, actual_pos = ops.qsa_compress_groups_with_ratio(
-        raw, table, req, logical, compressed_slots, 4
+        raw_step,
+        raw_positions,
+        state,
+        state_table,
+        req,
+        query_start_loc,
+        logical,
+        compressed_slots,
+        4,
     )
-    torch.testing.assert_close(actual_pool.cpu().float(), expected_pool.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        actual_pool.cpu().float(), expected_pool.float(), rtol=2e-2, atol=2e-2
+    )
     torch.testing.assert_close(actual_pos.cpu(), expected_pos)
 
 

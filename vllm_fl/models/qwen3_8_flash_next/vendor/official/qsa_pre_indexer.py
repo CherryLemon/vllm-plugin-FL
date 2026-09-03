@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Vendored math source; kept under the plugin namespace for the vLLM 0.24
-# adapter. This newer fused entry point is not selected while QSA metadata
-# graph is HOLD.
+# Vendored from the official Qwen3.8-Flash-Next image.  The vLLM 0.24
+# adapter calls this kernel through the model-owned compatibility layer.
 """Fused QSA pre-indexer kernel for Qwen3.8-Flash-Next."""
 
 import torch
