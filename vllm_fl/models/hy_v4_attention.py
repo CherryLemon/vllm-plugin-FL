@@ -49,6 +49,51 @@ _SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention"
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
+def _hy4_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    group_size: int,
+    *,
+    use_ue8m0: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize indexer queries without requiring the optional vLLM ``_C``.
+
+    vLLM 0.24.0's public helper unconditionally dispatches to
+    ``torch.ops._C.per_token_group_fp8_quant`` for CUDA tensors.  Empty-build
+    wheels intentionally omit ``vllm._C``; HY4 already ships the portable
+    FlagGems implementation, so prefer it before touching the optional op.
+    """
+    try:
+        from flag_gems import per_token_group_quant_fp8 as flaggems_quant
+
+        return flaggems_quant(
+            x,
+            group_size,
+            use_ue8m0=use_ue8m0,
+        )
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    # Keep the native vLLM path for validated full builds.  Merely importing
+    # the helper is not sufficient: probing a missing ``_C`` op may raise an
+    # AttributeError/RuntimeError before the helper can execute its Triton
+    # fallback.
+    try:
+        native_op = torch.ops._C.per_token_group_fp8_quant
+    except (AttributeError, RuntimeError):
+        native_op = None
+    if callable(native_op):
+        return per_token_group_quant_fp8(
+            x,
+            group_size,
+            use_ue8m0=use_ue8m0,
+        )
+
+    raise RuntimeError(
+        "HY4 indexer FP8 quantization requires FlagGems or vLLM _C "
+        "per_token_group_fp8_quant"
+    )
+
+
 def _make_hy4_flaggems_mla_prefill_backend() -> type:
     """Build the MLA prefill adapter without importing FA extensions."""
     from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
@@ -517,10 +562,9 @@ class Indexer(nn.Module):
 
         # Only q is quantized here; k quantization is fused with cache insertion.
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = per_token_group_quant_fp8(
+        q_fp8, q_scale = _hy4_per_token_group_quant_fp8(
             q,
             self.quant_block_size,
-            column_major_scales=False,
             use_ue8m0=self.scale_fmt is not None,
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
