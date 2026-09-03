@@ -644,17 +644,36 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
         # ``VLLM_FL_GLM5_PROVIDER=nvidia`` still fails fast as intended.
         sparse_indexer_module = None
         original_has_deep_gemm = None
+        mla_attention_module = None
+        original_get_prefill_backend = None
         if current_platform.is_cuda() and not use_nvidia_reference():
             from vllm.model_executor.layers import sparse_attn_indexer
+            from vllm.model_executor.layers.attention import (
+                mla_attention as mla_attention_module,
+            )
+
+            from vllm_fl.dispatch.backends.flaggems.impl.mla_prefill import (
+                FlagGemsMLAPrefillBackend,
+            )
 
             sparse_indexer_module = sparse_attn_indexer
             original_has_deep_gemm = sparse_indexer_module.has_deep_gemm
             sparse_indexer_module.has_deep_gemm = lambda: True
+            original_get_prefill_backend = (
+                mla_attention_module.get_mla_prefill_backend
+            )
+            mla_attention_module.get_mla_prefill_backend = (
+                lambda _vllm_config: FlagGemsMLAPrefillBackend
+            )
         try:
             super().__init__(*args, **kwargs)
         finally:
             if sparse_indexer_module is not None:
                 sparse_indexer_module.has_deep_gemm = original_has_deep_gemm
+            if mla_attention_module is not None:
+                mla_attention_module.get_mla_prefill_backend = (
+                    original_get_prefill_backend
+                )
         if self.indexer is not None and config.index_kpool_compress:
             indexer = self.indexer
             kpool = int(config.index_kpool)
