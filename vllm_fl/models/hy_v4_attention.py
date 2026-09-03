@@ -68,7 +68,7 @@ def _hy4_per_token_group_quant_fp8(
         return flaggems_quant(
             x,
             group_size,
-            use_ue8m0=use_ue8m0,
+            scale_ue8m0=use_ue8m0,
         )
     except (ImportError, ModuleNotFoundError):
         pass
