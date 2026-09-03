@@ -633,7 +633,28 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
         vllm_config = kwargs["vllm_config"]
         config = kwargs["config"]
         cache_config = kwargs["cache_config"]
-        super().__init__(*args, **kwargs)
+        # vLLM's base MLA constructor eagerly creates its stock
+        # ``SparseAttnIndexer`` before this class can replace it with the
+        # plugin-owned kpool implementation below.  On a CUDA empty-build
+        # wheel that stock constructor rejects the missing DeepGEMM ABI even
+        # though all runtime indexer operations will be routed through the
+        # portable backend.  Suppress only that constructor-time capability
+        # guard, and only for GLM5's non-NVIDIA provider; the temporary value
+        # is restored before model construction continues.  Explicit
+        # ``VLLM_FL_GLM5_PROVIDER=nvidia`` still fails fast as intended.
+        sparse_indexer_module = None
+        original_has_deep_gemm = None
+        if current_platform.is_cuda() and not use_nvidia_reference():
+            from vllm.model_executor.layers import sparse_attn_indexer
+
+            sparse_indexer_module = sparse_attn_indexer
+            original_has_deep_gemm = sparse_indexer_module.has_deep_gemm
+            sparse_indexer_module.has_deep_gemm = lambda: True
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            if sparse_indexer_module is not None:
+                sparse_indexer_module.has_deep_gemm = original_has_deep_gemm
         if self.indexer is not None and config.index_kpool_compress:
             indexer = self.indexer
             kpool = int(config.index_kpool)
