@@ -243,6 +243,7 @@ def _install_hy4_flaggems_fallback() -> bool:
 
     try:
         from flag_gems.fused import (
+            concat_and_cache_mla as flaggems_concat_and_cache_mla,
             cp_gather_indexer_k_quant_cache,
             flash_mla_sparse_fwd,
             fp8_fp4_mqa_logits,
@@ -301,6 +302,19 @@ def _install_hy4_flaggems_fallback() -> bool:
 
     native_sparse.flash_mla_sparse_fwd = flash_mla_sparse_fwd
     hy4_sparse.flash_mla_sparse_fwd = flash_mla_sparse_fwd
+
+    # The empty vLLM wheel also omits the generic MLA cache-update extension.
+    # AttentionImplBase imports ``vllm._custom_ops`` at call time, so replacing
+    # just this module attribute is sufficient and keeps the fallback scoped
+    # to workers that constructed a HY4 model.
+    import vllm._custom_ops as vllm_custom_ops
+
+    try:
+        native_cache_update = torch.ops._C_cache_ops.concat_and_cache_mla
+    except (AttributeError, RuntimeError):
+        native_cache_update = None
+    if not callable(native_cache_update):
+        vllm_custom_ops.concat_and_cache_mla = flaggems_concat_and_cache_mla
 
     # On Hopper vLLM 0.24's automatic prefill selector only considers
     # FlashAttention.  The empty wheel intentionally stubs that extension,
