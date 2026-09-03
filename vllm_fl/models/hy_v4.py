@@ -52,6 +52,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_fl.configs.hy_v4 import HYV4Config
 from vllm_fl.models.hy_v4_attention import (
     HYV4MLAAttention,
+    _install_hy4_empty_build_mxfp8_fallback,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
 )
@@ -714,6 +715,10 @@ class HYV4ForCausalLM(
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # Keep direct model construction (outside the plugin registration
+        # callback) safe as well: ModelOpt chooses MXFP8 linear kernels before
+        # the first decoder layer exists.
+        _install_hy4_empty_build_mxfp8_fallback()
         super().__init__()
         config = typing.cast(HYV4Config, vllm_config.model_config.hf_config)
         self.config = config

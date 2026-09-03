@@ -11,6 +11,9 @@ The per-head learnable sink is supported through `.flashmla_sparse`, which
 subclasses the platform's sparse MLA backend to forward ``attn_sink``.
 """
 
+import os
+from contextlib import suppress
+from types import SimpleNamespace
 from typing import cast
 
 import regex as re
@@ -46,6 +49,383 @@ logger = init_logger(__name__)
 
 _SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _make_hy4_flaggems_mla_prefill_backend() -> type:
+    """Build the MLA prefill adapter without importing FA extensions."""
+    from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+
+    class FlagGemsMLAPrefillBackend(MLAPrefillBackend):
+        @staticmethod
+        def get_name() -> str:
+            return "HYV4_FLAGGEMS_MLA_PREFILL"
+
+        @classmethod
+        def is_available(cls) -> bool:
+            try:
+                from flag_gems import flash_attn_varlen_func  # noqa: F401
+
+                return True
+            except ImportError:
+                return False
+
+        def _flash_attn_varlen(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            *,
+            cu_seqlens_q: torch.Tensor,
+            cu_seqlens_k: torch.Tensor,
+            max_seqlen_q: int,
+            max_seqlen_k: int,
+            causal: bool,
+            return_softmax_lse: bool,
+            out: torch.Tensor | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            from flag_gems import flash_attn_varlen_func
+
+            # MLA has q/k head dim 576 and value dim 512.  FlagGems accepts
+            # different head dimensions through padding, matching vLLM's
+            # FlashAttention prefill adapter.
+            maybe_padded_v = v
+            if v.shape[-1] != q.shape[-1]:
+                maybe_padded_v = torch.nn.functional.pad(
+                    v, [0, q.shape[-1] - v.shape[-1]], value=0
+                )
+
+            result = flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=maybe_padded_v,
+                max_seqlen_q=max_seqlen_q,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_k=max_seqlen_k,
+                cu_seqlens_k=cu_seqlens_k,
+                softmax_scale=self.scale,
+                causal=causal,
+                return_softmax_lse=return_softmax_lse,
+                # ``out`` has the unpadded value width.  Let the Triton
+                # wrapper allocate when padding is needed, then copy below.
+                out=out if maybe_padded_v is v else None,
+            )
+            lse = None
+            if isinstance(result, tuple):
+                result, lse = result[0], result[1]
+            if maybe_padded_v is not v:
+                result = result[..., : v.shape[-1]]
+                if out is not None:
+                    out.copy_(result)
+                    result = out
+            if return_softmax_lse:
+                assert lse is not None
+                return result, lse
+            return result
+
+        def run_prefill_new_tokens(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            return_softmax_lse: bool,
+            out: torch.Tensor | None = None,
+            output_scale: torch.Tensor | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            if output_scale is not None:
+                raise NotImplementedError(
+                    "HY4 FlagGems MLA prefill does not support quantized output"
+                )
+            metadata = self._prefill_metadata
+            return self._flash_attn_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=metadata.query_start_loc,
+                cu_seqlens_k=metadata.query_start_loc,
+                max_seqlen_q=metadata.max_query_len,
+                max_seqlen_k=metadata.max_query_len,
+                causal=True,
+                return_softmax_lse=return_softmax_lse,
+                out=out,
+            )
+
+        def run_prefill_context_chunk(
+            self,
+            chunk_idx: int,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            metadata = self._prefill_metadata
+            assert metadata.chunked_context is not None
+            chunked = metadata.chunked_context
+            result = self._flash_attn_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=metadata.query_start_loc,
+                cu_seqlens_k=chunked.cu_seq_lens[chunk_idx],
+                max_seqlen_q=metadata.max_query_len,
+                max_seqlen_k=chunked.max_seq_lens[chunk_idx],
+                causal=False,
+                return_softmax_lse=True,
+            )
+            assert isinstance(result, tuple)
+            return result
+
+    return FlagGemsMLAPrefillBackend
+
+
+def _install_hy4_empty_build_mxfp8_fallback() -> bool:
+    """Use the vLLM MXFP8 emulation paths when ``vllm._C`` is absent.
+
+    HY4's serialized checkpoint uses ModelOpt MXFP8 weights.  The CUDA kernel
+    registry normally prefers Marlin for those weights, but Marlin's weight
+    repack and GEMM entry points are part of the optional vLLM extension.  The
+    wheel used by the empty-build check deliberately omits that extension.
+    Keep the fallback model-local: dense MXFP8 layers use vLLM's load-time
+    MXFP8-to-BF16 emulation kernel and routed experts use the corresponding
+    Triton implementation.  Other models and full vLLM installations keep
+    their normal kernel selection.
+    """
+    # The empty-build wheel can leave either the legacy extension or the
+    # stable libtorch extension absent.  Only enter this path when neither
+    # extension exposes the native Marlin repack operation.  Checking the op
+    # as well as the import is intentional: a stub package may be importable
+    # while still not exporting the ABI used by ModelOpt.
+    native_marlin_repack = False
+    for extension_name in ("vllm._C", "vllm._C_stable_libtorch"):
+        try:
+            __import__(extension_name)
+        except (ImportError, OSError):
+            continue
+        try:
+            native_marlin_repack = hasattr(
+                torch.ops._C, "gptq_marlin_repack"
+            )
+        except (AttributeError, RuntimeError):
+            native_marlin_repack = False
+        if native_marlin_repack:
+            return False
+
+    import vllm.envs as envs
+    import vllm.model_executor.kernels.linear as linear_kernels
+    import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
+    import vllm.model_executor.layers.quantization.modelopt as modelopt
+    from vllm.model_executor.kernels.linear.mxfp8.emulation import (
+        EmulationMxfp8LinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+        Mxfp8LinearLayerConfig,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
+        Mxfp8EmulationTritonExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    if getattr(linear_kernels, "_hy4_mxfp8_fallback", False):
+        return True
+
+    # ``envs.VLLM_DISABLED_KERNELS`` is a lazy property in vLLM 0.24.  An
+    # in-place append mutates a newly-created list and is discarded on the
+    # next lookup.  Persist the value in the real environment and unwrap the
+    # optional env cache so the kernel registry observes the Marlin disable.
+    disabled = [
+        item
+        for item in os.environ.get("VLLM_DISABLED_KERNELS", "").split(",")
+        if item
+    ]
+    if "MarlinMxfp8LinearKernel" not in disabled:
+        disabled.append("MarlinMxfp8LinearKernel")
+        os.environ["VLLM_DISABLED_KERNELS"] = ",".join(disabled)
+    with suppress(AttributeError, AssertionError):
+        envs.disable_envs_cache()
+
+    # ``modelopt.py`` imported this function by value, so disabling Marlin in
+    # the registry alone is not enough for a future reordered registry.  The
+    # direct wrapper is the model's capability-gated selector and guarantees
+    # that no ``torch.ops._C`` entry is touched during weight loading.
+    def init_hy4_mxfp8_linear_kernel():
+        logger.info_once(
+            "Using EmulationMxfp8LinearKernel for HY4 empty-build MXFP8 GEMM"
+        )
+        return EmulationMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+
+    init_hy4_mxfp8_linear_kernel._hy4_empty_build_fallback = True
+    modelopt.init_mxfp8_linear_kernel = init_hy4_mxfp8_linear_kernel
+    # Keep the public kernel module in sync for callers that access the
+    # selector through its defining module rather than modelopt.py.
+    linear_kernels.init_mxfp8_linear_kernel = init_hy4_mxfp8_linear_kernel
+
+    def select_hy4_mxfp8_moe_backend(config):
+        del config
+        logger.info_once(
+            "Using 'emulation' MXFP8 MoE backend for HY4 empty-build"
+        )
+        return Fp8MoeBackend.EMULATION, Mxfp8EmulationTritonExperts
+
+    # modelopt.py imported the selector by value, therefore patch both its
+    # module and the already-imported reference used by the HY4 quant method.
+    mxfp8_oracle.select_mxfp8_moe_backend = select_hy4_mxfp8_moe_backend
+    modelopt.select_mxfp8_moe_backend = select_hy4_mxfp8_moe_backend
+    linear_kernels._hy4_mxfp8_fallback = True
+
+    # Keep this local marker for diagnostics and make the intended linear
+    # fallback explicit if a future registry reorders candidates unexpectedly.
+    linear_kernels._hy4_mxfp8_fallback_kernel = EmulationMxfp8LinearKernel
+    logger.warning_once(
+        "HY4: vLLM._C is unavailable; using load-time BF16 MXFP8 emulation "
+        "for dense linear and Triton emulation experts for MoE."
+    )
+    return True
+
+
+def _install_hy4_flaggems_fallback() -> bool:
+    """Use FlagGems DSA/MLA kernels when the vLLM wheel omits DeepGEMM.
+
+    This is deliberately a HY4-local compatibility hook.  The public vLLM
+    wheel's ``SparseAttnIndexer`` hard-gates construction on ``has_deep_gemm``
+    and imports the DeepGEMM MQA functions directly.  FlagGems already ships
+    semantically equivalent Triton implementations, so redirect only the
+    model's indexer module and HY4's sparse MLA backend.  No global vLLM
+    ``has_deep_gemm`` result is changed, and other models retain their normal
+    requirements.
+
+    Returns:
+        ``True`` when the fallback was installed, ``False`` when DeepGEMM is
+        present and the native path should be retained.
+    """
+    _install_hy4_empty_build_mxfp8_fallback()
+    import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+
+    if getattr(sparse_indexer, "_hy4_flaggems_fallback", False):
+        return True
+    if sparse_indexer.has_deep_gemm():
+        return False
+
+    try:
+        from flag_gems.fused import (
+            cp_gather_indexer_k_quant_cache,
+            flash_mla_sparse_fwd,
+            fp8_fp4_mqa_logits,
+            fp8_fp4_paged_mqa_logits,
+            indexer_k_quant_and_cache,
+            top_k_per_row_decode,
+            top_k_per_row_prefill,
+        )
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "HY4 empty-build runtime has no DeepGEMM and FlagGems DSA kernels "
+            "are unavailable; cannot construct sparse attention safely."
+        ) from exc
+
+    # ``sparse_attn_indexer`` captured these names when its custom op was
+    # registered.  Rebind the module globals so the already-registered op
+    # invokes FlagGems' Triton implementation at runtime.
+    sparse_indexer.fp8_fp4_mqa_logits = fp8_fp4_mqa_logits
+    sparse_indexer.fp8_fp4_paged_mqa_logits = fp8_fp4_paged_mqa_logits
+    sparse_indexer.ops = SimpleNamespace(
+        indexer_k_quant_and_cache=indexer_k_quant_and_cache,
+        cp_gather_indexer_k_quant_cache=cp_gather_indexer_k_quant_cache,
+        top_k_per_row_prefill=top_k_per_row_prefill,
+        top_k_per_row_decode=top_k_per_row_decode,
+    )
+
+    # vLLM's CUDA indexer selects ``torch.ops._C.persistent_topk`` for every
+    # decode batch on CUDA (and the cooperative variant for some shapes).
+    # Those are part of the omitted vLLM extension, so make only this module's
+    # platform view report a non-CUDA execution path for that branch.  The
+    # CustomOp dispatcher has already bound ``SparseAttnIndexer.forward_cuda``
+    # using its own platform object; this proxy therefore affects only the
+    # registered Python implementation and leaves the rest of vLLM unchanged.
+    native_sparse_indexer_platform = sparse_indexer.current_platform
+
+    class _HY4FlagGemsIndexerPlatform:
+        def is_cuda(self) -> bool:
+            return False
+
+        def __getattr__(self, name):
+            return getattr(native_sparse_indexer_platform, name)
+
+    sparse_indexer.current_platform = _HY4FlagGemsIndexerPlatform()
+
+    # The constructor's guard is intentionally local to the imported module;
+    # satisfy it only after all of the actual Triton replacements are ready.
+    sparse_indexer.has_deep_gemm = lambda: True
+    sparse_indexer._hy4_flaggems_fallback = True
+
+    # HY4's sink-capable backend imports these functions by value.  Rebind its
+    # globals (and the base module for inherited helper paths) to avoid the
+    # native FlashMLA/NV kernel when the wheel is empty.
+    import vllm.v1.attention.backends.mla.flashmla_sparse as native_sparse
+
+    from vllm_fl.models import hy_v4_flashmla_sparse as hy4_sparse
+
+    native_sparse.flash_mla_sparse_fwd = flash_mla_sparse_fwd
+    hy4_sparse.flash_mla_sparse_fwd = flash_mla_sparse_fwd
+
+    # On Hopper vLLM 0.24's automatic prefill selector only considers
+    # FlashAttention.  The empty wheel intentionally stubs that extension,
+    # even though HY4's sparse path uses MQA only.  Select a FlagGems adapter
+    # so layer construction remains valid and dense future HY4 layers also
+    # have a real Triton prefill implementation.
+    import vllm.model_executor.layers.attention.mla_attention as mla_attention
+    import vllm.v1.attention.backends.mla.prefill as prefill
+    import vllm.v1.attention.backends.mla.prefill.selector as prefill_selector
+
+    def has_callable_flash_attn_varlen() -> bool:
+        """Check the function the FlashAttention backend will actually call.
+
+        The empty-build vLLM wheel keeps the extension module importable and
+        makes its availability probe return true on CUDA, but the exported
+        function is ``None``.  Checking the backend's captured global catches
+        that ABI stub before its constructor asserts.
+        """
+        try:
+            from vllm.v1.attention.backends.mla.prefill import flash_attn
+
+            if callable(getattr(flash_attn, "flash_attn_varlen_func", None)):
+                return True
+        except (ImportError, OSError):
+            pass
+        try:
+            import vllm.vllm_flash_attn as vllm_flash_attn
+
+            return callable(
+                getattr(vllm_flash_attn, "flash_attn_varlen_func", None)
+            )
+        except (ImportError, OSError):
+            return False
+
+    if not getattr(mla_attention, "_hy4_flaggems_prefill_fallback", False):
+        native_get_prefill_backend = mla_attention.get_mla_prefill_backend
+        flaggems_prefill_backend = _make_hy4_flaggems_mla_prefill_backend()
+
+        def get_hy4_prefill_backend(vllm_config):
+            try:
+                backend = native_get_prefill_backend(vllm_config)
+                if (
+                    backend.is_available()
+                    and (
+                        backend.get_name() != "FLASH_ATTN"
+                        or has_callable_flash_attn_varlen()
+                    )
+                ):
+                    return backend
+            except (ImportError, OSError, AssertionError, ValueError):
+                pass
+            return flaggems_prefill_backend
+
+        mla_attention.get_mla_prefill_backend = get_hy4_prefill_backend
+        prefill.get_mla_prefill_backend = get_hy4_prefill_backend
+        prefill_selector.get_mla_prefill_backend = get_hy4_prefill_backend
+        mla_attention._hy4_flaggems_prefill_fallback = True
+
+    logger.warning_once(
+        "HY4: vLLM SparseAttnIndexer has no DeepGEMM; using FlagGems Triton "
+        "indexer/top-k and sparse MLA kernels."
+    )
+    return True
 
 
 def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
@@ -183,6 +563,7 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        _install_hy4_flaggems_fallback()
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
             self.quant_block_size,
@@ -290,6 +671,10 @@ class HYV4MLAAttention(nn.Module):
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
     ) -> None:
+        # Install before MLAAttention's constructor selects/instantiates its
+        # prefill backend.  Indexer construction happens later for some
+        # layers, which is too late for the empty-build FlashAttention stub.
+        _install_hy4_flaggems_fallback()
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size

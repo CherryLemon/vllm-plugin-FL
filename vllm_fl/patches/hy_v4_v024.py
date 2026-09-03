@@ -138,6 +138,17 @@ def apply_hy_v4_v024_patches() -> bool:
     )
     _patch_mxfp8_override_order(me_quant)
 
+    # The ModelOpt linear method selects its kernel while HY4's model object
+    # is being constructed.  Install the empty-build capability fallback at
+    # registration time, before any decoder layer can instantiate a Marlin
+    # kernel.  The hook is idempotent and no-ops when the native extension
+    # provides the Marlin repack ABI.
+    from vllm_fl.models.hy_v4_attention import (
+        _install_hy4_empty_build_mxfp8_fallback,
+    )
+
+    _install_hy4_empty_build_mxfp8_fallback()
+
     registered_loaders = model_loader._LOAD_FORMAT_TO_MODEL_LOADER
     if registered_loaders.get(_LOAD_FORMAT) is not HYV4SafetensorsLoader:
         model_loader.register_model_loader(_LOAD_FORMAT)(HYV4SafetensorsLoader)
