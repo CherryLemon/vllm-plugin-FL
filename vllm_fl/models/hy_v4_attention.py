@@ -208,6 +208,15 @@ def _install_hy4_empty_build_mxfp8_fallback() -> bool:
         if native_marlin_repack:
             return False
 
+    # Keeping every MXFP8 expert's BF16 expansion resident would exceed an
+    # 80-GiB H100 during the 16-way EP load (the compressed checkpoint fits,
+    # while a transient ``w13`` expansion can request another ~1.5 GiB).
+    # EmulationMxfp8LinearKernel and Mxfp8EmulationTritonExperts both support
+    # the compressed representation and dequantize per operation, so make
+    # that memory-safe mode the empty-build default before importing vLLM's
+    # lazy environment module.
+    os.environ.setdefault("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "0")
+
     import vllm.envs as envs
     import vllm.model_executor.kernels.linear as linear_kernels
     import vllm.model_executor.layers.fused_moe.oracle.mxfp8 as mxfp8_oracle
