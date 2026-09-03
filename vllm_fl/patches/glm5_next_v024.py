@@ -27,6 +27,67 @@ _CAUSAL_ARCH = "Glm5NextForCausalLM"
 _CONDITIONAL_ARCH = "Glm5NextForConditionalGeneration"
 _MHC_CUDA_MAX_TOKENS = 0
 
+# Empty-build vLLM wheels do not provide ``vllm._C``/``_moe_C``.  GLM5's
+# portable unquantized-MoE path still needs the dispatch-owned alignment and
+# Triton-kernel entry points, but older launch recipes often whitelist only
+# ``grouped_topk,moe_sum``.  Keep this list model-local: enabling these ops for
+# every model would change the platform-wide CUDA policy, while enabling it
+# when the GLM provider has selected FlagGems is required before the first
+# profile-run/KV-cache probe.
+_GLM5_PORTABLE_MOE_OPS = (
+    "moe_align_block_size",
+    "invoke_fused_moe_triton_kernel",
+)
+
+
+def _enable_glm5_portable_moe_dispatch() -> None:
+    """Make the GLM5 portable MoE path independent of the vLLM CUDA ABI.
+
+    ``register_model`` runs before :class:`WorkerFL` initializes the dispatch
+    registry and calls ``flag_gems.only_enable``.  Add the two dispatch ops
+    required by ``TritonExpertsFL`` to an existing deployment whitelist at
+    that point, and force their per-op order away from ``vendor.cuda``.  The
+    helper is a no-op for the validated NVIDIA/DeepGEMM provider and leaves an
+    unset whitelist unset (the normal FlagGems default already enables all
+    ops).  This is intentionally GLM5-specific; no common/day0-common change
+    is needed for empty-build compatibility.
+    """
+    if use_nvidia_reference():
+        return
+
+    whitelist = os.environ.get("VLLM_FL_FLAGOS_WHITELIST", "").strip()
+    if whitelist:
+        selected = [item.strip() for item in whitelist.split(",") if item.strip()]
+        for op_name in _GLM5_PORTABLE_MOE_OPS:
+            if op_name not in selected:
+                selected.append(op_name)
+        os.environ["VLLM_FL_FLAGOS_WHITELIST"] = ",".join(selected)
+
+    # The CUDA platform config prefers FlagGems, but an explicit per-op
+    # override can still select vendor.cuda.  Replace only these GLM-owned
+    # MoE entries and preserve every unrelated deployment override.
+    per_op = os.environ.get("VLLM_FL_PER_OP", "").strip()
+    entries = [item.strip() for item in per_op.split(";") if item.strip()]
+    rewritten: list[str] = []
+    seen: set[str] = set()
+    portable_order = "flagos|reference"
+    for entry in entries:
+        if "=" in entry:
+            op_name, _order = entry.split("=", 1)
+            op_name = op_name.strip()
+            if op_name in _GLM5_PORTABLE_MOE_OPS:
+                entry = f"{op_name}={portable_order}"
+                seen.add(op_name)
+        rewritten.append(entry)
+    for op_name in _GLM5_PORTABLE_MOE_OPS:
+        if op_name not in seen:
+            rewritten.append(f"{op_name}={portable_order}")
+    os.environ["VLLM_FL_PER_OP"] = ";".join(rewritten)
+    logger.info(
+        "GLM5-Next portable provider enabled FlagGems/Triton MoE ops: %s",
+        ", ".join(_GLM5_PORTABLE_MOE_OPS),
+    )
+
 
 def is_vllm_024() -> bool:
     """Return whether the installed vLLM belongs to the 0.24 ABI line.
@@ -460,6 +521,10 @@ def apply_glm5_next_v024_patches() -> bool:
     """Install idempotent config, convertor, and lazy-model registrations."""
     if not is_vllm_024():
         return False
+
+    # Do this before WorkerFL's provider/FlagGems initialization so the
+    # portable MoE implementations are registered in every worker process.
+    _enable_glm5_portable_moe_dispatch()
 
     from vllm.config.compilation import CompilationConfig
     from vllm.platforms import current_platform
