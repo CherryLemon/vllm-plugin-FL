@@ -36,7 +36,10 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_fl.kernels.glm5_next.provider import get_glm5_provider
+from vllm_fl.kernels.glm5_next.provider import (
+    get_glm5_provider,
+    use_nvidia_reference,
+)
 
 logger = init_logger(__name__)
 
@@ -132,7 +135,7 @@ class FlagGemsSparseMLAMetadataBuilder(
     # kernel can fall back to code containing host scalar reads.
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_BATCH
-        if current_platform.is_cuda() and get_glm5_provider() == "flaggems"
+        if current_platform.is_cuda() and not use_nvidia_reference()
         else AttentionCGSupport.NEVER
     )
 
@@ -190,6 +193,14 @@ class FlagGemsSparseMLAMetadataBuilder(
 class FlagGemsSparseMLABackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    # vLLM 0.24 resolves cudagraph support through the metadata builder, but
+    # newer runners also inspect the backend class. Keep both declarations in
+    # sync so the portable GLM5 path can participate in piecewise capture.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_BATCH
+        if current_platform.is_cuda() and not use_nvidia_reference()
+        else AttentionCGSupport.NEVER
+    )
 
     @staticmethod
     def get_name() -> str:
