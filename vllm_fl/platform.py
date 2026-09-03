@@ -21,7 +21,7 @@ for _extension in ("vllm._C", "vllm._C_stable_libtorch"):
         pass  # Non-CUDA platforms may not ship either extension.
 
 from vllm.logger import init_logger
-from vllm.platforms import Platform, PlatformEnum
+from vllm.platforms import Platform, PlatformEnum, current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -278,17 +278,32 @@ class PlatformFL(Platform):
         # validated NVIDIA MLA backend.  Bypass only for MLA, so this env does
         # not alter ViT/standard attention dispatch.
         if use_mla:
-            from vllm_fl.kernels.glm5_next.provider import get_glm5_provider
+            from vllm_fl.kernels.glm5_next.provider import (
+                get_glm5_provider,
+                use_nvidia_reference,
+            )
 
-            if get_glm5_provider() == "flaggems":
+            provider = get_glm5_provider()
+            auto_portable = (
+                provider == "auto"
+                and current_platform.is_cuda()
+                and not use_nvidia_reference()
+            )
+            if provider == "flaggems" or auto_portable:
                 from vllm_fl.dispatch.backends.flaggems.flaggems import (
                     FlagGemsBackend,
                 )
 
                 flaggems_backend = FlagGemsBackend()
                 if not flaggems_backend.is_available():
+                    if provider == "flaggems":
+                        raise RuntimeError(
+                            "VLLM_FL_GLM5_PROVIDER=flaggems requires FlagGems"
+                        )
                     raise RuntimeError(
-                        "VLLM_FL_GLM5_PROVIDER=flaggems requires FlagGems"
+                        "GLM5 auto provider selected a portable MLA backend "
+                        "because the NVIDIA ABI/DeepGEMM is unavailable, but "
+                        "FlagGems is not installed"
                     )
                 backend_path = flaggems_backend.attention_backend(
                     use_mla=use_mla,
