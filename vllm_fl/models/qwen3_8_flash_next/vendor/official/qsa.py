@@ -14,6 +14,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from ...gpu.nvidia_fast_paths import has_native_topk
+
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
@@ -788,18 +790,43 @@ def qsa_select_paged_tokens(
             compress_ratio,
         )
         blocks = blocks_buffer[: row_end - row_start]
-        use_cooperative_topk = (
-            blocks.shape[0] <= 32
-            and logits.stride(0) % 4 == 0
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
-        )
-        topk_op = (
-            torch.ops._C.cooperative_topk
-            if use_cooperative_topk
-            else torch.ops._C.persistent_topk
-        )
-        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
+        if has_native_topk():
+            use_cooperative_topk = (
+                blocks.shape[0] <= 32
+                and logits.stride(0) % 4 == 0
+                and current_platform.has_device_capability(90)
+                and not current_platform.is_device_capability_family(120)
+            )
+            topk_op = (
+                torch.ops._C.cooperative_topk
+                if use_cooperative_topk
+                else torch.ops._C.persistent_topk
+            )
+            topk_op(
+                logits,
+                visible_blocks,
+                blocks,
+                topk_workspace,
+                block_topk,
+                columns,
+            )
+        else:
+            # The empty vLLM wheel registers the private ``_C`` schemas but
+            # ships no CUDA kernels.  Calling the schema in that situation
+            # raises NotImplementedError during KV-cache profiling.  Keep the
+            # native path capability-gated and use PyTorch's CUDA topk as the
+            # portable fallback; the Triton QSA scoring/expansion kernels
+            # remain unchanged.
+            blocks.fill_(-1)
+            topk_width = min(block_topk, logits.shape[1])
+            if topk_width > 0:
+                selected = torch.topk(
+                    logits, topk_width, dim=1, sorted=False
+                ).indices.to(dtype=blocks.dtype)
+                blocks[:, :topk_width].copy_(selected)
+                ranks = torch.arange(block_topk, device=blocks.device)
+                valid = ranks.unsqueeze(0) < visible_blocks.unsqueeze(1)
+                blocks.masked_fill_(~valid, -1)
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
