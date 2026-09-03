@@ -1186,7 +1186,12 @@ class Qwen3_8FlashNextForConditionalGeneration(
             self._tower_model_names = []
         else:
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-            self._init_video_pruning(multimodal_config)
+            # vLLM 0.24's Qwen3.5 multimodal base does not provide the newer
+            # _init_video_pruning() helper and does not support EVS pruning.
+            # Keep the same 0.24 semantics explicitly for this backport.
+            self.is_multimodal_pruning_enabled = False
+            self.video_pruning_method = None
+            self.video_pruning_rate = 0.0
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
 
             with self._mark_tower_model(vllm_config, {"image", "video"}):
