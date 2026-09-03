@@ -344,6 +344,35 @@ def _install_hy4_flaggems_fallback() -> bool:
     if not callable(native_cache_update):
         vllm_custom_ops.concat_and_cache_mla = flaggems_concat_and_cache_mla
 
+    # The sparse MLA backend also concatenates the no-pe and RoPE query parts
+    # through ``_C_cache_ops.concat_mla_q``.  This tiny operation is absent
+    # from empty-build wheels and has no FlagGems equivalent.  Keep the
+    # preallocated vLLM buffer and copy each slice directly, avoiding a
+    # temporary concatenated tensor (and keeping this fallback local to HY4).
+    try:
+        native_concat_mla_q = torch.ops._C_cache_ops.concat_mla_q
+    except (AttributeError, RuntimeError):
+        native_concat_mla_q = None
+    if not callable(native_concat_mla_q):
+
+        def concat_hy4_mla_q(
+            ql_nope: torch.Tensor,
+            q_pe: torch.Tensor,
+            q_out: torch.Tensor,
+        ) -> None:
+            nope_width = ql_nope.shape[-1]
+            rope_width = q_pe.shape[-1]
+            if q_out.shape[-1] != nope_width + rope_width:
+                raise ValueError(
+                    "HY4 concat_mla_q output width mismatch: "
+                    f"expected {nope_width + rope_width}, "
+                    f"got {q_out.shape[-1]}"
+                )
+            q_out[..., :nope_width].copy_(ql_nope)
+            q_out[..., nope_width:].copy_(q_pe)
+
+        vllm_custom_ops.concat_mla_q = concat_hy4_mla_q
+
     # On Hopper vLLM 0.24's automatic prefill selector only considers
     # FlashAttention.  The empty wheel intentionally stubs that extension,
     # even though HY4's sparse path uses MQA only.  Select a FlagGems adapter
