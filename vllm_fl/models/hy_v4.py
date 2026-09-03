@@ -24,6 +24,13 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
+
+try:
+    from vllm.model_executor.layers.fused_moe import (
+        fused_moe_make_expert_params_mapping,
+    )
+except ImportError:  # vLLM variants without the legacy mapping helper
+    fused_moe_make_expert_params_mapping = None
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -181,6 +188,71 @@ def _try_load_mxfp8_indexer_wk(
     param.weight_loader(param, weight_bf16, 0)
     loaded_params.add(fused_name)
     return True
+
+
+def _make_hyv4_expert_params_mapping(
+    model: nn.Module,
+) -> list[tuple[str, str, int, str]]:
+    """Build the vLLM routed-expert mapping, with a small legacy fallback.
+
+    vLLM 0.24 exports ``fused_moe_make_expert_params_mapping``.  A few
+    plugin images carry the same RoutedExperts ABI without re-exporting that
+    helper, so keep the normal no-EPLB mapping local rather than making HY4
+    import fail before model registration.  EPLB physical-to-logical expert
+    remapping still requires the canonical helper and fails explicitly when
+    it is unavailable.
+    """
+    num_experts = int(model.config.n_routed_experts)
+    num_redundant_experts = int(getattr(model, "n_redundant_experts", 0))
+    helper = fused_moe_make_expert_params_mapping
+    if callable(helper):
+        try:
+            return list(
+                helper(
+                    model,
+                    ckpt_gate_proj_name="gate_proj",
+                    ckpt_down_proj_name="down_proj",
+                    ckpt_up_proj_name="up_proj",
+                    num_experts=num_experts,
+                    num_redundant_experts=num_redundant_experts,
+                )
+            )
+        except (AttributeError, TypeError) as exc:
+            if num_redundant_experts:
+                raise RuntimeError(
+                    "HY4 EPLB loading requires vLLM's expert mapping helper"
+                ) from exc
+
+    if num_redundant_experts:
+        raise RuntimeError(
+            "HY4 EPLB loading requires vLLM's expert mapping helper"
+        )
+
+    mapping = []
+    for expert_id in range(num_experts):
+        mapping.extend(
+            [
+                (
+                    "experts.routed_experts.w13_",
+                    f"experts.{expert_id}.gate_proj.",
+                    expert_id,
+                    "w1",
+                ),
+                (
+                    "experts.routed_experts.w2_",
+                    f"experts.{expert_id}.down_proj.",
+                    expert_id,
+                    "w2",
+                ),
+                (
+                    "experts.routed_experts.w13_",
+                    f"experts.{expert_id}.up_proj.",
+                    expert_id,
+                    "w3",
+                ),
+            ]
+        )
+    return mapping
 
 
 class HYV4HyperConnection(nn.Module):
@@ -833,7 +905,7 @@ class HYV4ForCausalLM(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load HY4, including its checkpoint-packed ModelOpt MXFP8 experts."""
+        """Load HY4 split or packed expert weights and their quant scales."""
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         stacked_mapping = [
@@ -844,6 +916,23 @@ class HYV4ForCausalLM(
         ]
         pending_wk_mxfp8: dict[str, dict[str, torch.Tensor]] = {}
         pending_wk_fp8: dict[str, dict[str, torch.Tensor]] = {}
+        # W8A8 HY4 checkpoints store each routed expert as three independent
+        # tensors (``experts.<id>.{gate,up,down}_proj``), with a matching
+        # ``.weight_scale`` tensor.  RoutedExperts exposes those tensors as
+        # packed ``w13_{weight,weight_scale}``/``w2_{weight,weight_scale}``
+        # parameters, so use vLLM's canonical mapping for both data kinds.
+        # Keep all candidates per source name for EPLB configurations that
+        # map more than one physical expert to the same logical checkpoint
+        # expert.
+        split_expert_mapping: dict[
+            str, list[tuple[str, int, str]]
+        ] = {}
+        for param_name, weight_name, expert_id, shard_id in (
+            _make_hyv4_expert_params_mapping(self)
+        ):
+            split_expert_mapping.setdefault(weight_name, []).append(
+                (param_name, expert_id, shard_id)
+            )
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         skip_topk_layers = compute_skip_topk_layers(self.config)
         tp_rank = get_tensor_model_parallel_rank()
@@ -874,6 +963,51 @@ class HYV4ForCausalLM(
                 pp_missing_layer_names,
             ):
                 continue
+
+            # The W8A8 export uses split per-expert names.  Match the
+            # ``experts.<id>.<projection>.`` part without treating shared
+            # experts (``shared_experts``) as routed experts.  Scales must go
+            # through the same weight loader as weights so channel-wise TP
+            # sharding is preserved.
+            split_mapping = None
+            if ".experts." in name:
+                parts = name.split(".")
+                try:
+                    experts_index = parts.index("experts")
+                    expert_id = int(parts[experts_index + 1])
+                    projection = parts[experts_index + 2]
+                except (ValueError, IndexError):
+                    pass
+                else:
+                    source_name = f"experts.{expert_id}.{projection}."
+                    split_mapping = split_expert_mapping.get(source_name)
+            if split_mapping is not None:
+                mapped = False
+                for target_name, expert_id, shard_id in split_mapping:
+                    mapped_name = name.replace(
+                        source_name, target_name, 1
+                    )
+                    if is_pp_missing_parameter(mapped_name, self):
+                        continue
+                    param = params_dict.get(mapped_name)
+                    if param is None:
+                        continue
+                    loader = typing.cast(Callable[..., bool], param.weight_loader)
+                    if loader(
+                        param,
+                        loaded_weight,
+                        mapped_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    ):
+                        loaded_params.add(mapped_name)
+                        mapped = True
+                # An expert not owned by this EP rank is still a recognized
+                # checkpoint tensor; do not let it fall through to the
+                # generic unexpected-parameter error.
+                if split_mapping or mapped:
+                    continue
 
             if name.endswith("learnable_sink_param"):
                 start = tp_rank * local_heads
