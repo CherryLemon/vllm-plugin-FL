@@ -6638,6 +6638,15 @@ class ModelRunnerFL(
             original_pools[id(instance)] = instance.graph_pool
             instance.graph_pool = profiling_pool
 
+        # The common-attention metadata producer captures its own graphs before
+        # the decoder wrapper is entered.  Keep those profiling graphs in the
+        # same temporary pool as the decoder graphs.  If they use the global
+        # runtime pool here, the profiling cleanup drops the last graph owning
+        # that pool; the first real decoder capture then reuses a zero-refcount
+        # CachingHostAllocator pool and aborts in capture_begin().
+        original_metadata_pool = self.common_attention_metadata_graph.graph_pool
+        self.common_attention_metadata_graph.graph_pool = profiling_pool
+
         shared_memory_estimate = {}
         per_graph_estimate = {}
         encoder_memory_estimate = 0
@@ -6710,6 +6719,7 @@ class ModelRunnerFL(
             self.cudagraph_dispatcher.keys_initialized = False
             self.maybe_remove_all_loras(self.lora_config)
             self._cleanup_profiling_kv_cache()
+            self.common_attention_metadata_graph.graph_pool = original_metadata_pool
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are

@@ -422,6 +422,23 @@ class Glm5NextForCausalLMConfig(HybridAttentionMambaModelConfig):
     def verify_and_update_config(cls, vllm_config) -> None:
         HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
 
+        # GLM5-Next's TP16 mHC/all-reduce path is not safe to capture with
+        # vLLM 0.24's breakable CUDA-graph allocator when the generic O2/O3
+        # ``fuse_allreduce_rms`` pass is enabled.  The failure happens during
+        # the first graph capture (CachingHostAllocator use-count assertion),
+        # before the server can become ready.  The reference GLM5 deployment
+        # uses FULL_AND_PIECEWISE with this pass disabled.  Keep eager mode's
+        # existing behavior intact while making graph mode safe by default;
+        # an explicit ``--enforce-eager`` still leaves the fusion enabled.
+        if not getattr(vllm_config.model_config, "enforce_eager", False):
+            pass_config = vllm_config.compilation_config.pass_config
+            if pass_config.fuse_allreduce_rms is not False:
+                pass_config.fuse_allreduce_rms = False
+                logger.info(
+                    "GLM5-Next: disabled fuse_allreduce_rms for CUDA-graph "
+                    "capture safety on the vLLM 0.24 ABI"
+                )
+
         text_config = vllm_config.model_config.hf_text_config
         cache_config = vllm_config.cache_config
         if cache_config.cache_dtype == "bfloat16":
