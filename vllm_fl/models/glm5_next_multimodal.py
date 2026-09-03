@@ -17,7 +17,7 @@ Default (flag off) is bit-identical to the inherited eager forward.
 
 from collections.abc import Mapping
 from functools import partial
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ from vllm.distributed import (
     parallel_state,
     utils as dist_utils,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
@@ -67,6 +68,93 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_fl.kernels.glm5_next.provider import use_nvidia_reference
 from vllm_fl.models.glm5_next import SiluAndMulWithClamp
+
+logger = init_logger(__name__)
+
+
+def _install_glm5_vision_flaggems_fallback() -> None:
+    """Keep GLM5 ViT FlashAttention usable in an empty-build vLLM wheel.
+
+    The empty vLLM build does not ship the native FlashAttention extension.
+    ``vllm_fl`` consequently installs a ``vllm.vllm_flash_attn`` stub whose
+    ``flash_attn_varlen_func`` is ``None``.  vLLM's ViT custom op imports that
+    symbol from ``fa_utils`` at execution time, after the model has already
+    selected the ``FLASH_ATTN`` backend, so changing only the backend selector
+    does not repair the call site.
+
+    This hook is deliberately loaded from the GLM5 model module rather than a
+    common plugin module.  It replaces the imported function references in all
+    vLLM 0.24 layouts seen by GLM5, and remains installed for worker forwards,
+    profile-run, and CUDA-graph replay.  FlagGems currently implements FA2;
+    force that version even if a vendor selector supplied another version.
+    """
+    if not use_nvidia_reference():
+        try:
+            from flag_gems import flash_attn_varlen_func as flaggems_flash_attn
+        except (ImportError, OSError, RuntimeError) as exc:
+            logger.warning(
+                "GLM5 portable vision attention cannot import FlagGems: %s", exc
+            )
+            return
+    else:
+        return
+
+    def _glm5_flaggems_flash_attn_varlen_func(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        # The vLLM wrapper passes ``fa_version`` when the selector can infer
+        # one.  FlagGems' portable implementation is FA2-only.
+        kwargs["fa_version"] = 2
+        result = flaggems_flash_attn(q, k, v, *args, **kwargs)
+        # ViT callers expect only the attention output.  Keep this adapter
+        # tolerant of FlagGems configurations that return an LSE tuple.
+        if isinstance(result, tuple):
+            return result[0]
+        return result
+
+    _glm5_flaggems_flash_attn_varlen_func.__name__ = (
+        "glm5_flaggems_flash_attn_varlen_func"
+    )
+    _glm5_flaggems_flash_attn_varlen_func._glm5_flaggems_vision = True  # type: ignore[attr-defined]
+
+    # ``vit_attn_wrappers`` imports from fa_utils inside the custom-op
+    # implementation on vLLM 0.24.  Newer/vendor layouts may import the same
+    # symbol at module scope; assign both forms and the owning MM module.
+    import vllm.model_executor.layers.attention.mm_encoder_attention as mm_mod
+    import vllm.v1.attention.backends.fa_utils as fa_utils
+    import vllm.v1.attention.ops.vit_attn_wrappers as vit_ops
+
+    fa_utils.flash_attn_varlen_func = _glm5_flaggems_flash_attn_varlen_func
+    vit_ops.flash_attn_varlen_func = _glm5_flaggems_flash_attn_varlen_func
+    mm_mod.flash_attn_varlen_func = _glm5_flaggems_flash_attn_varlen_func
+
+    # ``patch_mm_encoder_attention`` may query this module directly on an
+    # alternate vLLM build.  Repair its optional stub as well, but do not
+    # overwrite a working native implementation.
+    try:
+        import vllm.vllm_flash_attn as vllm_flash_attn
+
+        if getattr(vllm_flash_attn, "flash_attn_varlen_func", None) is None:
+            vllm_flash_attn.flash_attn_varlen_func = (
+                _glm5_flaggems_flash_attn_varlen_func
+            )
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    logger.info_once(
+        "GLM5-Next portable vision attention uses persistent FlagGems FA2 "
+        "fallback for empty-build vLLM"
+    )
+
+
+# Install before the vision tower is constructed.  The assignment is
+# intentionally persistent: profile_run and graph replay execute the vLLM
+# custom op long after MMEncoderAttention.__init__ has returned.
+_install_glm5_vision_flaggems_fallback()
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
