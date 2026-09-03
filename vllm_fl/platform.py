@@ -21,7 +21,7 @@ for _extension in ("vllm._C", "vllm._C_stable_libtorch"):
         pass  # Non-CUDA platforms may not ship either extension.
 
 from vllm.logger import init_logger
-from vllm.platforms import Platform, PlatformEnum, current_platform
+from vllm.platforms import Platform, PlatformEnum
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -286,7 +286,8 @@ class PlatformFL(Platform):
             provider = get_glm5_provider()
             auto_portable = (
                 provider == "auto"
-                and current_platform.is_cuda()
+                and cls.device_type == "cuda"
+                and cls.vendor_name == "nvidia"
                 and not use_nvidia_reference()
             )
             if provider == "flaggems" or auto_portable:
