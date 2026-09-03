@@ -189,6 +189,27 @@
       "reason": "The deterministic 32-token response truncated before the final arithmetic answer; no historical baseline artifact was available for an independent comparison."
     }
   },
+  "precision_semantic_short_regression": {
+    "endpoint": "http://10.8.2.9:18188/v1/chat/completions",
+    "prompt": "You are a calculator. Output exactly one integer and no words: 17*25+3",
+    "expected": "428",
+    "sampling": {
+      "temperature": 0,
+      "top_p": 1,
+      "seed": 0,
+      "max_tokens": 8,
+      "stream": false
+    },
+    "request_count": 3,
+    "http_statuses": [200, 200, 200],
+    "elapsed_seconds": [28.39733009901829, 6.108620197977871, 6.004142391961068],
+    "prompt_tokens": 40,
+    "completion_tokens": 8,
+    "observed_text": "We need answer as calculator, output exactly",
+    "all_outputs_equal": true,
+    "all_exact": false,
+    "reason": "The model's deterministic reasoning prefix needs more than eight completion tokens; this is recorded as an API determinism check, not a semantic pass."
+  },
   "benchmark_1k_1k": {
     "endpoint": "http://10.8.2.9:18188/v1/chat/completions",
     "request_count": 1,
