@@ -270,6 +270,17 @@ def _install_hy4_flaggems_fallback() -> bool:
             if tle is not None and not hasattr(tle, "cumsum"):
                 tle.cumsum = tl.cumsum
 
+        # ``flash_mla_sparse_fwd`` has a separate TLE gate from the top-k
+        # helpers above.  FlagGems selects its TLE implementation on this
+        # Triton build, but the bundled ``triton.experimental.tle.language``
+        # module is missing ``pipe``; the first HY4 request then fails while
+        # Triton hashes the kernel.  Force the portable non-TLE implementation
+        # for this model-local fallback as well.
+        flashmla_sparse_module = importlib.import_module(
+            "flag_gems.fused.flashmla_sparse"
+        )
+        flashmla_sparse_module.HAS_TLE_FLASHMLA_SPARSE = False
+
         from flag_gems.fused import (
             concat_and_cache_mla as flaggems_concat_and_cache_mla,
             cp_gather_indexer_k_quant_cache,
