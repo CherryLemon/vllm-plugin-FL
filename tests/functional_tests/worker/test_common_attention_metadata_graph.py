@@ -239,19 +239,19 @@ def test_common_attention_metadata_matches_vllm_with_hybrid_blocks_and_cp(
         max_num_batched_tokens=16,
         pin_memory=False,
         device=device,
-        block_sizes=[8],
-        kernel_block_sizes=[4],
-        max_num_blocks=[8],
+        block_sizes=[8, 16],
+        kernel_block_sizes=[4, 8],
+        max_num_blocks=[8, 4],
         cp_kv_cache_interleave_size=2,
     )
-    table.add_row(([2, 3, 4, 5],), 0)
-    table.add_row(([6, 7, 8, 9],), 1)
+    table.add_row(([2, 3, 4, 5], [10, 11, 12, 13]), 0)
+    table.add_row(([6, 7, 8, 9], [14, 15, 16, 17]), 1)
     table.commit_block_table(2)
-    group = table.block_tables[0]
-    group.pcp_world_size = 2
-    group.pcp_rank = 1
-    group.dcp_world_size = 1
-    group.dcp_rank = 0
+    for group in table.block_tables:
+        group.pcp_world_size = 2
+        group.pcp_rank = 1
+        group.dcp_world_size = 1
+        group.dcp_rank = 0
 
     query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32, device=device)
     positions = torch.zeros(16, dtype=torch.int64, device=device)

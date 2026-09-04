@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -17,6 +18,22 @@ from vllm_fl.compilation.graph import Graph
 logger = init_logger(__name__)
 
 _GRAPH_DEVICE_TYPES = frozenset({"cuda", "npu", "musa", "ptpu"})
+_LAYOUT_ATTR = "_vllm_fl_common_attention_metadata_layout"
+
+
+@dataclass(frozen=True)
+class _CommonAttentionMetadataLayout:
+    """Fixed-address tensors used by the multi-group Triton launch."""
+
+    block_table_ptrs: torch.Tensor
+    block_table_strides: torch.Tensor
+    block_sizes: torch.Tensor
+    slot_mapping_ptrs: torch.Tensor
+    num_groups: int
+    max_num_batched_tokens: int
+    total_cp_world_size: int
+    total_cp_rank: int
+    cp_kv_cache_interleave_size: int
 
 
 def supports_accelerator_graph() -> bool:
@@ -28,18 +45,25 @@ def supports_accelerator_graph() -> bool:
     )
 
 
-# Adapted from vLLM's BlockTable slot-mapping kernel. The padding boundary is
-# read from query_start_loc on device so one captured graph can replay with
-# different request lengths without a host-derived launch argument.
+@triton.jit
+def _load_ptr(ptr_to_ptr, elem_dtype):
+    ptr = tl.load(ptr_to_ptr)
+    ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
+    return tl.multiple_of(ptr, 16)
+
+
+# Backported from vLLM's multi-group BlockTables slot-mapping kernel. The
+# padding boundary is read from query_start_loc on device so one captured graph
+# can replay with different request lengths without a host-derived argument.
 @triton.jit(do_not_specialize=["max_num_tokens"])
 def _compute_slot_mapping_graph_kernel(
     max_num_tokens,
     query_start_loc_ptr,
     positions_ptr,
-    block_table_ptr,
-    block_table_stride,
-    block_size,
-    slot_mapping_ptr,
+    block_table_ptrs,
+    block_table_strides,
+    block_sizes,
+    slot_mapping_ptrs,
     TOTAL_CP_WORLD_SIZE: tl.constexpr,
     TOTAL_CP_RANK: tl.constexpr,
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
@@ -47,9 +71,14 @@ def _compute_slot_mapping_graph_kernel(
     PAD_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    req_idx = tl.program_id(0)
+    group_idx = tl.program_id(0)
+    req_idx = tl.program_id(1)
+    block_table_ptr = _load_ptr(block_table_ptrs + group_idx, tl.int32)
+    block_table_stride = tl.load(block_table_strides + group_idx)
+    block_size = tl.load(block_sizes + group_idx)
+    slot_mapping_ptr = _load_ptr(slot_mapping_ptrs + group_idx, tl.int64)
 
-    if req_idx == tl.num_programs(0) - 1:
+    if req_idx == tl.num_programs(1) - 1:
         actual_num_tokens = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
         for i in range(actual_num_tokens, max_num_tokens, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
@@ -126,6 +155,83 @@ def _compute_num_computed_tokens_kernel(
     )
 
 
+def _make_ptr_tensor(tensors: list[torch.Tensor]) -> torch.Tensor:
+    # uint64 covers every possible device address. The tensors are persistent,
+    # so these raw pointers remain valid across graph capture and replay.
+    return torch.tensor(
+        [tensor.data_ptr() for tensor in tensors],
+        dtype=torch.uint64,
+        device=tensors[0].device,
+    )
+
+
+def _create_common_attention_metadata_layout(
+    block_table: Any,
+) -> _CommonAttentionMetadataLayout:
+    tables = block_table.block_tables
+    if not tables:
+        raise ValueError("Common attention metadata requires a KV cache group")
+
+    max_num_batched_tokens = tables[0].max_num_batched_tokens
+    total_cp_world_size = tables[0].pcp_world_size * tables[0].dcp_world_size
+    total_cp_rank = tables[0].pcp_rank * tables[0].dcp_world_size + tables[0].dcp_rank
+    cp_kv_cache_interleave_size = tables[0].cp_kv_cache_interleave_size
+    device = tables[0].block_table.gpu.device
+
+    for table in tables[1:]:
+        table_cp_world_size = table.pcp_world_size * table.dcp_world_size
+        table_cp_rank = table.pcp_rank * table.dcp_world_size + table.dcp_rank
+        if (
+            table.block_table.gpu.device != device
+            or table.slot_mapping.gpu.device != device
+        ):
+            raise ValueError("All KV cache groups must be on the same device")
+        if table.max_num_batched_tokens != max_num_batched_tokens:
+            raise ValueError(
+                "All KV cache groups must use the same max_num_batched_tokens"
+            )
+        if (
+            table_cp_world_size != total_cp_world_size
+            or table_cp_rank != total_cp_rank
+            or table.cp_kv_cache_interleave_size != cp_kv_cache_interleave_size
+        ):
+            raise ValueError(
+                "All KV cache groups must use the same context-parallel layout"
+            )
+
+    return _CommonAttentionMetadataLayout(
+        block_table_ptrs=_make_ptr_tensor([table.block_table.gpu for table in tables]),
+        block_table_strides=torch.tensor(
+            [table.block_table.gpu.stride(0) for table in tables],
+            dtype=torch.int64,
+            device=device,
+        ),
+        block_sizes=torch.tensor(
+            [table.block_size for table in tables],
+            dtype=torch.int32,
+            device=device,
+        ),
+        slot_mapping_ptrs=_make_ptr_tensor(
+            [table.slot_mapping.gpu for table in tables]
+        ),
+        num_groups=len(tables),
+        max_num_batched_tokens=max_num_batched_tokens,
+        total_cp_world_size=total_cp_world_size,
+        total_cp_rank=total_cp_rank,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
+
+
+def _get_common_attention_metadata_layout(
+    block_table: Any,
+) -> _CommonAttentionMetadataLayout:
+    layout = getattr(block_table, _LAYOUT_ATTR, None)
+    if layout is None:
+        layout = _create_common_attention_metadata_layout(block_table)
+        setattr(block_table, _LAYOUT_ATTR, layout)
+    return layout
+
+
 def compute_common_attention_metadata(
     block_table: Any,
     num_reqs: int,
@@ -135,20 +241,19 @@ def compute_common_attention_metadata(
     num_computed_tokens: torch.Tensor,
 ) -> None:
     """Populate fixed-address metadata buffers consumed by attention backends."""
-    for table in block_table.block_tables:
-        total_cp_world_size = table.pcp_world_size * table.dcp_world_size
-        total_cp_rank = table.pcp_rank * table.dcp_world_size + table.dcp_rank
-        _compute_slot_mapping_graph_kernel[(num_reqs + 1,)](
-            table.max_num_batched_tokens,
+    if block_table.block_tables:
+        layout = _get_common_attention_metadata_layout(block_table)
+        _compute_slot_mapping_graph_kernel[(layout.num_groups, num_reqs + 1)](
+            layout.max_num_batched_tokens,
             query_start_loc,
             positions,
-            table.block_table.gpu,
-            table.block_table.gpu.stride(0),
-            table.block_size,
-            table.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
-            CP_KV_CACHE_INTERLEAVE_SIZE=table.cp_kv_cache_interleave_size,
+            layout.block_table_ptrs,
+            layout.block_table_strides,
+            layout.block_sizes,
+            layout.slot_mapping_ptrs,
+            TOTAL_CP_WORLD_SIZE=layout.total_cp_world_size,
+            TOTAL_CP_RANK=layout.total_cp_rank,
+            CP_KV_CACHE_INTERLEAVE_SIZE=layout.cp_kv_cache_interleave_size,
             NULL_BLOCK_ID=NULL_BLOCK_ID,
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
@@ -226,6 +331,14 @@ class CommonAttentionMetadataGraphRunner:
             if graph is not None:
                 graph.replay()
                 return True
+
+            # Materialize the pointer/stride tensors before entering capture.
+            # Allocating them inside the graph would make replay unsafe.
+            if (
+                compute is compute_common_attention_metadata
+                and block_table.block_tables
+            ):
+                _get_common_attention_metadata_layout(block_table)
 
             graph = Graph.graph()
             with current_platform.torch_device_fn.graph(graph, pool=self.graph_pool):
