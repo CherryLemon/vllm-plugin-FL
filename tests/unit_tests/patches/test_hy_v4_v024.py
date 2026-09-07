@@ -82,9 +82,7 @@ def test_mxfp8_alias_is_probed_after_canonical_override():
         "modelopt_mxfp8": FakeMXFP8Config,
         "other": OtherConfig,
     }
-    quantization = SimpleNamespace(
-        get_quantization_config=lambda name: configs[name]
-    )
+    quantization = SimpleNamespace(get_quantization_config=lambda name: configs[name])
 
     compat._patch_mxfp8_override_order(quantization)
     alias = quantization.get_quantization_config("mxfp8")
@@ -126,9 +124,7 @@ def test_apply_registers_plugin_owned_hy4_components(monkeypatch):
 
     monkeypatch.setattr(compat, "is_vllm_024", lambda: True)
     monkeypatch.setattr(transformers_config, "_CONFIG_REGISTRY", {})
-    monkeypatch.setattr(
-        model_arch_config_convertor, "MODEL_ARCH_CONFIG_CONVERTORS", {}
-    )
+    monkeypatch.setattr(model_arch_config_convertor, "MODEL_ARCH_CONFIG_CONVERTORS", {})
     monkeypatch.setattr(model_registry, "ModelRegistry", fake_registry)
     monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", {})
     monkeypatch.setattr(model_loader, "register_model_loader", register_loader)
@@ -142,9 +138,7 @@ def test_apply_registers_plugin_owned_hy4_components(monkeypatch):
     assert registered_models == {
         "HYV4ForCausalLM": "vllm_fl.models.hy_v4:HYV4ForCausalLM"
     }
-    assert registered_loaders == {
-        "hy4_safetensors": compat.HYV4SafetensorsLoader
-    }
+    assert registered_loaders == {"hy4_safetensors": compat.HYV4SafetensorsLoader}
 
 
 def test_flagos_oot_platform_inherits_mxfp8_linear_candidates():
@@ -261,10 +255,7 @@ def test_hy4_fp32_combine_reduce_order_and_world_size():
         all_reduce=mock_all_reduce,
     )
     expected = (
-        routed.float()
-        + shared.float()
-        + peer_routed.float()
-        + peer_shared.float()
+        routed.float() + shared.float() + peer_routed.float() + peer_shared.float()
     )
     assert result.dtype == torch.float32
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
@@ -317,12 +308,13 @@ def test_hy4_fp32_combine_reduce_order_and_world_size():
         shared_output_is_global=True,
         all_reduce=lambda _: (_ for _ in ()).throw(AssertionError("unexpected")),
     )
-    torch.testing.assert_close(preserved_fallback, routed_global.float() + shared.float())
-
-    bf16_reference = (
-        (routed + peer_routed).to(torch.bfloat16).float()
-        + (shared + peer_shared).to(torch.bfloat16).float()
+    torch.testing.assert_close(
+        preserved_fallback, routed_global.float() + shared.float()
     )
+
+    bf16_reference = (routed + peer_routed).to(torch.bfloat16).float() + (
+        shared + peer_shared
+    ).to(torch.bfloat16).float()
     diff = (result - bf16_reference).abs()
     print(
         "HY4 FP32 combine vs BF16-two-reduce "
@@ -445,9 +437,7 @@ def test_hy4_moe_constructor_wires_fallback_runner_and_sp(monkeypatch):
 
     def construct(*, runner: bool, sequence_parallel: bool):
         observed.clear()
-        monkeypatch.setenv(
-            "VLLM_HY4_SHARED_EXPERTS_RUNNER", "1" if runner else "0"
-        )
+        monkeypatch.setenv("VLLM_HY4_SHARED_EXPERTS_RUNNER", "1" if runner else "0")
         parallel = SimpleNamespace(
             use_sequence_parallel_moe=sequence_parallel,
             eplb_config=SimpleNamespace(num_redundant_experts=0),
@@ -497,9 +487,7 @@ def test_hy4_dense_mlp_sequence_parallel_disables_tp(monkeypatch):
     class FakeRow(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
-            linear_calls.append(
-                ("row", kwargs["disable_tp"], kwargs["reduce_results"])
-            )
+            linear_calls.append(("row", kwargs["disable_tp"], kwargs["reduce_results"]))
 
     monkeypatch.setattr(hy_v4, "MergedColumnParallelLinear", FakeColumn)
     monkeypatch.setattr(hy_v4, "RowParallelLinear", FakeRow)

@@ -30,9 +30,7 @@ def _literal(flat: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("m", [1, 2, 8, 64, 65, 257])
 @pytest.mark.parametrize("n", [4, 8])
-def test_hy4_hc_literal_correctness(
-    monkeypatch: pytest.MonkeyPatch, m: int, n: int
-):
+def test_hy4_hc_literal_correctness(monkeypatch: pytest.MonkeyPatch, m: int, n: int):
     monkeypatch.setenv(HC_N8_ENABLE_ENV, "1")
     torch.manual_seed(101 + m + n)
     flat = torch.randn((m, K), device="cuda", dtype=torch.float32)
