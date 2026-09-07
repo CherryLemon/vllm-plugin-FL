@@ -237,8 +237,37 @@ class WorkerFL(WorkerBase):
         if fl_envs.USE_FLAGGEMS:
             import flag_gems
 
+            from vllm_fl.patches.flaggems_aten_plan_cache import (
+                apply_flaggems_aten_plan_cache,
+            )
+
+            apply_flaggems_aten_plan_cache()
+
             # Get whitelist and blacklist from environment variables
             whitelist, blacklist = get_flag_gems_whitelist_blacklist()
+
+            # Qwen3.8-Flash-Next/Qwen4Exp owns a multi-GiB transposed PLE
+            # cache and performs a large PLE Conv1d during profile runs.
+            # Keep its unsafe index_select and large profile-run
+            # convolution/padding calls native;
+            # do not mutate global config or affect workers for other models.
+            from vllm_fl.patches.qwen3_8_flash_next import (
+                apply_native_index_select_policy,
+                needs_native_index_select,
+            )
+
+            whitelist, blacklist = apply_native_index_select_policy(
+                vllm_config,
+                whitelist,
+                blacklist,
+                vendor_name=getattr(current_platform, "vendor_name", None),
+            )
+            if not whitelist and needs_native_index_select(vllm_config):
+                logger.info(
+                    "[Qwen3.8-Flash-Next] Using native index_select and PLE "
+                    "profile-run convolution/padding primitives; NVIDIA also "
+                    "uses native repeat_interleave and dense linear"
+                )
 
             # Only rank 0 records the oplist to avoid file truncation and
             # interleaved writes when tensor-parallel-size > 1.
@@ -517,10 +546,13 @@ class WorkerFL(WorkerBase):
             # CUDA graphs are captured only after the KV cache has been
             # allocated. Account for their pool before sizing the cache;
             # otherwise high-concurrency batches can leave no room for
-            # runtime activations and fail with OOM.
+            # runtime activations and fail with OOM.  The pool accounting
+            # helper uses PyTorch's CUDA-shaped graph/memory API, which is also
+            # the supported interface on ROCm/HIP. Other OOT runtimes keep the
+            # estimate at zero until they expose a compatible graph profiler.
             cudagraph_memory_estimate = 0
             if (
-                current_platform.is_cuda()
+                (current_platform.is_cuda() or current_platform.is_rocm())
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
@@ -547,7 +579,7 @@ class WorkerFL(WorkerBase):
         free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory > free_gpu_memory, (
+        assert self.init_snapshot.free_memory >= free_gpu_memory, (
             "Error in memory profiling. "
             f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
             f"current free memory {GiB(free_gpu_memory)} GiB. "
@@ -802,6 +834,19 @@ class WorkerFL(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        # Emit one aggregate observation after model warmup/capture. This is
+        # deliberately outside the request path and proves that an explicitly
+        # enabled FlagGems plan cache is installed and receiving real hits.
+        if fl_envs.USE_FLAGGEMS and (
+            self.rank == 0
+            or os.getenv("VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE", "0") == "1"
+        ):
+            from vllm_fl.patches.flaggems_aten_plan_cache import (
+                log_flaggems_aten_plan_cache_stats,
+            )
+
+            log_flaggems_aten_plan_cache_stats("post-warmup")
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
@@ -1226,6 +1271,20 @@ class WorkerFL(WorkerBase):
         )
 
     def shutdown(self) -> None:
+        if (
+            fl_envs.USE_FLAGGEMS
+            and os.getenv("VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE", "0") == "1"
+        ):
+            # This boundary has no request-path overhead. Keep shutdown safe
+            # even when it follows an unrelated initialization failure.
+            try:
+                from vllm_fl.patches.flaggems_aten_plan_cache import (
+                    log_flaggems_aten_plan_cache_stats,
+                )
+
+                log_flaggems_aten_plan_cache_stats("pre-shutdown")
+            except Exception as error:
+                logger.warning("Could not report final plan-cache stats: %s", error)
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:
