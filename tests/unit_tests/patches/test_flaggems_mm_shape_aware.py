@@ -41,9 +41,7 @@ class _FakeLibrary:
         with_keyset=False,
         allow_override=False,
     ):
-        self.impl_calls.append(
-            (op_name, fn, dispatch_key, with_keyset, allow_override)
-        )
+        self.impl_calls.append((op_name, fn, dispatch_key, with_keyset, allow_override))
 
 
 class _FakeSafeKernel:
@@ -89,9 +87,7 @@ def test_caller_default_can_enable_but_explicit_disable_wins(monkeypatch):
 def test_mm_dispatch_guard_preserves_explicit_flaggems_selection(
     whitelist, blacklist, expected
 ):
-    assert (
-        shape_aware.is_mm_dispatch_enabled(whitelist, blacklist) is expected
-    )
+    assert shape_aware.is_mm_dispatch_enabled(whitelist, blacklist) is expected
 
 
 @pytest.mark.parametrize("value", ["", "2 ", " 2", "+2", "-1", "1.0", "abc"])
@@ -127,22 +123,14 @@ def test_native_candidate_boundary_dtype_and_stride():
     b_column_major = _FakeTensor(m=4096, stride=(1, 4096))
     assert shape_aware._is_native_candidate(a, b_column_major, 1)
 
-    assert shape_aware._is_native_candidate(
-        _FakeTensor(m=64), b_column_major, 64
-    )
-    assert not shape_aware._is_native_candidate(
-        _FakeTensor(m=65), b_column_major, 64
-    )
+    assert shape_aware._is_native_candidate(_FakeTensor(m=64), b_column_major, 64)
+    assert not shape_aware._is_native_candidate(_FakeTensor(m=65), b_column_major, 64)
 
-    assert not shape_aware._is_native_candidate(
-        _FakeTensor(m=2), b_column_major, 1
-    )
+    assert not shape_aware._is_native_candidate(_FakeTensor(m=2), b_column_major, 1)
     assert not shape_aware._is_native_candidate(
         a, _FakeTensor(dtype=torch.float16, stride=(1, 4096)), 1
     )
-    assert not shape_aware._is_native_candidate(
-        a, _FakeTensor(stride=(8192, 2)), 1
-    )
+    assert not shape_aware._is_native_candidate(a, _FakeTensor(stride=(8192, 2)), 1)
     assert not shape_aware._is_native_candidate(
         _FakeTensor(stride=(8192, 2)), b_column_major, 1
     )
@@ -170,9 +158,7 @@ def test_apply_captures_flaggems_before_override_and_routes_shapes(monkeypatch):
         return "native-result"
 
     native_kernel = _FakeSafeKernel(native_mm)
-    flaggems_kernel = _FakeSafeKernel(
-        lambda dispatch_keys, a, b: flaggems_mm(a, b)
-    )
+    flaggems_kernel = _FakeSafeKernel(lambda dispatch_keys, a, b: flaggems_mm(a, b))
     library = _FakeLibrary()
     monkeypatch.setattr(
         shape_aware.torch.library,
@@ -187,9 +173,7 @@ def test_apply_captures_flaggems_before_override_and_routes_shapes(monkeypatch):
 
     assert shape_aware.apply_shape_aware_mm(native_mm_kernel=native_kernel) is True
     assert len(library.impl_calls) == 1
-    op_name, wrapper, dispatch_key, with_keyset, allow_override = (
-        library.impl_calls[0]
-    )
+    op_name, wrapper, dispatch_key, with_keyset, allow_override = library.impl_calls[0]
     assert (op_name, dispatch_key, with_keyset, allow_override) == (
         "mm",
         "CUDA",
@@ -216,8 +200,7 @@ def test_apply_captures_flaggems_before_override_and_routes_shapes(monkeypatch):
     # Unsupported dtype/stride remains on the captured FlagGems callable.
     calls.clear()
     assert (
-        wrapper("dispatch-key", _FakeTensor(dtype=torch.int8), b)
-        == "flaggems-result"
+        wrapper("dispatch-key", _FakeTensor(dtype=torch.int8), b) == "flaggems-result"
     )
     assert calls[0][0] == "flaggems"
 
@@ -230,9 +213,7 @@ def test_apply_fails_without_safe_override_api(monkeypatch):
     monkeypatch.delenv(shape_aware.THRESHOLD_ENV, raising=False)
     monkeypatch.setattr(shape_aware, "_STATE", None)
     safe_kernel = _FakeSafeKernel(lambda dispatch_keys, a, b: None)
-    monkeypatch.setattr(
-        shape_aware.torch.library, "get_kernel", lambda *_: safe_kernel
-    )
+    monkeypatch.setattr(shape_aware.torch.library, "get_kernel", lambda *_: safe_kernel)
 
     class _NoAllowOverrideLibrary:
         def impl(self, op_name, fn, dispatch_key):

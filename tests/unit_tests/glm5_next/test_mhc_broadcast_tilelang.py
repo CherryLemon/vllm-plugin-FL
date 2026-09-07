@@ -61,19 +61,13 @@ def _make_inputs(tokens: int):
             tokens, hidden_size, device="cuda", dtype=torch.bfloat16
         ),
         "fn": fn,
-        "fn_broadcast": fn.view(mix_size, streams, hidden_size)
-        .sum(dim=1)
-        .contiguous(),
-        "scale": torch.tensor(
-            [0.8, 0.7, 0.6], device="cuda", dtype=torch.float32
-        ),
+        "fn_broadcast": fn.view(mix_size, streams, hidden_size).sum(dim=1).contiguous(),
+        "scale": torch.tensor([0.8, 0.7, 0.6], device="cuda", dtype=torch.float32),
         "base": (
             torch.randn(mix_size, device="cuda", dtype=torch.float32) * 0.1
         ).contiguous(),
         "norm_weight": (
-            1
-            + torch.randn(hidden_size, device="cuda", dtype=torch.float32)
-            * 0.05
+            1 + torch.randn(hidden_size, device="cuda", dtype=torch.float32) * 0.05
         )
         .to(torch.bfloat16)
         .contiguous(),
@@ -83,10 +77,7 @@ def _make_inputs(tokens: int):
 
 def _generic_outputs(mhc_pre_tilelang, values):
     expanded = (
-        values["residual"]
-        .unsqueeze(1)
-        .expand(-1, values["streams"], -1)
-        .contiguous()
+        values["residual"].unsqueeze(1).expand(-1, values["streams"], -1).contiguous()
     )
     post, comb, layer_input = mhc_pre_tilelang(
         expanded,
