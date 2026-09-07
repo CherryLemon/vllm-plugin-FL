@@ -12,7 +12,6 @@ import math
 import torch
 import torch.nn.functional as F
 
-
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -134,7 +133,9 @@ def ple_hash_ids_reference(
         gather_indices = source.clamp_min(0).unsqueeze(0).expand(num_reqs, -1)
         shifted_tokens = context.gather(1, gather_indices)
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
-        shifted.append(torch.where(valid, shifted_tokens, context.new_full((), eos_token_id)))
+        shifted.append(
+            torch.where(valid, shifted_tokens, context.new_full((), eos_token_id))
+        )
 
     if multipliers.numel() != ngram_size:
         raise ValueError("multipliers must have one entry per n-gram position")
@@ -150,9 +151,10 @@ def ple_hash_ids_reference(
         mixed = shifted[0] * multipliers[0]
         for index in range(1, ngram):
             mixed = torch.bitwise_xor(mixed, shifted[index] * multipliers[index])
-        ids = torch.remainder(
-            mixed.unsqueeze(-1), vocab_sizes[start:end]
-        ) + offsets[start:end]
+        ids = (
+            torch.remainder(mixed.unsqueeze(-1), vocab_sizes[start:end])
+            + offsets[start:end]
+        )
         blocks.append(ids[request_indices, adjusted_columns])
     return torch.cat(blocks, dim=-1)
 
@@ -188,10 +190,7 @@ def dilated_short_conv_reference(
         outputs.append(F.silu(y))
         if state_len:
             current_state = history[:, -state_len:]
-    if outputs:
-        output = torch.stack(outputs, dim=0)
-    else:
-        output = x.new_empty((0, hidden))
+    output = torch.stack(outputs, dim=0) if outputs else x.new_empty((0, hidden))
     return output, current_state
 
 
@@ -214,7 +213,9 @@ def logical_to_physical_slots_reference(
         & (request_indices < block_table.shape[0])
         & (logical_positions >= 0)
     )
-    logical_block = torch.div(logical_positions.clamp_min(0), block_size, rounding_mode="floor")
+    logical_block = torch.div(
+        logical_positions.clamp_min(0), block_size, rounding_mode="floor"
+    )
     valid &= logical_block < block_table.shape[1]
     if not valid.any():
         return result
@@ -340,8 +341,12 @@ def qsa_mqa_paged_reference(
     """Reference for the positive-dot MQA indexer score kernel."""
 
     rows = q.shape[0]
-    columns = page_table.shape[1] * k_cache.shape[1] if num_columns is None else num_columns
-    logits = torch.full((rows, columns), -float("inf"), dtype=torch.float32, device=q.device)
+    columns = (
+        page_table.shape[1] * k_cache.shape[1] if num_columns is None else num_columns
+    )
+    logits = torch.full(
+        (rows, columns), -float("inf"), dtype=torch.float32, device=q.device
+    )
     visible_blocks = torch.zeros((rows,), dtype=torch.int32, device=q.device)
     divisor = math.sqrt(q.shape[-1]) if score_scale is None else score_scale
     page_size = k_cache.shape[1]
@@ -351,7 +356,9 @@ def qsa_mqa_paged_reference(
             continue
         query_position = int(query_positions[row])
         sequence_length = int(sequence_lengths[request])
-        visible = min((query_position + 1) // compress_ratio, sequence_length // compress_ratio)
+        visible = min(
+            (query_position + 1) // compress_ratio, sequence_length // compress_ratio
+        )
         visible_blocks[row] = visible
         for column in range(min(columns, max(visible, 0))):
             page = column // page_size
@@ -384,14 +391,24 @@ def expand_qsa_indices_reference(
     block_topk = token_topk // compress_ratio
     output_width = token_topk + compress_ratio - 1
     output = torch.full(
-        (block_indices.shape[0], output_width), -1, dtype=torch.int32, device=block_indices.device
+        (block_indices.shape[0], output_width),
+        -1,
+        dtype=torch.int32,
+        device=block_indices.device,
     )
     for row in range(block_indices.shape[0]):
         request = int(token_to_req[row])
-        sequence_length = int(sequence_lengths[request]) if 0 <= request < sequence_lengths.numel() else 0
+        sequence_length = (
+            int(sequence_lengths[request])
+            if 0 <= request < sequence_lengths.numel()
+            else 0
+        )
         query_position = int(query_positions[row])
         complete_blocks = min(
-            min((query_position + 1) // compress_ratio, sequence_length // compress_ratio),
+            min(
+                (query_position + 1) // compress_ratio,
+                sequence_length // compress_ratio,
+            ),
             block_topk,
         )
         expanded_count = complete_blocks * compress_ratio
@@ -400,7 +417,10 @@ def expand_qsa_indices_reference(
         for column in range(output_width):
             if column < expanded_count:
                 block_rank = column // compress_ratio
-                token = int(block_indices[row, block_rank]) * compress_ratio + column % compress_ratio
+                token = (
+                    int(block_indices[row, block_rank]) * compress_ratio
+                    + column % compress_ratio
+                )
                 valid = 0 <= token < sequence_length
             else:
                 tail_offset = column - expanded_count
@@ -427,7 +447,7 @@ def qsa_sparse_paged_attention_reference(
     rows, query_heads, head_dim = q.shape
     kv_heads = k_cache.shape[2]
     group_size = query_heads // kv_heads
-    scale = head_dim ** -0.5 if softmax_scale is None else softmax_scale
+    scale = head_dim**-0.5 if softmax_scale is None else softmax_scale
     output = torch.zeros_like(q)
     page_size = k_cache.shape[1]
     for row in range(rows):

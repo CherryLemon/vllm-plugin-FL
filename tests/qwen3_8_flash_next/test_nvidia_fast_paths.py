@@ -24,9 +24,7 @@ def test_non_nvidia_platform_never_probes_private_cuda_ops(monkeypatch):
     def fail(*_args, **_kwargs):
         raise AssertionError("private CUDA dispatch must not be probed")
 
-    monkeypatch.setattr(
-        torch._C, "_dispatch_has_kernel_for_dispatch_key", fail
-    )
+    monkeypatch.setattr(torch._C, "_dispatch_has_kernel_for_dispatch_key", fail)
     assert fast.is_nvidia_platform() is False
     assert fast.has_native_topk() is False
     assert fast.has_native_cache_update() is False

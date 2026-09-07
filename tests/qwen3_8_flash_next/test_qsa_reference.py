@@ -48,7 +48,11 @@ def test_qsa_store_rows_and_compress_groups_reference():
     torch.testing.assert_close(stored[2, 3, 0], rows[1])
     assert bool((stored[0] == -1).all())
 
-    raw = torch.arange(4 * 4 * 3, dtype=torch.float32).reshape(4, 4, 1, 3).to(torch.bfloat16)
+    raw = (
+        torch.arange(4 * 4 * 3, dtype=torch.float32)
+        .reshape(4, 4, 1, 3)
+        .to(torch.bfloat16)
+    )
     token_to_req = torch.tensor([0, 1], dtype=torch.int32)
     logical_positions = torch.tensor([3, 7], dtype=torch.int64)
     compressed_slots = torch.tensor([0, 1], dtype=torch.int64)
@@ -121,9 +125,7 @@ def _load_qsa_ops():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable; Triton comparison is optional")
     try:
-        return importlib.import_module(
-            "vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa"
-        )
+        return importlib.import_module("vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa")
     except Exception as exc:  # target-GPU jobs must not hide import failures
         pytest.fail(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}")
 
@@ -145,36 +147,42 @@ def test_qsa_cuda_store_and_compress_match_reference():
     # so the expected means are deterministic and exercise the cross-step
     # boundary rather than the former self-developed cache signature.
     state = torch.zeros(4, 4, 1, 8, dtype=torch.bfloat16, device=device)
-    state[2, :3, 0] = torch.arange(24, dtype=torch.float32, device=device).reshape(
-        3, 8
-    )
+    state[2, :3, 0] = torch.arange(24, dtype=torch.float32, device=device).reshape(3, 8)
     state[1, :3, 0] = (
         100 + torch.arange(24, dtype=torch.float32, device=device)
     ).reshape(3, 8)
-    raw_step = torch.stack(
-        [
-            torch.full((8,), 24, dtype=torch.float32, device=device),
-            torch.full((8,), 124, dtype=torch.float32, device=device),
-        ]
-    ).to(torch.bfloat16).view(2, 1, 8)
+    raw_step = (
+        torch.stack(
+            [
+                torch.full((8,), 24, dtype=torch.float32, device=device),
+                torch.full((8,), 124, dtype=torch.float32, device=device),
+            ]
+        )
+        .to(torch.bfloat16)
+        .view(2, 1, 8)
+    )
     state_table = torch.tensor([[2], [1]], dtype=torch.int32, device=device)
     req = torch.tensor([0, 1], dtype=torch.int32, device=device)
     logical = torch.tensor([3, 7], dtype=torch.int64, device=device)
     raw_positions = logical.view(2, 1, 1).expand(-1, 1, 3).contiguous()
     query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
     compressed_slots = torch.tensor([0, 1], dtype=torch.int64, device=device)
-    expected_pool = torch.stack(
-        [
-            torch.cat([state[2, :3, 0], raw_step[0, 0]], dim=0)
-            .reshape(4, 8)
-            .float()
-            .mean(0),
-            torch.cat([state[1, :3, 0], raw_step[1, 0]], dim=0)
-            .reshape(4, 8)
-            .float()
-            .mean(0),
-        ]
-    ).to(torch.bfloat16).view(2, 1, 8)
+    expected_pool = (
+        torch.stack(
+            [
+                torch.cat([state[2, :3, 0], raw_step[0, 0]], dim=0)
+                .reshape(4, 8)
+                .float()
+                .mean(0),
+                torch.cat([state[1, :3, 0], raw_step[1, 0]], dim=0)
+                .reshape(4, 8)
+                .float()
+                .mean(0),
+            ]
+        )
+        .to(torch.bfloat16)
+        .view(2, 1, 8)
+    )
     expected_pos = torch.tensor(
         [[0, 0, 0], [4, 4, 4]], dtype=torch.int64, device=device
     )
@@ -212,7 +220,9 @@ def test_qsa_cuda_indexer_and_sparse_match_reference():
     actual_logits, actual_visible = ops.qsa_mqa_paged(
         q, key, table, req, positions, lengths, 4
     )
-    torch.testing.assert_close(actual_logits.cpu(), expected_logits, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        actual_logits.cpu(), expected_logits, rtol=2e-2, atol=2e-2
+    )
     torch.testing.assert_close(actual_visible.cpu(), expected_visible)
 
     block_indices = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32, device=device)
@@ -236,7 +246,9 @@ def test_qsa_cuda_indexer_and_sparse_match_reference():
     actual_out = ops.qsa_sparse_paged_attention(
         q_gqa, k, v, logical_indices, table, req
     )
-    torch.testing.assert_close(actual_out.cpu().float(), expected_out.float(), rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        actual_out.cpu().float(), expected_out.float(), rtol=5e-2, atol=5e-2
+    )
 
 
 @pytest.mark.gpu
@@ -251,12 +263,10 @@ def test_qsa_cuda_full_select_matches_reference_and_graph(rows):
     # select k=512 compressed blocks, one of the private NVIDIA op's supported
     # K values. The same case stays valid through the generic vendor path.
     page_size, num_pages, compress_ratio, token_topk = 16, 32, 4, 2048
-    table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).reshape(1, num_pages)
-    key = torch.randn(
-        num_pages, page_size, 1, 8, dtype=torch.bfloat16, device=device
+    table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        1, num_pages
     )
+    key = torch.randn(num_pages, page_size, 1, 8, dtype=torch.bfloat16, device=device)
     q = torch.randn(rows, 2, 8, dtype=torch.bfloat16, device=device)
     req = torch.zeros(rows, dtype=torch.int32, device=device)
     positions = torch.full((rows,), 2047, dtype=torch.int64, device=device)
@@ -305,9 +315,7 @@ def test_qsa_cuda_full_select_matches_reference_and_graph(rows):
             expected_valid = expected[row][expected[row] >= 0].sort().values
             actual_valid = actual_cpu[row][actual_cpu[row] >= 0].sort().values
             torch.testing.assert_close(actual_valid, expected_valid, rtol=0, atol=0)
-            assert int((actual_cpu[row] < 0).sum()) == int(
-                (expected[row] < 0).sum()
-            )
+            assert int((actual_cpu[row] < 0).sum()) == int((expected[row] < 0).sum())
 
     assert_same_selected_tokens(select())
     for _ in range(5):

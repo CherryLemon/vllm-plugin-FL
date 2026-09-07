@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 # The patch imports vLLM's Triton compatibility layer.  Keep this test
 # collection-friendly on source-only/CPU developer machines; the actual test
 # runs in the vLLM/FlagOS image used for Day0 validation.
@@ -109,7 +108,5 @@ def test_patch_is_optional_when_fla_module_or_symbol_is_unavailable(monkeypatch)
     def missing_module(_module):
         raise ModuleNotFoundError("FLA is not present in this vLLM build")
 
-    monkeypatch.setattr(
-        gdn_packed_decode.importlib, "import_module", missing_module
-    )
+    monkeypatch.setattr(gdn_packed_decode.importlib, "import_module", missing_module)
     assert gdn_packed_decode.patch_vllm_packed_gdn_beta() is False

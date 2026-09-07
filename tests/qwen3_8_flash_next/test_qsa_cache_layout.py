@@ -39,9 +39,13 @@ def test_qsa_backends_expose_layout_contract(
 
 
 def test_qsa_backend_owns_vendor_neutral_legacy_layout():
-    assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_shape(
-        3, 16, 2, 8
-    ) == (3, 2, 16, 2, 8)
+    assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_shape(3, 16, 2, 8) == (
+        3,
+        2,
+        16,
+        2,
+        8,
+    )
     assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_stride_order() == (
         0,
         1,
@@ -74,19 +78,15 @@ def test_unpack_legacy_vllm_024_cache_layout():
     # decode.
     flat_key = key.reshape(3, 16, 1, 16)
     flat_value = value.reshape(3, 16, 1, 16)
-    assert (
-        flat_key.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
-    )
-    assert (
-        flat_value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
-    )
+    assert flat_key.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    assert flat_value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
     assert flat_key.storage_offset() == key.storage_offset()
     assert flat_value.storage_offset() == value.storage_offset()
 
     key_update = torch.arange(flat_key.numel(), dtype=cache.dtype).reshape_as(flat_key)
-    value_update = -torch.arange(
-        flat_value.numel(), dtype=cache.dtype
-    ).reshape_as(flat_value)
+    value_update = -torch.arange(flat_value.numel(), dtype=cache.dtype).reshape_as(
+        flat_value
+    )
     flat_key.copy_(key_update)
     flat_value.copy_(value_update)
     torch.testing.assert_close(cache[:, 0], key_update.reshape_as(cache[:, 0]))

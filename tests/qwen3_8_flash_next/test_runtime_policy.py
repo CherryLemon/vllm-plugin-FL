@@ -37,8 +37,14 @@ def test_qwen4_merges_native_index_select_with_platform_blacklist():
     )
     assert whitelist is None
     assert blacklist == [
-        "copy_", "index", "index_select", "conv1d", "_conv_depthwise2d",
-        "conv2d", "pad", "constant_pad_nd"
+        "copy_",
+        "index",
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
 
 
@@ -47,8 +53,12 @@ def test_policy_accepts_outer_multimodal_model_type(model_type):
     config = _config(model_type)
     _, blacklist = apply_native_index_select_policy(config, None, None)
     assert blacklist == [
-        "index_select", "conv1d", "_conv_depthwise2d", "conv2d", "pad",
-        "constant_pad_nd"
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
 
 
@@ -56,8 +66,12 @@ def test_policy_accepts_checkpoint_architecture_fallback():
     config = _architecture_config("Qwen4ExpForConditionalGeneration")
     _, blacklist = apply_native_index_select_policy(config, None, None)
     assert blacklist == [
-        "index_select", "conv1d", "_conv_depthwise2d", "conv2d", "pad",
-        "constant_pad_nd"
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
 
 
@@ -67,10 +81,23 @@ def test_policy_adds_measured_nvidia_decode_fast_paths():
         config, None, ["copy_"], vendor_name="nvidia"
     )
     assert blacklist == [
-        "copy_", "index_select", "conv1d", "_conv_depthwise2d", "conv2d",
-        "pad", "constant_pad_nd", "repeat_interleave_tensor",
-        "repeat_interleave_self_tensor", "linear", "mm", "mm_out", "addmm",
-        "addmm_out", "addmm_", "addmm_dtype", "addmm_dtype_out"
+        "copy_",
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
+        "repeat_interleave_tensor",
+        "repeat_interleave_self_tensor",
+        "linear",
+        "mm",
+        "mm_out",
+        "addmm",
+        "addmm_out",
+        "addmm_",
+        "addmm_dtype",
+        "addmm_dtype_out",
     ]
 
 
@@ -100,12 +127,14 @@ def test_policy_is_idempotent_and_preserves_explicit_whitelist():
     config = _config("qwen3_8_flash_next_text")
     _, blacklist = apply_native_index_select_policy(config, None, ["index_select"])
     assert blacklist == [
-        "index_select", "conv1d", "_conv_depthwise2d", "conv2d", "pad",
-        "constant_pad_nd"
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
-    whitelist, blacklist = apply_native_index_select_policy(
-        config, ["add"], ["copy_"]
-    )
+    whitelist, blacklist = apply_native_index_select_policy(config, ["add"], ["copy_"])
     assert whitelist == ["add"]
     assert blacklist == ["copy_"]
 
