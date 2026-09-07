@@ -255,6 +255,12 @@ class WorkerFL(WorkerBase):
 
             shape_aware_mm_enabled = is_shape_aware_mm_enabled()
 
+            from vllm_fl.patches.flaggems_aten_plan_cache import (
+                apply_flaggems_aten_plan_cache,
+            )
+
+            apply_flaggems_aten_plan_cache()
+
             # Resolve policy before capturing native mm. An override is valid
             # only when FlagGems retains ownership of aten::mm.
             whitelist, blacklist = get_flag_gems_whitelist_blacklist()
@@ -604,10 +610,13 @@ class WorkerFL(WorkerBase):
             # CUDA graphs are captured only after the KV cache has been
             # allocated. Account for their pool before sizing the cache;
             # otherwise high-concurrency batches can leave no room for
-            # runtime activations and fail with OOM.
+            # runtime activations and fail with OOM.  The pool accounting
+            # helper uses PyTorch's CUDA-shaped graph/memory API, which is also
+            # the supported interface on ROCm/HIP. Other OOT runtimes keep the
+            # estimate at zero until they expose a compatible graph profiler.
             cudagraph_memory_estimate = 0
             if (
-                current_platform.is_cuda()
+                (current_platform.is_cuda() or current_platform.is_rocm())
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
@@ -634,7 +643,7 @@ class WorkerFL(WorkerBase):
         free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory > free_gpu_memory, (
+        assert self.init_snapshot.free_memory >= free_gpu_memory, (
             "Error in memory profiling. "
             f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
             f"current free memory {GiB(free_gpu_memory)} GiB. "
@@ -889,6 +898,19 @@ class WorkerFL(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+
+        # Emit one aggregate observation after model warmup/capture. This is
+        # deliberately outside the request path and proves that an explicitly
+        # enabled FlagGems plan cache is installed and receiving real hits.
+        if fl_envs.USE_FLAGGEMS and (
+            self.rank == 0
+            or os.getenv("VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE", "0") == "1"
+        ):
+            from vllm_fl.patches.flaggems_aten_plan_cache import (
+                log_flaggems_aten_plan_cache_stats,
+            )
+
+            log_flaggems_aten_plan_cache_stats("post-warmup")
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
@@ -1313,6 +1335,20 @@ class WorkerFL(WorkerBase):
         )
 
     def shutdown(self) -> None:
+        if (
+            fl_envs.USE_FLAGGEMS
+            and os.getenv("VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE", "0") == "1"
+        ):
+            # This boundary has no request-path overhead. Keep shutdown safe
+            # even when it follows an unrelated initialization failure.
+            try:
+                from vllm_fl.patches.flaggems_aten_plan_cache import (
+                    log_flaggems_aten_plan_cache_stats,
+                )
+
+                log_flaggems_aten_plan_cache_stats("pre-shutdown")
+            except Exception as error:
+                logger.warning("Could not report final plan-cache stats: %s", error)
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:

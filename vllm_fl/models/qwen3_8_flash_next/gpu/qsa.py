@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""vLLM 0.24 ABI owner around the official Qwen4 QSA kernels."""
+"""Cross-vendor QSA owner with FlagTree/Triton kernels."""
 
 from __future__ import annotations
 
@@ -92,11 +92,12 @@ def _unpack_qsa_kv_cache(
 
 
 class Qwen3_8FlashNextQSAAttentionBackend(AttentionBackend):
-    """Main K/V cache owner for the official QSA transaction.
+    """Main K/V cache owner for the Triton QSA transaction.
 
-    The class is only the vLLM 0.24 integration boundary. All QSA math,
-    selection, sparse attention, and side-cache updates are dispatched through
-    ``vendor.official.qsa``.
+    QSA performs cache update and sparse attention in its model custom op, so
+    it needs vLLM only for cache allocation and device-side metadata building.
+    Owning those interfaces directly avoids coupling the model to a vendor's
+    FlashAttention extension or cache-update ABI.
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
@@ -104,7 +105,7 @@ class Qwen3_8FlashNextQSAAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "QWEN38_FLASH_NEXT_QSA_OFFICIAL"
+        return "QWEN38_FLASH_NEXT_QSA_FLAGTREE"
 
     @staticmethod
     def get_impl_cls():
@@ -286,6 +287,14 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             ),
             persistent=False,
         )
+        # Keep one caller-owned partial workspace per layer and graph bucket.
+        # The global vLLM workspace is shared by sequential layers; retaining
+        # these views here prevents a later rows/TopK bucket from resizing the
+        # allocation referenced by an already-captured graph.
+        self._qsa_split_workspaces: dict[
+            tuple[int, int, int, int, int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -312,6 +321,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        gate: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
         metadata = get_forward_context().attn_metadata
@@ -345,7 +355,11 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen3.8-Flash-Next QSA requires BF16 Q/K/V")
 
-        from .ops.qsa import qsa_sparse_paged_attention, qsa_store_cache_rows
+        from .ops.qsa import (
+            qsa_prepare_split_workspace,
+            qsa_sparse_paged_attention,
+            qsa_store_kv_cache_rows,
+        )
 
         slot_mapping = main_metadata.slot_mapping[:num_tokens]
         if num_tokens and has_native_cache_update():
@@ -362,29 +376,24 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self._v_scale,
             )
         else:
-            # Cross-vendor fallback. ``view`` (rather than reshape) makes a
-            # non-viewable allocator layout fail instead of silently copying
-            # rows away from the backing cache.
-            flat_width = self.num_kv_heads * self.head_dim
-            flat_key_cache = key_cache.view(
-                key_cache.shape[0], key_cache.shape[1], 1, flat_width
-            )
-            flat_value_cache = value_cache.view(
-                value_cache.shape[0], value_cache.shape[1], 1, flat_width
-            )
-            qsa_store_cache_rows(
-                flat_key_cache,
+            # Cross-vendor fallback: one stride-aware launch writes K and V
+            # without flattening the allocator-owned head/dim layout.
+            qsa_store_kv_cache_rows(
+                key_cache,
+                value_cache,
                 slot_mapping,
-                key[:num_tokens].reshape(num_tokens, 1, flat_width),
-            )
-            qsa_store_cache_rows(
-                flat_value_cache,
-                slot_mapping,
-                value[:num_tokens].reshape(num_tokens, 1, flat_width),
+                key[:num_tokens],
+                value[:num_tokens],
             )
 
         output.zero_()
         if num_tokens:
+            _, split_workspace = qsa_prepare_split_workspace(
+                query[:num_tokens],
+                key_cache,
+                self.topk_indices_buffer.shape[1],
+                self._qsa_split_workspaces,
+            )
             qsa_sparse_paged_attention(
                 query[:num_tokens],
                 key_cache,
@@ -392,7 +401,10 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.topk_indices_buffer[:num_tokens],
                 main_metadata.block_table,
                 side_metadata.token_to_req[:num_tokens],
+                self.scaling,
                 output[:num_tokens],
+                gate=gate[:num_tokens],
+                split_workspace=split_workspace,
             )
 
     def forward(
@@ -402,10 +414,13 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        if gate is None:
+            raise RuntimeError("Qwen3.8-Flash-Next QSA requires its output gate")
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        gate = gate.view_as(query)
         attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
@@ -415,6 +430,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 query,
                 key,
                 value,
+                gate,
                 attn_output,
                 encoded_layer_name,
             )
@@ -425,12 +441,11 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 query,
                 key,
                 value,
+                gate,
                 attn_output,
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        if gate is not None:
-            flat_output = flat_output * torch.sigmoid(gate)
         output, _ = self.o_proj(flat_output)
         return output
 
@@ -441,6 +456,7 @@ def qwen3_8_flash_next_qsa_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    gate: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
 ) -> None:
@@ -456,6 +472,7 @@ def qwen3_8_flash_next_qsa_with_output(
         query,
         key,
         value,
+        gate,
         output,
     )
 
@@ -466,10 +483,11 @@ def qwen3_8_flash_next_qsa_with_output_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    gate: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
 ) -> None:
-    del hidden_states, positions, query, key, value, output, layer_name
+    del hidden_states, positions, query, key, value, gate, output, layer_name
 
 
 direct_register_custom_op(

@@ -46,7 +46,9 @@ def _last_write_mask_host(values: list[int]) -> list[bool]:
     return keep
 
 
-def _last_enabled_write_mask_host(values: list[int], enabled: list[bool]) -> list[bool]:
+def _last_enabled_write_mask_host(
+    values: list[int], enabled: list[bool]
+) -> list[bool]:
     """Keep only the final enabled writer for every remapped cache row."""
 
     safe = [0 if value == NULL_BLOCK_ID else value for value in values]
@@ -278,14 +280,18 @@ def test_ple_state_scatter_graph_replay_updates_inputs(num_indices):
     device = torch.device("cuda")
     dtype = torch.bfloat16
     cache_rows, hidden, width = 71, 3, 5
-    backing = torch.randn(cache_rows + 4, width, hidden, dtype=dtype, device=device)
+    backing = torch.randn(
+        cache_rows + 4, width, hidden, dtype=dtype, device=device
+    )
     state = backing[2 : 2 + cache_rows].transpose(1, 2)
     assert state.storage_offset() > 0
     baseline = state.clone()
 
     indices = torch.ones(num_indices, dtype=torch.int64, device=device)
     write_mask = torch.ones(num_indices, dtype=torch.bool, device=device)
-    rows_storage = torch.empty(num_indices, width, hidden, dtype=dtype, device=device)
+    rows_storage = torch.empty(
+        num_indices, width, hidden, dtype=dtype, device=device
+    )
     rows = rows_storage.transpose(1, 2)
 
     def set_case(offset: int) -> tuple[list[int], list[bool]]:

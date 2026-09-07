@@ -42,9 +42,11 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+
 from ..common.hyperconnection import (
     GatedResidualSimple,
     HyperConnectionConfig,
+    pack_gated_hc_projection_weights,
 )
 from ..config import Qwen3_8FlashNextTextConfig
 from .model import (
@@ -276,31 +278,41 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
             hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
             hidden_states = hidden_states.flatten(-2)
-            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
-        hidden_states, residual = layer(
+        hidden_states, block_output, injection = layer(
             hidden_states=hidden_states,
-            residual=residual,
+            prev_block_output=None,
+            prev_injection=None,
             positions=positions,
             input_ids=input_ids,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
         if not get_pp_group().is_last_rank:
+            assert injection is not None
+            hidden_states = layer.mlp_hyper_connection.combine_pending(
+                hidden_states,
+                block_output,
+                injection,
+            )
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # Last PP rank finalize. Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
         #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
         #       for the next draft step (zero extra compute, just kept).
-        multi_hidden = hidden_states
-        sample_hidden_states, _ = self.hyper_connection_mixer.mix(multi_hidden)
+        multi_hidden, sample_hidden_states, _ = (
+            self.hyper_connection_mixer.combine_and_mix(
+                hidden_states,
+                block_output,
+                injection,
+            )
+        )
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -315,7 +327,9 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
             skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        pack_gated_hc_projection_weights(self)
+        return loaded
 
 
 @support_torch_compile(
@@ -424,7 +438,9 @@ class Qwen3_8FlashNextMTP(nn.Module, SupportsPP, QwenNextMixtureOfExperts):
             skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(remap_weight_names())
+        loaded = loader.load_weights(remap_weight_names())
+        pack_gated_hc_projection_weights(self)
+        return loaded
 
 
 __all__ = ["Qwen3_8FlashNextMTP", "Qwen3_8FlashNextMultiTokenPredictor"]

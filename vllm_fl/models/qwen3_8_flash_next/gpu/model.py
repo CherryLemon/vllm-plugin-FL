@@ -99,6 +99,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from ..common.hyperconnection import (
     GatedResidualSimple,
     HyperConnectionConfig,
+    pack_gated_hc_projection_weights,
 )
 from ..config import Qwen3_8FlashNextConfig, Qwen3_8FlashNextTextConfig
 from .ple_layer import Qwen3_8FlashNextPLELayer
@@ -576,17 +577,31 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        positions: torch.Tensor,
+        prev_block_output: torch.Tensor | None = None,
+        prev_injection: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # Keep a clear failure mode for old callers that still try to pass a
+        # separate residual tensor.  HC's pending state is a block output plus
+        # injection logits, not the ordinary vLLM residual ABI.
+        legacy_residual = kwargs.pop("residual", None)
+        if legacy_residual is not None:
+            raise ValueError("HC layers use prev_block_output/prev_injection")
         del kwargs
-        if residual is not None:
-            raise ValueError("HC layers do not use a separate residual tensor")
         if self.ple is not None:
+            # PLE adds to the materialized multi-stream state.  It therefore
+            # terminates a pending delayed combine before its external add.
+            if prev_block_output is not None and prev_injection is not None:
+                hidden_states = self.attn_hyper_connection.combine_pending(
+                    hidden_states,
+                    prev_block_output,
+                    prev_injection,
+                )
+                prev_block_output = prev_injection = None
             if input_ids is None:
                 raise ValueError("PLE requires input_ids")
             if query_start_loc is None:
@@ -600,7 +615,11 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
                 ngram_context,
             )
 
-        mixed, hc_residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, mixed, injection = self.attn_hyper_connection.combine_and_mix(
+            hidden_states,
+            prev_block_output,
+            prev_injection,
+        )
         if self.layer_type == "linear_attention":
             if self._gdn_requires_output_buffer:
                 # vLLM 0.24's pluggable GDN ABI writes into a caller-provided
@@ -616,19 +635,26 @@ class Qwen3_8FlashNextDecoderLayer(Qwen3NextDecoderLayer):
             )
         else:
             raise ValueError("Invalid layer_type")
-        hidden_states = self_attention_output
         if get_tensor_model_parallel_world_size() > 1:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, hc_residual)
+            self_attention_output = tensor_model_parallel_all_reduce(
+                self_attention_output
+            )
 
-        mixed, hc_residual = self.mlp_hyper_connection.mix(hidden_states)
-        hidden_states = self.mlp(mixed)
+        # Consume the attention injection at the next HC boundary and leave
+        # the MLP output itself pending for the following layer/final mixer.
+        hidden_states, mixed, next_injection = (
+            self.mlp_hyper_connection.combine_and_mix(
+                hidden_states,
+                self_attention_output,
+                injection,
+            )
+        )
+        block_output = self.mlp(mixed)
         if get_tensor_model_parallel_world_size() > 1 and getattr(
             self.mlp, "requires_tp_all_reduce", True
         ):
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, hc_residual)
-        return hidden_states, None
+            block_output = tensor_model_parallel_all_reduce(block_output)
+        return hidden_states, block_output, next_injection
 
 
 @support_torch_compile(
@@ -733,20 +759,23 @@ class Qwen3_8FlashNextModel(nn.Module):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
-            residual = None
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = None
 
+        block_output: torch.Tensor | None = None
+        injection: torch.Tensor | None = None
+        last_layer = None
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
-            hidden_states, residual = layer(
+            last_layer = layer
+            hidden_states, block_output, injection = layer(
                 hidden_states=hidden_states,
-                residual=residual,
+                prev_block_output=block_output,
+                prev_injection=injection,
                 positions=positions,
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
@@ -767,20 +796,45 @@ class Qwen3_8FlashNextModel(nn.Module):
                     )
                     .flatten(-2)
                 )
+                if block_output is not None and injection is not None:
+                    # Deepstack is an external add and must see the fully
+                    # materialized state, so it explicitly ends the delayed
+                    # combine chain for this layer.
+                    hidden_states = layer.mlp_hyper_connection.combine_pending(
+                        hidden_states,
+                        block_output,
+                        injection,
+                    )
+                    block_output = injection = None
                 hidden_states = hidden_states + deepstack_embed
 
         if not get_pp_group().is_last_rank:
+            # PP transports one tensor.  Materialize the pending MLP block at
+            # the stage boundary instead of silently dropping its injection.
+            if last_layer is not None and block_output is not None:
+                assert injection is not None
+                hidden_states = last_layer.mlp_hyper_connection.combine_pending(
+                    hidden_states,
+                    block_output,
+                    injection,
+                )
             return IntermediateTensors({"hidden_states": hidden_states})
 
+        assert self.hyper_connection_mixer is not None
+        multi_hidden, sample_hidden_states, _ = (
+            self.hyper_connection_mixer.combine_and_mix(
+                hidden_states,
+                block_output,
+                injection,
+            )
+        )
         if self._mtp_hidden_buffer is not None:
-            # Capture the pre-final-mixer multi-stream residual
+            # Capture the pre-final-mixer multi-stream state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
             # this tensor is needed by the final mixer regardless).
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states)
-        assert self.hyper_connection_mixer is not None
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        return hidden_states
+            num_tokens = multi_hidden.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
@@ -857,6 +911,7 @@ class Qwen3_8FlashNextModel(nn.Module):
             mapper=mapper,
         )
         loaded.update(legacy_loaded)
+        pack_gated_hc_projection_weights(self)
         return loaded
 
 
@@ -1078,7 +1133,9 @@ class Qwen3_8FlashNextForCausalLM(
             skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        pack_gated_hc_projection_weights(self)
+        return loaded
 
 
 class Qwen3_8FlashNextMixtureOfExperts(MixtureOfExperts):
@@ -1188,7 +1245,7 @@ class Qwen3_8FlashNextForConditionalGeneration(
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
             # vLLM 0.24's Qwen3.5 multimodal base does not provide the newer
             # _init_video_pruning() helper and does not support EVS pruning.
-            # Keep the same 0.24 semantics explicitly for this backport.
+            # Preserve the existing day0 compatibility behavior.
             self.is_multimodal_pruning_enabled = False
             self.video_pruning_method = None
             self.video_pruning_rate = 0.0
@@ -1324,7 +1381,9 @@ class Qwen3_8FlashNextForConditionalGeneration(
             skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        pack_gated_hc_projection_weights(self)
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(

@@ -9,6 +9,7 @@ without modifying either the checkpoint or the installed vLLM package.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
@@ -184,10 +185,13 @@ def apply_native_index_select_policy(
     batch. Each accelerator's PyTorch backend supplies the safe fallback.
 
     On NVIDIA only, keep decode ``repeat_interleave`` and dense ``linear`` on
-    native ATen. The generic FlagGems repeat-interleave path introduces a
-    stream synchronization, while matched H100 profiling shows its generic
-    dense path is slower than native ATen. Other vendors retain FlagGems until
-    their own backend is measured.
+    native ATen.  The generic FlagGems repeat-interleave implementation drops
+    vLLM's host-known ``output_size`` and performs ``cumsum[-1].item()``, which
+    introduces one stream synchronization per GDN layer.  Matched H100 nsys
+    also shows the generic FlagGems linear path at roughly 3x the native dense
+    GEMM time.  Other accelerator vendors retain their FlagGems paths until
+    they have vendor-specific measurements; this is a performance policy, not
+    a CUDA-only model requirement.
     """
 
     if not needs_native_index_select(vllm_config):
@@ -201,10 +205,15 @@ def apply_native_index_select_policy(
         "constant_pad_nd",
     ]
     if vendor_name == "nvidia":
+        # FlagGems ``unused`` entries are implementation function names, not
+        # ATen overload names (for example, not repeat_interleave.self_Tensor).
         required_native_ops.extend(
             (
                 "repeat_interleave_tensor",
                 "repeat_interleave_self_tensor",
+                # aten::linear is CompositeImplicitAutograd.  Once its direct
+                # FlagGems implementation is disabled it decomposes to mm or
+                # addmm, so those leaf implementations must stay native too.
                 "linear",
                 "mm",
                 "mm_out",
@@ -244,14 +253,56 @@ def should_skip_generic_flaggems_aten(
     heuristics. Explicit fused/OOT QSA, HC and MoE kernels are registered by a
     separate path and remain enabled. Other accelerators keep FlagGems because
     their native PyTorch backends may not offer an equivalent fast path. An
-    explicit whitelist remains a user override.
+    explicit whitelist remains a user override. An explicitly requested ATen
+    plan-cache also retains generic FlagGems dispatch so it can cache plans.
     """
 
     return (
         vendor_name == "nvidia"
         and whitelist is None
         and needs_native_index_select(vllm_config)
+        and os.getenv(
+            "VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE",
+            os.getenv("FLAGGEMS_ATEN_PLAN_CACHE", "0"),
+        ).strip().lower() in {"0", "false", "off", "no"}
     )
+
+
+def _patch_common_attention_token_to_req_cache() -> None:
+    """Backport vLLM's shared per-token request-index cache to v0.24."""
+    import torch
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    if hasattr(CommonAttentionMetadata, "token_to_req_indices"):
+        return
+
+    def token_to_req_indices(self, buffer: torch.Tensor) -> torch.Tensor:
+        num_tokens = self.num_actual_tokens
+        cached = getattr(self, "_token_to_req_indices_cache", None)
+        if cached is not None:
+            assert cached.device == buffer.device
+            assert cached.dtype == torch.int32
+            assert cached.shape[0] >= num_tokens
+            return cached[:num_tokens]
+
+        num_mapped_tokens = int(self.query_start_loc_cpu[-1])
+        query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
+        assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
+        mapping = torch.repeat_interleave(
+            torch.arange(
+                query_lens.shape[0], dtype=torch.int32, device=buffer.device
+            ),
+            query_lens,
+            output_size=num_mapped_tokens,
+        )
+        buffer[:num_mapped_tokens].copy_(mapping)
+        if num_mapped_tokens < num_tokens:
+            buffer[num_mapped_tokens:num_tokens].zero_()
+        cached = buffer[: max(num_mapped_tokens, num_tokens)]
+        self._token_to_req_indices_cache = cached
+        return cached[:num_tokens]
+
+    setattr(CommonAttentionMetadata, "token_to_req_indices", token_to_req_indices)
 
 
 def _patch_ple_metadata_bridge() -> None:
@@ -330,6 +381,7 @@ def apply_qwen3_8_flash_next_patches() -> bool:
             architecture, f"{module}:{class_name}"
         )
 
+    _patch_common_attention_token_to_req_cache()
     _patch_ple_metadata_bridge()
     _register_compilation_boundaries()
     patch_vllm_packed_gdn_beta()

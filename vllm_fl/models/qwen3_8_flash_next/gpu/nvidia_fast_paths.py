@@ -11,8 +11,9 @@ mistaking plugin schema stubs for an executable NVIDIA implementation.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any
 
 import torch
 from torch import nn
@@ -24,11 +25,29 @@ def is_nvidia_platform() -> bool:
     """Return true only for vLLM's NVIDIA CUDA platform, never ROCm."""
 
     try:
-        return bool(current_platform.is_cuda()) and not bool(
-            current_platform.is_rocm()
-        )
+        return bool(current_platform.is_cuda()) and not bool(current_platform.is_rocm())
     except (AttributeError, RuntimeError):
         return False
+
+
+def qsa_sparse_triton_launch_config(
+    device: torch.device,
+) -> tuple[int, int, int]:
+    """Return the measured sparse-QSA config, guarded by GPU architecture.
+
+    ``(64, 8, 3)`` is validated on SM90 H100/H200 shapes.  Every other
+    NVIDIA architecture and every non-NVIDIA accelerator keeps the original
+    conservative Triton configuration until it has its own benchmark.
+    """
+
+    if not is_nvidia_platform() or device.type != "cuda":
+        return 16, 4, 2
+    try:
+        if torch.cuda.get_device_capability(device) == (9, 0):
+            return 64, 8, 3
+    except (AssertionError, RuntimeError):
+        pass
+    return 16, 4, 2
 
 
 def _has_cuda_kernel(qualified_op: str) -> bool:
@@ -36,9 +55,7 @@ def _has_cuda_kernel(qualified_op: str) -> bool:
         return False
     try:
         return bool(
-            torch._C._dispatch_has_kernel_for_dispatch_key(
-                qualified_op, "CUDA"
-            )
+            torch._C._dispatch_has_kernel_for_dispatch_key(qualified_op, "CUDA")
         )
     except (AttributeError, RuntimeError):
         return False
@@ -142,9 +159,9 @@ def _mrope_kernel() -> tuple[Callable[..., Any] | None, bool]:
     except (ImportError, OSError):
         return None, False
     try:
-        has_neox_argument = "is_neox_style" in inspect.signature(
-            triton_mrope
-        ).parameters
+        has_neox_argument = (
+            "is_neox_style" in inspect.signature(triton_mrope).parameters
+        )
     except (TypeError, ValueError):
         # vLLM 0.24 is the known eight-argument ABI. Unknown wrappers should
         # stay on the public/native fallback rather than be guessed here.
@@ -201,4 +218,5 @@ __all__ = [
     "is_nvidia_platform",
     "native_cache_update",
     "native_topk",
+    "qsa_sparse_triton_launch_config",
 ]

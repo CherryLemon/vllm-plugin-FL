@@ -117,16 +117,12 @@ def test_dilated_short_conv_stateful_matches_explicit_fconv(hidden, kernel, dila
     # This is the exact F.conv1d formulation used by the plugin's prefill and
     # decode fallbacks: one depthwise channel, causal history, then SiLU.
     history = torch.cat([initial_state, x.transpose(0, 1)], dim=-1).unsqueeze(0)
-    direct = (
-        F.conv1d(
-            history,
-            weight.unsqueeze(1),
-            groups=hidden,
-            dilation=dilation,
-        )
-        .squeeze(0)
-        .transpose(0, 1)
-    )
+    direct = F.conv1d(
+        history,
+        weight.unsqueeze(1),
+        groups=hidden,
+        dilation=dilation,
+    ).squeeze(0).transpose(0, 1)
     torch.testing.assert_close(expected, F.silu(direct), rtol=1e-5, atol=1e-5)
     if state_len:
         torch.testing.assert_close(expected_state, history[..., -state_len:].squeeze(0))
@@ -145,6 +141,8 @@ def test_dilated_short_conv_chunking_preserves_state_and_output():
     first, state = dilated_short_conv_reference(
         x[:4], weight, dilation=3, state=initial
     )
-    second, state = dilated_short_conv_reference(x[4:], weight, dilation=3, state=state)
+    second, state = dilated_short_conv_reference(
+        x[4:], weight, dilation=3, state=state
+    )
     torch.testing.assert_close(torch.cat([first, second]), whole)
     torch.testing.assert_close(state, whole_state)

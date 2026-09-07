@@ -7,6 +7,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -286,6 +287,11 @@ from vllm_fl.worker.common_attention_metadata import (
     compute_common_attention_metadata,
 )
 
+from vllm_fl.worker.common_slot_mapping import (
+    CommonSlotMappingGraphRunner,
+    compute_common_slot_mapping,
+)
+from vllm_fl.worker.packed_block_table import PackedBlockTableArena
 GraphWrapper = GraphWrapper
 
 if TYPE_CHECKING:
@@ -298,6 +304,181 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+# Waiting on a CUDA event from the async-output thread introduces a second
+# stream of CUDA runtime calls into the output-rank process. Under a busy
+# CUDA-graph serving loop, those calls contend with the model thread's launch
+# path and turn rank-arrival skew into apparent first-collective time.
+#
+# A Python cudaLaunchHostFunc callback is not safe here: the callback needs the
+# GIL, while a CUDA API running on the model thread may hold the GIL and wait
+# for the callback's stream (cudaProfilerStop is one concrete example). The
+# plugin C++ extension instead enqueues a native callback which only writes to
+# a Linux eventfd. The output thread blocks in os.read(), which releases the
+# GIL and does not enter the accelerator runtime. Unsupported platforms,
+# extension/driver ABI failures, and pool exhaustion retain vLLM's Event
+# synchronization fallback.
+_ASYNC_OUTPUT_COMPLETION_POOL_SIZE = 64
+
+
+class _NativeEventfdCompletionPool:
+    """Process-local pool of native stream-callback completion events."""
+
+    def __init__(self, capacity: int = _ASYNC_OUTPUT_COMPLETION_POOL_SIZE):
+        if capacity <= 0:
+            raise ValueError("Native completion pool capacity must be positive.")
+        if not hasattr(os, "eventfd"):
+            raise RuntimeError("Linux eventfd is unavailable.")
+
+        # Import lazily because non-NVIDIA platforms may intentionally ship no
+        # plugin extension. The op itself dynamically resolves libcuda.
+        import importlib
+
+        importlib.import_module("vllm_fl._C")
+        namespace = getattr(torch.ops, "vllm_fl", None)
+        enqueue_op = (
+            getattr(namespace, "enqueue_cuda_eventfd_completion", None)
+            if namespace is not None
+            else None
+        )
+        if enqueue_op is None:
+            raise RuntimeError(
+                "vllm_fl native eventfd completion op is unavailable."
+            )
+
+        event_fds: list[int] = []
+        try:
+            for _ in range(capacity):
+                event_fds.append(os.eventfd(0, os.EFD_CLOEXEC))
+        except Exception:
+            for event_fd in event_fds:
+                os.close(event_fd)
+            raise
+
+        self._enqueue_op = enqueue_op
+        self._event_fds = event_fds
+        self._available = list(range(capacity - 1, -1, -1))
+        self._lock = threading.Lock()
+        self._supported = True
+
+    def acquire(self) -> int | None:
+        with self._lock:
+            if not self._supported or not self._available:
+                return None
+            return self._available.pop()
+
+    def enqueue(self, stream: Any) -> "_NativeEventfdCompletion | None":
+        slot = self.acquire()
+        if slot is None:
+            return None
+        try:
+            status = int(
+                self._enqueue_op(
+                    int(stream.cuda_stream), self._event_fds[slot]
+                )
+            )
+            if status != 0:
+                raise RuntimeError(
+                    "native CUDA host callback enqueue failed with status "
+                    f"{status}"
+                )
+        except Exception as exc:
+            with self._lock:
+                self._supported = False
+                self._available.append(slot)
+            logger.warning_once(
+                "Native async-output completion is unavailable; using "
+                "accelerator Event synchronization instead: %s",
+                exc,
+            )
+            return None
+        return _NativeEventfdCompletion(self, slot)
+
+    def wait(self, slot: int) -> None:
+        # CPython releases the GIL around the blocking read. The native CUDA
+        # callback writes one uint64 after all preceding copy-stream work.
+        payload = os.read(self._event_fds[slot], 8)
+        if len(payload) != 8 or int.from_bytes(payload, "little") == 0:
+            raise RuntimeError("Invalid native completion eventfd payload.")
+
+    def release(self, slot: int) -> None:
+        with self._lock:
+            self._available.append(slot)
+
+
+class _NativeEventfdCompletion(NamedTuple):
+    pool: _NativeEventfdCompletionPool
+    slot: int
+
+
+_native_completion_pool: _NativeEventfdCompletionPool | bool | None = None
+_native_completion_pool_lock = threading.Lock()
+
+
+def _get_native_completion_pool() -> _NativeEventfdCompletionPool | None:
+    global _native_completion_pool
+    if not current_platform.is_cuda() or _native_completion_pool is False:
+        return None
+    if _native_completion_pool is None:
+        with _native_completion_pool_lock:
+            if _native_completion_pool is None:
+                try:
+                    _native_completion_pool = _NativeEventfdCompletionPool()
+                except (
+                    ImportError,
+                    AttributeError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    _native_completion_pool = False
+                    logger.warning_once(
+                        "Native async-output completion initialization "
+                        "failed; using accelerator Event synchronization: %s",
+                        exc,
+                    )
+    return (
+        _native_completion_pool
+        if isinstance(_native_completion_pool, _NativeEventfdCompletionPool)
+        else None
+    )
+
+
+def _enqueue_native_completion(
+    stream: Any,
+) -> _NativeEventfdCompletion | None:
+    pool = _get_native_completion_pool()
+    if pool is None:
+        return None
+    completion = pool.enqueue(stream)
+    if completion is None and pool._supported:
+        logger.warning_once(
+            "Native async-output completion pool exhausted; using "
+            "accelerator Event synchronization for this output."
+        )
+    return completion
+
+
+def _wait_for_async_output_event(
+    event: Any, completion: _NativeEventfdCompletion | None
+) -> None:
+    """Wait until async D2H copies are safe to consume on the CPU."""
+    if completion is None:
+        event.synchronize()
+        return
+    try:
+        completion.pool.wait(completion.slot)
+    except (OSError, RuntimeError) as exc:
+        logger.warning_once(
+            "Native async-output completion wait failed; synchronizing the "
+            "accelerator Event instead: %s",
+            exc,
+        )
+        event.synchronize()
+    finally:
+        completion.pool.release(completion.slot)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -342,6 +523,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 if self._routed_experts is not None
                 else None
             )
+            self._async_copy_completion = _enqueue_native_completion(
+                async_output_copy_stream
+            )
             self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
@@ -350,7 +534,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        _wait_for_async_output_event(
+            self.async_copy_ready_event, self._async_copy_completion
+        )
+        self._async_copy_completion = None
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -451,13 +638,19 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
                 raw_pooler_output=self._raw_pooler_output,
                 finished_mask=finished_mask,
             )
+            self._async_copy_completion = _enqueue_native_completion(
+                async_output_copy_stream
+            )
             self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        self.async_copy_ready_event.synchronize()
+        _wait_for_async_output_event(
+            self.async_copy_ready_event, self._async_copy_completion
+        )
+        self._async_copy_completion = None
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
@@ -808,6 +1001,9 @@ class ModelRunnerFL(
             self.max_num_reqs + 1, dtype=torch.int32
         )
         self.common_attention_metadata_graph = CommonAttentionMetadataGraphRunner()
+        self.common_slot_mapping_graph = CommonSlotMappingGraphRunner()
+        self.packed_block_table_arena: PackedBlockTableArena | None = None
+        self._install_packed_block_table_arena()
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -1979,6 +2175,74 @@ class ModelRunnerFL(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _install_packed_block_table_arena(self) -> None:
+        """Install the fixed-address packed block-table/slot arena.
+
+        This is intentionally a best-effort metadata optimization.  A vendor
+        ``CpuGpuBuffer`` may have stronger assumptions than the vLLM buffer
+        (for example, contiguous group storage), so construction failure must
+        retain the stock per-group commit path rather than change correctness.
+        The all-on harness explicitly enables this switch. Other day0 users
+        retain the existing common-attention metadata path by default.
+        """
+        old_arena = getattr(self, "packed_block_table_arena", None)
+        if old_arena is not None:
+            old_arena.close()
+        self.packed_block_table_arena = None
+
+        disabled = os.getenv("VLLM_FL_PACKED_BLOCK_TABLE_ARENA", "0").lower()
+        require = os.getenv("VLLM_FL_PACKED_BLOCK_TABLE_REQUIRE", "0").lower()
+        require = require not in {"0", "false", "off", "no"}
+        if disabled in {"0", "false", "off", "no"}:
+            if require:
+                raise RuntimeError(
+                    "VLLM_FL_PACKED_BLOCK_TABLE_REQUIRE=1 but the packed "
+                    "block-table arena is disabled"
+                )
+            return
+
+        try:
+            self.packed_block_table_arena = PackedBlockTableArena(
+                self.input_batch.block_table,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+        except Exception as exc:
+            if require:
+                raise RuntimeError(
+                    "Packed block-table arena is required but could not be "
+                    "installed"
+                ) from exc
+            # Do not make model startup depend on an optional aliasing
+            # optimization.  The warning includes the exception for remote
+            # diagnosis while the normal per-group path remains unchanged.
+            logger.warning_once(
+                "Packed block-table arena disabled; falling back to per-group "
+                "metadata copies: %s",
+                exc,
+            )
+        else:
+            logger.info(
+                "Packed block-table arena enabled: groups=%d packed_width=%d "
+                "h2d_copies=1 slot_producer=2d",
+                self.packed_block_table_arena.group_count,
+                self.packed_block_table_arena.total_block_width,
+            )
+
+    def _close_packed_block_table_arena(self) -> None:
+        arena = getattr(self, "packed_block_table_arena", None)
+        if arena is not None:
+            arena.close()
+            self.packed_block_table_arena = None
+
+    def _commit_block_table(self, num_reqs: int) -> None:
+        """Copy block-table rows once, with a safe stock fallback."""
+        arena = self.packed_block_table_arena
+        if arena is not None and arena.block_table is self.input_batch.block_table:
+            arena.commit(num_reqs)
+        else:
+            self.input_batch.block_table.commit_block_table(num_reqs)
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1999,7 +2263,7 @@ class ModelRunnerFL(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        self._commit_block_table(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -4176,7 +4440,14 @@ class ModelRunnerFL(
             cudagraph_mode != CUDAGraphMode.NONE
             and not self.parallel_config.use_ubatching
         )
-        return self.common_attention_metadata_graph.run(
+        arena = getattr(self, "packed_block_table_arena", None)
+        if arena is not None and arena.block_table is self.input_batch.block_table:
+            runner = self.common_slot_mapping_graph
+            compute = compute_common_slot_mapping
+        else:
+            runner = self.common_attention_metadata_graph
+            compute = compute_common_attention_metadata
+        return runner.run(
             self.input_batch.block_table,
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
@@ -4185,7 +4456,7 @@ class ModelRunnerFL(
             self.num_computed_tokens[:num_reqs],
             use_graph=use_graph,
             capture=capture,
-            compute=compute_common_attention_metadata,
+            compute=compute,
         )
 
     def _get_slot_mappings(
@@ -4500,7 +4771,9 @@ class ModelRunnerFL(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
-                    block_table_rows_are_current=True,
+                    # The packed producer updates slots but retains the tested
+                    # builder-side NULL_BLOCK_ID cleanup for padded rows.
+                    block_table_rows_are_current=self.packed_block_table_arena is None,
                 )
             )
 
@@ -6111,7 +6384,7 @@ class ModelRunnerFL(
                 # remove_request() are visible to the attention metadata
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
-                self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                self._commit_block_table(num_reqs_padded)
                 self._run_common_attention_metadata(
                     num_reqs_padded,
                     cudagraph_runtime_mode,
@@ -6128,7 +6401,7 @@ class ModelRunnerFL(
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
-                    block_table_rows_are_current=True,
+                    block_table_rows_are_current=self.packed_block_table_arena is None,
                 )
 
             # Dummy forwards must not update real KV-cache slots. Capture the
@@ -6619,6 +6892,9 @@ class ModelRunnerFL(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        # The cleanup above synchronizes and destroys slot-mapping graphs
+        # first; only then is it safe to release the arena's graph addresses.
+        self._close_packed_block_table_arena()
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
@@ -6637,6 +6913,7 @@ class ModelRunnerFL(
     def _cleanup_profiling_kv_cache(self) -> None:
         _accelerator_synchronize()
         self.common_attention_metadata_graph.clear()
+        self.common_slot_mapping_graph.clear()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -7258,6 +7535,12 @@ class ModelRunnerFL(
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
         ):
+            # Graphs and packed views retain pointers into the old input batch.
+            # Tear both down before replacing it; the new batch is installed
+            # below with fresh, capture-stable addresses.
+            self.common_attention_metadata_graph.clear()
+            self.common_slot_mapping_graph.clear()
+            self._close_packed_block_table_arena()
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self.input_batch = InputBatch(
@@ -7275,6 +7558,7 @@ class ModelRunnerFL(
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
             )
+            self._install_packed_block_table_arena()
 
         assert self._init_block_sizes == block_sizes, (
             f"InputBatch block_sizes {self._init_block_sizes} != "
@@ -7545,6 +7829,15 @@ class ModelRunnerFL(
             self.kv_caches,
             num_attn_module,
         )
+        # vLLM 0.24's helper assigns ``layer.kv_cache`` directly. QSA's raw
+        # side cache needs its bind hook to expose typed key/position views;
+        # newer vLLM calls this hook natively.
+        for layer_name, kv_cache in kv_caches.items():
+            layer = self.compilation_config.static_forward_context[layer_name]
+            if layer.__class__.__module__.endswith(
+                "qwen3_8_flash_next.common.qsa_cache"
+            ):
+                layer.bind_kv_cache(kv_cache)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

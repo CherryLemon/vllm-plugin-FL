@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import os
 import re
 from typing import Any
 
@@ -40,6 +41,48 @@ _TARGET_NAME = "fused_recurrent_gated_delta_rule_packed_decode_kernel"
 _VULNERABLE_BETA_EXPRESSION = (
     "tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)"
 )
+_GDN_SUBTILE_V = 16
+_selection_logged = False
+
+
+def _strict_patch_requested() -> bool:
+    return os.environ.get("VLLM_FL_GDN_STRICT_PATCH", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _strict_patch_failure(reason: str, exc: BaseException | None = None) -> None:
+    """Raise only when deployment explicitly requires this candidate.
+
+    The normal plugin import path remains portable across vLLM/vendor builds,
+    while the validation and production launch can set the gate to make an
+    accidental fallback fail fast instead of silently using the old kernel.
+    """
+
+    if _strict_patch_requested():
+        error = f"VLLM_FL_GDN_STRICT_PATCH=1: {reason}"
+        if exc is None:
+            raise RuntimeError(error)
+        raise RuntimeError(error) from exc
+
+
+def _log_selected_kernel() -> None:
+    """Emit one process-level record of the actual packed-GDN selection."""
+
+    global _selection_logged
+    if _selection_logged:
+        return
+    _selection_logged = True
+    logger.info(
+        "GDN packed decode selected: kernel=%s BV=wrapper(min(nextpow2(V),32)) "
+        "num_warps=wrapper(1) num_stages=wrapper(3) FP32_beta=1 "
+        "FP32_state=1 register_layout=two_%d_row_subtiles",
+        _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta.__name__,
+        _GDN_SUBTILE_V,
+    )
 
 
 @triton.jit
@@ -82,12 +125,16 @@ def _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta(
     i_h = i_hv // (HV // H)
 
     o_k = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
     mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_v[:, None] & mask_k[None, :]
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+
+    # Keep the invalid-state behavior observable for every output lane.  The
+    # valid path below uses two 16-row subtiles when BV=32; each row is
+    # independent, so this lowers the live recurrent tile from 32xBK to
+    # 16xBK while keeping the wrapper's BV/grid contract unchanged.
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_v = o_v < V
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
     # Skip if state index is invalid (NULL_BLOCK_ID=0).
@@ -97,19 +144,21 @@ def _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta(
         return
 
     p_h0 = h0 + state_idx * stride_init_state_token
-    p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    p_h0 = p_h0 + i_hv * V * K
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
     k_off = (H * K) + i_h * K + o_k
-    v_off = (2 * H * K) + i_hv * V + o_v
     b_q = tl.load(p_mixed + q_off, mask=mask_k, other=0).to(tl.float32)
-    b_k = tl.load(p_mixed + k_off, mask=mask_k, other=0).to(tl.float32)
-    b_v = tl.load(p_mixed + v_off, mask=mask_v, other=0).to(tl.float32)
-
     if USE_QK_L2NORM_IN_KERNEL:
         b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+
+    # Normalize q and k in separate live ranges.  Loading both raw vectors
+    # before the first reduction keeps two extra 128-wide FP32 values live on
+    # Hopper; this ordering preserves FP32 QK normalization while reducing
+    # peak register pressure for the state tile below.
+    b_k = tl.load(p_mixed + k_off, mask=mask_k, other=0).to(tl.float32)
+    if USE_QK_L2NORM_IN_KERNEL:
         b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
 
@@ -125,16 +174,46 @@ def _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta(
     # dtype before applying it to the FP32 recurrent state.
     beta_val = tl.sigmoid(b_val)
 
-    b_h *= exp(g_val)
-    b_v -= tl.sum(b_h * b_k[None, :], 1)
-    b_v *= beta_val
-    b_h += b_v[:, None] * b_k[None, :]
-    b_o = tl.sum(b_h * b_q[None, :], 1)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
-
-    p_ht = ht + state_idx * stride_final_state_token
-    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+    # Keep the tile width literal: Triton 3.6 treats Python module globals
+    # differently across cache/codegen paths, while this value is part of the
+    # deliberate register-layout choice.  The second mask also preserves the
+    # original ABI if a caller ever supplies BV < 16 explicitly.
+    for v_start in range(0, BV, 16):
+        v_lane = tl.arange(0, 16)
+        o_v_block = i_v * BV + v_start + v_lane
+        mask_v_block = (v_start + v_lane < BV) & (o_v_block < V)
+        mask_h_block = mask_v_block[:, None] & mask_k[None, :]
+        p_o_block = o + (i_n * HV + i_hv) * V + o_v_block
+        p_h0_block = p_h0 + o_v_block[:, None] * K + o_k[None, :]
+        p_ht_block = ht + state_idx * stride_final_state_token
+        p_ht_block = (
+            p_ht_block
+            + i_hv * V * K
+            + o_v_block[:, None] * K
+            + o_k[None, :]
+        )
+        v_off_block = (2 * H * K) + i_hv * V + o_v_block
+        b_v_block = tl.load(
+            p_mixed + v_off_block, mask=mask_v_block, other=0
+        ).to(tl.float32)
+        b_h_block = tl.load(
+            p_h0_block, mask=mask_h_block, other=0
+        ).to(tl.float32)
+        b_h_block *= exp(g_val)
+        b_v_block -= tl.sum(b_h_block * b_k[None, :], 1)
+        b_v_block *= beta_val
+        b_h_block += b_v_block[:, None] * b_k[None, :]
+        b_o_block = tl.sum(b_h_block * b_q[None, :], 1)
+        tl.store(
+            p_o_block,
+            b_o_block.to(p_o_block.dtype.element_ty),
+            mask=mask_v_block,
+        )
+        tl.store(
+            p_ht_block,
+            b_h_block.to(p_ht_block.dtype.element_ty),
+            mask=mask_h_block,
+        )
 
 
 # Marker used for idempotence.  Triton JIT functions accept Python attributes
@@ -206,6 +285,14 @@ def patch_vllm_packed_gdn_beta() -> bool:
         current_kernel = getattr(target_module, _TARGET_NAME)
     except (ImportError, AttributeError) as exc:
         logger.debug("Packed GDN decode kernel is unavailable: %s", exc)
+        _strict_patch_failure("packed GDN decode kernel is unavailable", exc)
+        return False
+
+    # A second plugin/model registration must not replace or obscure the
+    # candidate.  Log this path too, so a model process has exactly one
+    # positive selection record even when the hook is called idempotently.
+    if current_kernel is _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta:
+        _log_selected_kernel()
         return False
 
     if not _has_known_triton_abi(current_kernel):
@@ -213,8 +300,12 @@ def patch_vllm_packed_gdn_beta() -> bool:
             "Packed GDN kernel is not the known Triton ABI; preserving %r",
             current_kernel,
         )
+        _strict_patch_failure("packed GDN kernel ABI is not the expected Triton ABI")
         return False
     if not _kernel_needs_beta_patch(current_kernel):
+        _strict_patch_failure(
+            "packed GDN kernel is not the vulnerable FP16/BF16-beta implementation"
+        )
         return False
 
     setattr(
@@ -222,6 +313,13 @@ def patch_vllm_packed_gdn_beta() -> bool:
         _TARGET_NAME,
         _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta,
     )
+    if (
+        getattr(target_module, _TARGET_NAME, None)
+        is not _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta
+    ):
+        _strict_patch_failure("packed GDN replacement did not bind to the target symbol")
+        return False
+    _log_selected_kernel()
     logger.info("Patched vLLM packed GDN decode to keep beta in FP32")
     return True
 

@@ -28,6 +28,36 @@ def test_non_nvidia_platform_never_probes_private_cuda_ops(monkeypatch):
     assert fast.is_nvidia_platform() is False
     assert fast.has_native_topk() is False
     assert fast.has_native_cache_update() is False
+    assert fast.qsa_sparse_triton_launch_config(torch.device("cuda")) == (
+        16,
+        4,
+        2,
+    )
+
+
+class _NvidiaPlatform:
+    @staticmethod
+    def is_cuda() -> bool:
+        return True
+
+    @staticmethod
+    def is_rocm() -> bool:
+        return False
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((8, 0), (16, 4, 2)),
+        ((9, 0), (64, 8, 3)),
+        ((10, 0), (16, 4, 2)),
+        ((12, 0), (16, 4, 2)),
+    ],
+)
+def test_sparse_qsa_config_is_sm90_only(monkeypatch, capability, expected):
+    monkeypatch.setattr(fast, "current_platform", _NvidiaPlatform())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    assert fast.qsa_sparse_triton_launch_config(torch.device("cuda")) == expected
 
 
 @pytest.mark.gpu

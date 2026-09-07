@@ -17,35 +17,31 @@ from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import (
 
 
 @pytest.mark.parametrize(
-    "backend,expected_indexes,expected_order,expected_layered_order",
+    "backend,expected_order,expected_layered_order",
     [
         (
             Qwen3_8FlashNextQSAAttentionBackend,
-            False,
             (0, 1, 2, 3, 4),
             (0, 1, 2, 3, 4, 5),
         ),
-        # The official QSA raw-state metadata uses a block-strided page so the
-        # vLLM 0.24 planner can pad its physical page to the main KV page.
-        (QSAStateBackend, True, (0, 1, 2, 3), (0, 1, 2, 3, 4)),
+        (QSAStateBackend, (0, 1, 2, 3), (0, 1, 2, 3, 4)),
     ],
 )
-def test_qsa_backends_expose_layout_contract(
-    backend, expected_indexes, expected_order, expected_layered_order
+def test_qsa_backends_use_layered_identity_layout(
+    backend, expected_order, expected_layered_order
 ):
-    assert backend.indexes_kv_by_block_stride() is expected_indexes
+    # An identity leading dimension is not the vLLM block-stride contract.
+    # Keep allocator packing layer-local until a real block-major layout is
+    # implemented and exercised end to end.
+    assert backend.indexes_kv_by_block_stride() is False
     assert backend.get_kv_cache_stride_order() == expected_order
     assert backend.get_kv_cache_stride_order(True) == expected_layered_order
 
 
 def test_qsa_backend_owns_vendor_neutral_legacy_layout():
-    assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_shape(3, 16, 2, 8) == (
-        3,
-        2,
-        16,
-        2,
-        8,
-    )
+    assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_shape(
+        3, 16, 2, 8
+    ) == (3, 2, 16, 2, 8)
     assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_stride_order() == (
         0,
         1,
@@ -78,15 +74,19 @@ def test_unpack_legacy_vllm_024_cache_layout():
     # decode.
     flat_key = key.reshape(3, 16, 1, 16)
     flat_value = value.reshape(3, 16, 1, 16)
-    assert flat_key.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
-    assert flat_value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    assert (
+        flat_key.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    )
+    assert (
+        flat_value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    )
     assert flat_key.storage_offset() == key.storage_offset()
     assert flat_value.storage_offset() == value.storage_offset()
 
     key_update = torch.arange(flat_key.numel(), dtype=cache.dtype).reshape_as(flat_key)
-    value_update = -torch.arange(flat_value.numel(), dtype=cache.dtype).reshape_as(
-        flat_value
-    )
+    value_update = -torch.arange(
+        flat_value.numel(), dtype=cache.dtype
+    ).reshape_as(flat_value)
     flat_key.copy_(key_update)
     flat_value.copy_(value_update)
     torch.testing.assert_close(cache[:, 0], key_update.reshape_as(cache[:, 0]))
