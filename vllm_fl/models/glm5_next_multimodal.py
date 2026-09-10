@@ -818,6 +818,79 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         num_patches = grid_t * grid_h * grid_w
         return preprocessed_size, num_patches // (merge_size**2)
 
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int] | None:
+        """Video token ceiling from the token-budget pixel cap.
+
+        vLLM 0.24's inherited implementation reads
+        ``video_processor.size["longest_edge"]``, but the GLM-5-Next
+        token-budget processor deliberately leaves ``size`` unused
+        (``longest_edge=1``). That understates the video encoder ceiling by
+        orders of magnitude, so recompute it from ``_get_video_max_pixels``
+        and the sampler's own frame cap.
+        """
+        result: dict[str, int] = {}
+
+        if mm_counts.get("image", 0) > 0:
+            result["image"] = self.get_max_image_tokens()
+
+        if mm_counts.get("video", 0) > 0:
+            video_processor = self.get_video_processor()
+            max_pixels = self._get_video_max_pixels()
+
+            vision_config = self.get_hf_config().vision_config
+            temporal_patch_size = vision_config.temporal_patch_size
+            patch_size = vision_config.patch_size
+            merge_size = vision_config.spatial_merge_size
+
+            max_vision_tokens = max_pixels // (
+                temporal_patch_size * patch_size**2 * merge_size**2
+            )
+
+            max_grid_t = max(
+                int(getattr(video_processor, "max_frame_count_dynamic", 2048))
+                // temporal_patch_size,
+                1,
+            )
+
+            tokenizer = self.get_tokenizer()
+            max_ts_tokens = max(
+                len(tokenizer.encode(f"{t:.1f} seconds", add_special_tokens=False))
+                for t in range(min(max_grid_t, 300))
+            )
+
+            result["video"] = max_vision_tokens + max_grid_t * (2 + max_ts_tokens) + 2
+
+        return result
+
+    def _get_video_second_idx_glm46v(
+        self, metadata: dict[str, Any], total_frames: int
+    ) -> list[int]:
+        """Align video prompt timestamps with the processor's frame sampler.
+
+        vLLM's GLM-4.6V re-derivation uses a different duration-threshold
+        policy than GLM5Next's ``fps_interval`` sampler, so the placeholder
+        frame count would not match the encoded ``grid_t``. Reuse the
+        processor's sampler through :func:`glm_video_timestamp_seconds`.
+        """
+        from types import SimpleNamespace
+
+        from vllm_fl.transformers_utils.processors.glm5_next import (
+            glm_video_timestamp_seconds,
+        )
+
+        video_metadata = SimpleNamespace(
+            fps=metadata.get("fps"),
+            duration=metadata.get("duration"),
+            total_num_frames=metadata.get("total_num_frames", total_frames),
+            frames_indices=metadata.get("frames_indices"),
+            do_sample_frames=metadata.get("do_sample_frames", True),
+        )
+        return glm_video_timestamp_seconds(self.get_video_processor(), video_metadata)
+
 
 class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
     """Let vLLM, rather than the feature-only HF processor, update prompts."""

@@ -193,6 +193,40 @@ def glm_sample_frame_indices_legacy(
     return unique
 
 
+def glm_video_timestamp_seconds(
+    video_processor,
+    metadata,
+) -> list[int]:
+    """Prompt-visible per-frame second indices for a GLM-5-Next video.
+
+    vLLM's inherited GLM-4.6V prompt builder re-derives the sampled frames
+    with a duration-threshold policy (``_get_video_second_idx_glm46v``), which
+    selects a different frame count than ``Glm5NextVideoProcessor``'s
+    ``fps_interval`` sampler. That desynchronizes the number of video frame
+    placeholders from the encoded ``grid_t``. This helper reuses the exact
+    processor sampler and keeps every ``temporal_patch_size``-th pick
+    (``[::2]``), which is precisely the ``grid_t`` consumed by the vision
+    tower.
+
+    ``metadata`` exposes ``fps``, ``duration``, ``total_num_frames``,
+    ``do_sample_frames`` and (when ``do_sample_frames`` is false)
+    ``frames_indices``.
+    """
+    fps = getattr(metadata, "fps", None)
+    if not fps:
+        fps = 24.0
+
+    if getattr(metadata, "do_sample_frames", True) is False:
+        frames_indices = getattr(metadata, "frames_indices", None)
+        frames = [] if frames_indices is None else [int(i) for i in frames_indices]
+    else:
+        frames = [int(index) for index in video_processor.sample_frames(metadata)]
+
+    if not frames:
+        return []
+    return [int(index / fps) for index in frames][::2]
+
+
 def _ceil_to_factor(value: int, factor: int) -> int:
     """Round a positive integer upward to the nearest multiple of factor."""
     return math.ceil(value / factor) * factor
@@ -1104,6 +1138,7 @@ __all__ = [
     "Glm5NextProcessor",
     "glm_sample_frame_indices",
     "glm_sample_frame_indices_legacy",
+    "glm_video_timestamp_seconds",
     "smart_resize",
 ]
 
