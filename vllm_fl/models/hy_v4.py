@@ -781,6 +781,12 @@ class HYV4ForCausalLM(
 ):
     """Native vLLM causal language model for the HY4 preview checkpoint."""
 
+    # HY4 preview is a text-only checkpoint family: no released variant ships a
+    # vision tower, image processor, or image-token id.  Pin the capability
+    # flag so vLLM 0.24's registry classifies HY4 as text-only and rejects
+    # multimodal requests instead of silently dropping image inputs.
+    supports_multimodal = False
+
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }

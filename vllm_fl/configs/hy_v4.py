@@ -4,9 +4,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from transformers import PretrainedConfig
+
+# HY4 preview (``tencent/Hy4-preview`` and ``tencent/Hy4-preview-FP8``) is a
+# text-only MoE language model.  The official configs have no ``vision_config``,
+# image-token ids, processor, or vision/projector weights, and upstream vLLM's
+# ``hy_v4`` implementation is a plain ``SupportsPP`` causal LM.  The plugin
+# therefore serves the text path only and must fail fast if a checkpoint ever
+# advertises a vision tower, rather than silently dropping those parameters.
+_MULTIMODAL_KEY_PREFIXES = ("vision_", "image_", "video_", "audio_", "pixel_")
+_MULTIMODAL_KEY_EXACT = frozenset(
+    {
+        "multi_modal_projector",
+        "mm_projector",
+        "mm_projector_type",
+        "vision_tower",
+    }
+)
+
+
+def _unsupported_multimodal_keys(mapping: Mapping[str, Any]) -> list[str]:
+    """Return config keys that advertise an unsupported multimodal tower."""
+    rejected = [
+        key
+        for key in mapping
+        if key in _MULTIMODAL_KEY_EXACT or key.startswith(_MULTIMODAL_KEY_PREFIXES)
+    ]
+    return sorted(rejected)
 
 
 class HYV4Config(PretrainedConfig):
@@ -14,6 +41,8 @@ class HYV4Config(PretrainedConfig):
 
     model_type = "hy_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
+    # Explicit capability contract consumed by vLLM's multimodal registry.
+    supports_multimodal = False
 
     def __init__(
         self,
@@ -70,6 +99,14 @@ class HYV4Config(PretrainedConfig):
         pad_token_id: int = 120_002,
         **kwargs: Any,
     ) -> None:
+        multimodal_keys = _unsupported_multimodal_keys(kwargs)
+        if multimodal_keys:
+            raise ValueError(
+                "HY4 preview is a text-only checkpoint family; multimodal "
+                "config keys are not supported: "
+                f"{multimodal_keys}. Use the text-only HY4 checkpoint "
+                "(tencent/Hy4-preview) or a dedicated multimodal model."
+            )
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
