@@ -354,7 +354,6 @@ def apply_qwen3_8_flash_next_patches() -> bool:
         Qwen3_8FlashNextConfig,
         Qwen3_8FlashNextTextConfig,
     )
-    from vllm_fl.patches.gdn_packed_decode import patch_vllm_packed_gdn_beta
 
     config_registry = transformers_config._CONFIG_REGISTRY
     config_registry.setdefault("qwen3_8_flash_next", Qwen3_8FlashNextConfig)
@@ -384,7 +383,16 @@ def apply_qwen3_8_flash_next_patches() -> bool:
     _patch_common_attention_token_to_req_cache()
     _patch_ple_metadata_bridge()
     _register_compilation_boundaries()
-    patch_vllm_packed_gdn_beta()
+    # Capability-gated: reduced/empty builds may omit vLLM's FLA package, but
+    # model + processor registration must still succeed so text-only serving
+    # stays available. The packed-GDN fix is a numerical patch, not a
+    # registration prerequisite.
+    try:
+        from vllm_fl.patches.gdn_packed_decode import patch_vllm_packed_gdn_beta
+
+        patch_vllm_packed_gdn_beta()
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Qwen3.8-Flash-Next packed GDN patch unavailable: %s", exc)
     logger.info("Installed Qwen3.8-Flash-Next / Qwen4Exp Day0 runtime support")
     return True
 

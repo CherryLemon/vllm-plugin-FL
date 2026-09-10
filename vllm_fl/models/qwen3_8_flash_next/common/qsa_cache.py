@@ -12,7 +12,7 @@ follow the main KV-cache lifecycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from typing import ClassVar
 
 import torch
@@ -34,6 +34,27 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+
+def _spec_supports_block_stride_flag() -> bool:
+    """Whether this vLLM ABI carries the padded-page block-stride contract.
+
+    vLLM 0.24 added ``AttentionSpec.indexes_kv_by_block_stride`` so a side
+    cache can be padded to a unified page size while still being read through
+    a strided view.  Older builds lack the field entirely; the exporter keeps
+    the flag out of the spec there instead of raising at construction time.
+    """
+
+    try:
+        return any(
+            field.name == "indexes_kv_by_block_stride"
+            for field in dataclass_fields(AttentionSpec)
+        )
+    except Exception:
+        return False
+
+
+_BLOCK_STRIDE_SPEC_FLAG = _spec_supports_block_stride_flag()
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -390,9 +411,9 @@ class QSAStateBackend(AttentionBackend):
 
     @classmethod
     def indexes_kv_by_block_stride(cls) -> bool:
-        # This side cache uses the identity/layered layout below, not the
-        # block-major layout required by vLLM's cross-layer packing path.
-        return False
+        # vLLM 0.24 may pad this side cache while unifying per-layer page sizes;
+        # the flattened block/row layout below preserves that padded addressing.
+        return True
 
     @staticmethod
     def get_kv_cache_stride_order(
@@ -482,13 +503,19 @@ class QSAKeyStateCache(_QSAStateCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
-        return FullAttentionSpec(
+        spec_kwargs = dict(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
         )
+        if _BLOCK_STRIDE_SPEC_FLAG:
+            # Opt into vLLM 0.24's padded-page contract so this side cache can
+            # share a unified page size.  The stride-aware QSA stores/loads and
+            # the ``bind_kv_cache`` slice below read it through the strided view.
+            spec_kwargs["indexes_kv_by_block_stride"] = True
+        return FullAttentionSpec(**spec_kwargs)
 
 
 class QSACompressedKeyCache(_QSAStateCache):

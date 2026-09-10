@@ -1210,6 +1210,11 @@ class Qwen3_8FlashNextForConditionalGeneration(
     """Qwen3-VL vision tower backed by the Qwen3.8-Flash-Next language model."""
 
     requires_raw_input_tokens = True
+    # Do not inherit the multimodal-pruning capability from the Qwen3.5/Qwen3VL
+    # base: some vLLM 0.24 builds default it to True, but this Day0 model never
+    # initializes EVS pruning and ``recompute_mrope_positions`` raises. Declare
+    # it here so the runner cannot select a pruning path the model cannot run.
+    supports_multimodal_pruning = False
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping
 
