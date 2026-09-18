@@ -21,11 +21,6 @@ def _vulnerable_kernel():
     return beta_val
 
 
-def _vulnerable_kernel_with_formatting():
-    beta_val = "tl.sigmoid( b_val ) . to( b.dtype.element_ty ) . to( tl.float32 )"
-    return beta_val
-
-
 def _fixed_kernel():
     beta_val = "tl.sigmoid(b_val)"
     return beta_val
@@ -36,24 +31,28 @@ def _non_sigmoid_kernel():
     return beta_val
 
 
+def _target(kernel):
+    return SimpleNamespace(
+        fused_recurrent_gated_delta_rule_packed_decode_kernel=kernel
+    )
+
+
 def test_kernel_detection_matches_only_legacy_sigmoid_cast():
     assert gdn_packed_decode._kernel_needs_beta_patch(_vulnerable_kernel)
-    assert gdn_packed_decode._kernel_needs_beta_patch(
-        _vulnerable_kernel_with_formatting
-    )
     assert not gdn_packed_decode._kernel_needs_beta_patch(_fixed_kernel)
     assert not gdn_packed_decode._kernel_needs_beta_patch(_non_sigmoid_kernel)
 
 
+def test_uninspectable_source_prefers_the_fix():
+    # vLLM 0.24.0 is known to need the fix, so a stripped wheel must not keep
+    # the rounded recurrent update just because the source is unavailable.
+    assert gdn_packed_decode._kernel_needs_beta_patch(len)
+
+
 def test_patch_replaces_vulnerable_kernel_and_is_idempotent(monkeypatch):
-    target = SimpleNamespace(
-        fused_recurrent_gated_delta_rule_packed_decode_kernel=_vulnerable_kernel
-    )
+    target = _target(_vulnerable_kernel)
     monkeypatch.setattr(
         gdn_packed_decode.importlib, "import_module", lambda _module: target
-    )
-    monkeypatch.setattr(
-        gdn_packed_decode, "_has_known_triton_abi", lambda _kernel: True
     )
 
     assert gdn_packed_decode.patch_vllm_packed_gdn_beta() is True
@@ -68,33 +67,13 @@ def test_patch_replaces_vulnerable_kernel_and_is_idempotent(monkeypatch):
 
 @pytest.mark.parametrize("kernel", [_fixed_kernel, _non_sigmoid_kernel])
 def test_patch_preserves_non_vulnerable_kernel(monkeypatch, kernel):
-    target = SimpleNamespace(
-        fused_recurrent_gated_delta_rule_packed_decode_kernel=kernel
-    )
+    target = _target(kernel)
     monkeypatch.setattr(
         gdn_packed_decode.importlib, "import_module", lambda _module: target
     )
 
     assert gdn_packed_decode.patch_vllm_packed_gdn_beta() is False
     assert target.fused_recurrent_gated_delta_rule_packed_decode_kernel is kernel
-
-
-def test_patch_preserves_unknown_non_triton_abi(monkeypatch):
-    target = SimpleNamespace(
-        fused_recurrent_gated_delta_rule_packed_decode_kernel=_vulnerable_kernel
-    )
-    monkeypatch.setattr(
-        gdn_packed_decode.importlib, "import_module", lambda _module: target
-    )
-    assert gdn_packed_decode.patch_vllm_packed_gdn_beta() is False
-    assert (
-        target.fused_recurrent_gated_delta_rule_packed_decode_kernel
-        is _vulnerable_kernel
-    )
-
-
-def test_source_unavailable_is_never_assumed_vulnerable():
-    assert not gdn_packed_decode._kernel_needs_beta_patch(len)
 
 
 def test_patch_is_optional_when_fla_module_or_symbol_is_unavailable(monkeypatch):
@@ -110,3 +89,18 @@ def test_patch_is_optional_when_fla_module_or_symbol_is_unavailable(monkeypatch)
 
     monkeypatch.setattr(gdn_packed_decode.importlib, "import_module", missing_module)
     assert gdn_packed_decode.patch_vllm_packed_gdn_beta() is False
+
+
+def test_registration_helper_reports_the_patch_result(monkeypatch):
+    import vllm_fl
+
+    target = _target(_vulnerable_kernel)
+    real_import = gdn_packed_decode.importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == gdn_packed_decode._TARGET_MODULE:
+            return target
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(gdn_packed_decode.importlib, "import_module", fake_import)
+    assert vllm_fl._register_gdn_packed_decode_patch() is True

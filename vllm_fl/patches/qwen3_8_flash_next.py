@@ -20,6 +20,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def ple_ngram_context_uses_cpu_history() -> bool:
+    """Whether the runner selected for this plugin builds PLE history on CPU.
+
+    The restriction is tied to the runner that is actually selected rather
+    than to the presence of ``gpu/model_state.py``: only a runner that
+    declares GPU token history can serve the n-gram embedding with
+    asynchronous scheduling.
+    """
+
+    from vllm_fl.worker.model_runner import ModelRunnerFL
+
+    return getattr(ModelRunnerFL, "ple_ngram_context_source", "cpu") == "cpu"
+
+
 def _strip_mrope(model_config: "ModelConfig") -> None:
     configs = {
         id(config): config
@@ -83,6 +97,25 @@ class Qwen3_8FlashNextForConditionalGenerationConfig(
                 "Qwen4Exp PLE requires pipeline_parallel_size=1 because raw "
                 "token n-gram context is not broadcast between PP stages"
             )
+
+        if bool(text_config.ple_layer_ids) and ple_ngram_context_uses_cpu_history():
+            scheduler_config = vllm_config.scheduler_config
+            async_scheduling = scheduler_config.async_scheduling
+            if async_scheduling is None:
+                # vLLM resolves ``None`` later than this hook, so the default
+                # must be pinned here; otherwise an auto-enabled asynchronous
+                # scheduler would read a stale CPU token history.
+                scheduler_config.async_scheduling = False
+                logger.info(
+                    "Qwen4Exp PLE builds its n-gram token history on the CPU; "
+                    "asynchronous scheduling is disabled for this run."
+                )
+            elif async_scheduling:
+                raise NotImplementedError(
+                    "Qwen4Exp PLE requires a synchronous token history for its "
+                    "n-gram embedding; start the server with "
+                    "--no-async-scheduling."
+                )
 
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
@@ -268,6 +301,44 @@ def should_skip_generic_flaggems_aten(
     )
 
 
+def _qwen3_8_flash_next_flag_gems_policy(
+    vllm_config: "VllmConfig",
+    whitelist: Optional[list[str]],
+    blacklist: Optional[list[str]],
+    *,
+    vendor_name: Optional[str] = None,
+):
+    """Generic-factory adapter for the model-scoped Qwen FlagGems policy.
+
+    Registered with :mod:`vllm_fl.flaggems_policy` so the worker never imports
+    this module directly.  Returns ``None`` for any other model.
+    """
+    from vllm_fl.flaggems_policy import FlagGemsModelPolicy
+
+    if not needs_native_index_select(vllm_config):
+        return None
+    whitelist, blacklist = apply_native_index_select_policy(
+        vllm_config, whitelist, blacklist, vendor_name=vendor_name
+    )
+    skip_generic_aten = should_skip_generic_flaggems_aten(
+        vllm_config, vendor_name=vendor_name, whitelist=whitelist
+    )
+    messages: list[str] = []
+    if not whitelist:
+        messages.append("[Qwen3.8-Flash-Next] Using native PLE runtime primitives")
+    if skip_generic_aten:
+        messages.append(
+            "[Qwen3.8-Flash-Next] NVIDIA keeps native ATen for generic "
+            "tensor operations; explicit FlagOS/OOT kernels remain enabled"
+        )
+    return FlagGemsModelPolicy(
+        whitelist=whitelist,
+        blacklist=blacklist,
+        skip_generic_aten=skip_generic_aten,
+        log_messages=tuple(messages),
+    )
+
+
 def _patch_common_attention_token_to_req_cache() -> None:
     """Backport vLLM's shared per-token request-index cache to v0.24."""
     import torch
@@ -379,6 +450,10 @@ def apply_qwen3_8_flash_next_patches() -> bool:
         model_registry.ModelRegistry.register_model(
             architecture, f"{module}:{class_name}"
         )
+
+    from vllm_fl.flaggems_policy import register_flag_gems_policy_provider
+
+    register_flag_gems_policy_provider(_qwen3_8_flash_next_flag_gems_policy)
 
     _patch_common_attention_token_to_req_cache()
     _patch_ple_metadata_bridge()

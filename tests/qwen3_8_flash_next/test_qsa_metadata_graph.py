@@ -95,6 +95,47 @@ def test_forward_metadata_holds_common_metadata_by_reference():
     assert logical.tolist() == [0, 1]
 
 
+def test_sparse_attention_uses_compressed_metadata_request_map():
+    from vllm_fl.models.qwen3_8_flash_next.gpu import model as _model  # noqa: F401
+    from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import (
+        _prepared_qsa_token_to_req,
+    )
+
+    raw = torch.zeros(6, dtype=torch.int32)
+    compressed = torch.tensor([0, 0, 1, 1, 99, 99], dtype=torch.int32)
+    metadata = {
+        "raw": SimpleNamespace(num_actual_tokens=4, token_to_req=raw),
+        "compressed": SimpleNamespace(num_actual_tokens=4, token_to_req=compressed),
+    }
+    indexer = SimpleNamespace(
+        raw_key_cache=SimpleNamespace(prefix="raw"),
+        compressed_key_cache=SimpleNamespace(prefix="compressed"),
+    )
+    actual = _prepared_qsa_token_to_req(metadata, indexer, 4)
+    assert actual.tolist() == [0, 0, 1, 1]
+    assert actual.data_ptr() == compressed.data_ptr()
+    assert actual.data_ptr() != raw.data_ptr()
+    # Fixed-address storage must expose updated mappings on later replays.
+    compressed[:4].copy_(torch.tensor([0, 1, 2, 3], dtype=torch.int32))
+    assert actual.tolist() == [0, 1, 2, 3]
+
+
+def test_sparse_attention_rejects_compressed_metadata_token_count_mismatch():
+    from vllm_fl.models.qwen3_8_flash_next.gpu import model as _model  # noqa: F401
+    from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import (
+        _prepared_qsa_token_to_req,
+    )
+
+    metadata = {
+        "compressed": SimpleNamespace(
+            num_actual_tokens=3, token_to_req=torch.tensor([0, 0, 1])
+        ),
+    }
+    indexer = SimpleNamespace(compressed_key_cache=SimpleNamespace(prefix="compressed"))
+    with pytest.raises(RuntimeError, match="compressed metadata token counts"):
+        _prepared_qsa_token_to_req(metadata, indexer, 4)
+
+
 def test_metadata_defer_follows_global_full_graph_modes():
     from vllm.config.compilation import CUDAGraphMode
 

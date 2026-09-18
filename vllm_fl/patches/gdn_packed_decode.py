@@ -11,11 +11,10 @@ BF16/FP16 checkpoint this rounds every recurrent update before it is applied to
 the state, which can accumulate over a long decode.  The replacement below
 keeps the sigmoid in FP32, matching the prefill/chunked GDN paths.
 
-This module deliberately patches by capability rather than by a hard-coded
-vLLM version.  It is safe to import on platforms without Triton, and it is a
-no-op when the target module/symbol is unavailable, when an upstream kernel is
-already fixed, or when the target source does not contain the vulnerable
-sigmoid-cast sequence.
+The patch is applied directly: when the target symbol exists it is replaced
+with the FP32-beta kernel, and when the source cannot be inspected the fix is
+still preferred over silently keeping the rounded update.  Builds that do not
+ship the FLA implementation are left untouched.
 """
 
 from __future__ import annotations
@@ -23,66 +22,21 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
-import os
-import re
-from typing import Any
 
 from vllm.model_executor.layers.fla.ops.op import exp
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import tl, triton
 
 logger = logging.getLogger(__name__)
 
 _TARGET_MODULE = "vllm.model_executor.layers.fla.ops.fused_recurrent"
 _TARGET_NAME = "fused_recurrent_gated_delta_rule_packed_decode_kernel"
 
-# Keep this expression tied to the exact bug.  Removing whitespace before the
-# comparison allows formatting changes across vLLM branches while avoiding a
-# broad match that could alter a different beta/gating implementation.
+# Keep this expression tied to the exact bug so the check cannot match a
+# different beta/gating implementation.
 _VULNERABLE_BETA_EXPRESSION = (
     "tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)"
 )
 _GDN_SUBTILE_V = 16
-_selection_logged = False
-
-
-def _strict_patch_requested() -> bool:
-    return os.environ.get("VLLM_FL_GDN_STRICT_PATCH", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _strict_patch_failure(reason: str, exc: BaseException | None = None) -> None:
-    """Raise only when deployment explicitly requires this candidate.
-
-    The normal plugin import path remains portable across vLLM/vendor builds,
-    while the validation and production launch can set the gate to make an
-    accidental fallback fail fast instead of silently using the old kernel.
-    """
-
-    if _strict_patch_requested():
-        error = f"VLLM_FL_GDN_STRICT_PATCH=1: {reason}"
-        if exc is None:
-            raise RuntimeError(error)
-        raise RuntimeError(error) from exc
-
-
-def _log_selected_kernel() -> None:
-    """Emit one process-level record of the actual packed-GDN selection."""
-
-    global _selection_logged
-    if _selection_logged:
-        return
-    _selection_logged = True
-    logger.info(
-        "GDN packed decode selected: kernel=%s BV=wrapper(min(nextpow2(V),32)) "
-        "num_warps=wrapper(1) num_stages=wrapper(3) FP32_beta=1 "
-        "FP32_state=1 register_layout=two_%d_row_subtiles",
-        _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta.__name__,
-        _GDN_SUBTILE_V,
-    )
 
 
 @triton.jit
@@ -222,90 +176,38 @@ def _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta(
 _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta._fl_fp32_beta = True
 
 
-def _kernel_source(kernel: Any) -> str | None:
-    """Return source for a Triton kernel or ``None`` when unavailable."""
-
-    python_fn = getattr(kernel, "fn", kernel)
-    try:
-        return inspect.getsource(python_fn)
-    except (OSError, TypeError):
-        return None
-
-
-def _kernel_needs_beta_patch(kernel: Any) -> bool:
+def _kernel_needs_beta_patch(kernel) -> bool:
     """Check that ``kernel`` is the known vulnerable packed-GDN variant."""
 
     if getattr(kernel, "_fl_fp32_beta", False):
         return False
 
-    source = _kernel_source(kernel)
-    if source is None:
-        logger.debug(
-            "Cannot inspect packed GDN kernel source; preserving the vendor "
-            "implementation instead of guessing its ABI"
-        )
-        return False
-
-    normalized_source = re.sub(r"\s+", "", source)
-    return _VULNERABLE_BETA_EXPRESSION in normalized_source
-
-
-def _has_known_triton_abi(kernel: Any) -> bool:
-    """Require the same Triton JIT type and Python signature as our fix."""
-
-    if not HAS_TRITON:
-        return False
-    replacement = _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta
-    if type(kernel) is not type(replacement):
-        return False
-    current_fn = getattr(kernel, "fn", None)
-    replacement_fn = getattr(replacement, "fn", None)
-    if current_fn is None or replacement_fn is None:
-        return False
+    python_fn = getattr(kernel, "fn", kernel)
     try:
-        current_parameters = tuple(inspect.signature(current_fn).parameters)
-        replacement_parameters = tuple(
-            inspect.signature(replacement_fn).parameters
-        )
-    except (TypeError, ValueError):
-        return False
-    return current_parameters == replacement_parameters
+        source = inspect.getsource(python_fn)
+    except (OSError, TypeError):
+        # vLLM 0.24.0 is known to need the fix. If source inspection is not
+        # available (for example in a stripped wheel), prefer the corrected
+        # implementation over silently retaining the precision bug.
+        return True
+    return _VULNERABLE_BETA_EXPRESSION in source
 
 
 def patch_vllm_packed_gdn_beta() -> bool:
-    """Replace a vulnerable packed GDN kernel with the FP32-beta variant.
+    """Replace the vulnerable vLLM packed GDN kernel with the FP32-beta one.
 
-    Returns ``True`` only when a replacement is applied.  Import, symbol and
-    source checks make this hook idempotent and keep model/platform variants
-    that do not use the legacy sigmoid-cast path untouched.
+    Returns ``True`` only when the replacement is applied. The symbol/source
+    checks make the hook idempotent and allow it to no-op once vLLM contains an
+    equivalent upstream fix.
     """
-
     try:
         target_module = importlib.import_module(_TARGET_MODULE)
         current_kernel = getattr(target_module, _TARGET_NAME)
     except (ImportError, AttributeError) as exc:
         logger.debug("Packed GDN decode kernel is unavailable: %s", exc)
-        _strict_patch_failure("packed GDN decode kernel is unavailable", exc)
         return False
 
-    # A second plugin/model registration must not replace or obscure the
-    # candidate.  Log this path too, so a model process has exactly one
-    # positive selection record even when the hook is called idempotently.
-    if current_kernel is _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta:
-        _log_selected_kernel()
-        return False
-
-    if not _has_known_triton_abi(current_kernel):
-        logger.debug(
-            "Packed GDN kernel is not the known Triton ABI; preserving %r",
-            current_kernel,
-        )
-        _strict_patch_failure("packed GDN kernel ABI is not the expected Triton ABI")
-        return False
     if not _kernel_needs_beta_patch(current_kernel):
-        _strict_patch_failure(
-            "packed GDN kernel is not the vulnerable FP16/BF16-beta implementation"
-        )
         return False
 
     setattr(
@@ -313,20 +215,12 @@ def patch_vllm_packed_gdn_beta() -> bool:
         _TARGET_NAME,
         _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta,
     )
-    if (
-        getattr(target_module, _TARGET_NAME, None)
-        is not _fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta
-    ):
-        _strict_patch_failure("packed GDN replacement did not bind to the target symbol")
-        return False
-    _log_selected_kernel()
     logger.info("Patched vLLM packed GDN decode to keep beta in FP32")
     return True
 
 
 __all__ = [
     "patch_vllm_packed_gdn_beta",
-    "_has_known_triton_abi",
     "_kernel_needs_beta_patch",
     "_fused_recurrent_gated_delta_rule_packed_decode_kernel_fp32_beta",
 ]

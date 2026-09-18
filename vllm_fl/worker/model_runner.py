@@ -269,12 +269,12 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
-    bind_kv_cache,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
 
 # FL-specific imports
+from vllm_fl.compat.vllm024.kv_cache import bind_kv_cache
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.dispatch.io_dumper import (
@@ -676,6 +676,11 @@ class ExecuteModelState(NamedTuple):
 class ModelRunnerFL(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    # ``_prepare_ngram_context`` assembles the PLE token history on the CPU and
+    # only then copies it to the GPU, so asynchronous scheduling could read a
+    # history that misses the newest committed tokens.
+    ple_ngram_context_source = "cpu"
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -7810,16 +7815,12 @@ class ModelRunnerFL(
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        # vLLM 0.24 assigns ``layer.kv_cache`` directly. QSA's raw side cache
-        # additionally needs its bind hook to expose typed key/position views;
-        # newer vLLM calls this hook natively.
-        for layer_name, kv_cache in kv_caches.items():
-            layer = self.compilation_config.static_forward_context[layer_name]
-            if layer.__class__.__module__.endswith(
-                "qwen3_8_flash_next.common.qsa_cache"
-            ):
-                layer.bind_kv_cache(kv_cache)
-
+        # Version-correct binding order: upstream ``bind_kv_cache`` runs once
+        # (it fills the runner list and assigns ``layer.kv_cache`` directly on
+        # the vLLM 0.24 ABI), then the registered cache owners run their bind
+        # hook once to build typed views over the shared storage.  Owners are
+        # identified by explicit registration, not by module name, and a newer
+        # ABI that already calls the hook is used natively without a second call.
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )
@@ -7829,15 +7830,6 @@ class ModelRunnerFL(
             self.kv_caches,
             num_attn_module,
         )
-        # vLLM 0.24's helper assigns ``layer.kv_cache`` directly. QSA's raw
-        # side cache needs its bind hook to expose typed key/position views;
-        # newer vLLM calls this hook natively.
-        for layer_name, kv_cache in kv_caches.items():
-            layer = self.compilation_config.static_forward_context[layer_name]
-            if layer.__class__.__module__.endswith(
-                "qwen3_8_flash_next.common.qsa_cache"
-            ):
-                layer.bind_kv_cache(kv_cache)
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(

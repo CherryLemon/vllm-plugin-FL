@@ -47,6 +47,25 @@ from .indexer_qsa import QSAIndexer
 from .nvidia_fast_paths import has_native_cache_update, native_cache_update
 
 
+def _prepared_qsa_token_to_req(
+    metadata: dict[str, Any],
+    indexer: QSAIndexer,
+    num_tokens: int,
+) -> torch.Tensor:
+    """Use the request map filled by the compressed metadata producer.
+
+    On GPU the raw cache owns a separate zero-initialized buffer which is
+    never prepared. Reading it would route every token to request row zero.
+    Call this after the indexer has prepared the compressed metadata.
+    """
+    compressed = cast(
+        QSAForwardMetadata, metadata[indexer.compressed_key_cache.prefix]
+    )
+    if compressed.num_actual_tokens != num_tokens:
+        raise RuntimeError("QSA main and compressed metadata token counts disagree")
+    return compressed.token_to_req[:num_tokens]
+
+
 def _unpack_qsa_kv_cache(
     kv_cache: torch.Tensor,
     head_size: int,
@@ -346,6 +365,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             positions,
             self.topk_indices_buffer[:num_tokens],
         )
+        token_to_req = _prepared_qsa_token_to_req(metadata, self.indexer, num_tokens)
         if selected.shape != (
             num_tokens,
             self.indexer.output_width,
@@ -400,7 +420,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value_cache,
                 self.topk_indices_buffer[:num_tokens],
                 main_metadata.block_table,
-                side_metadata.token_to_req[:num_tokens],
+                token_to_req,
                 self.scaling,
                 output[:num_tokens],
                 gate=gate[:num_tokens],

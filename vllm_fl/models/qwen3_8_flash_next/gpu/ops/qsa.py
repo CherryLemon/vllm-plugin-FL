@@ -17,13 +17,10 @@ except ImportError:  # newer/alternate vLLM workspace APIs use local buffers
     current_workspace_manager = None
 
 from ..nvidia_fast_paths import (
-    has_native_topk,
-    native_topk,
     qsa_sparse_triton_launch_config,
 )
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
-_TOPK_WORKSPACE_BYTES = 1024 * 1024
 _QSA_MQA_DOT_ENABLED = os.environ.get("QWEN4_QSA_MQA_DOT", "1") != "0"
 _QSA_SPLIT_ALLOWED = (1, 2, 4, 8, 16, 32)
 
@@ -1820,6 +1817,36 @@ def expand_qsa_block_indices(
     return out
 
 
+def _qsa_deterministic_block_topk(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_topk: int,
+) -> torch.Tensor:
+    """Select by (score descending, logical index ascending), then visit in order.
+
+    Native cooperative/persistent TopK emits an unordered set. Above the QSA
+    budget its order varies between identical launches, changing the BF16
+    attention reduction. Ties at the cutoff can also change *membership*, so
+    sorting that set alone is insufficient. Stable score sorting provides an
+    exact tie break without perturbing scores; logical ordering then fixes the
+    attention reduction order. All shapes are static and graph-capturable.
+    """
+    if logits.ndim != 2 or visible_blocks.shape != (logits.shape[0],):
+        raise ValueError("QSA scores and visible-block counts have incompatible shapes")
+    if block_topk <= 0:
+        raise ValueError("QSA block top-k must be positive")
+    rows, columns = logits.shape
+    width = min(block_topk, columns)
+    ranked = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :width]
+    # Mask padding before canonicalizing: otherwise -1 would sort ahead of
+    # real blocks, and expansion consumes only the first visible ranks.
+    ranked = ranked.masked_fill(ranked >= visible_blocks[:, None], columns)
+    ordered = ranked.sort(dim=-1).values
+    result = torch.full((rows, block_topk), -1, dtype=torch.int32, device=logits.device)
+    result[:, :width] = ordered.masked_fill(ordered == columns, -1).to(torch.int32)
+    return result
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1844,31 +1871,9 @@ def qsa_select_paged_tokens(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
-    chunk_rows = min(rows, rows_per_chunk)
-    use_native_topk = has_native_topk() and block_topk in (512, 1024, 2048)
-    blocks_buffer: torch.Tensor | None = None
-    topk_workspace: torch.Tensor | None = None
-    if use_native_topk:
-        if current_workspace_manager is not None:
-            try:
-                blocks_buffer, topk_workspace = (
-                    current_workspace_manager().get_simultaneous(
-                        ((chunk_rows, block_topk), torch.int32),
-                        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
-                    )
-                )
-            except (AssertionError, RuntimeError):
-                # Direct operator tests do not install a worker workspace.
-                # Fixed-shape allocations remain graph-capturable.
-                blocks_buffer = None
-        if blocks_buffer is None or topk_workspace is None:
-            blocks_buffer = torch.empty(
-                (chunk_rows, block_topk), dtype=torch.int32, device=q.device
-            )
-            topk_workspace = torch.empty(
-                (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
-            )
+    # Budget scores plus stable-sort values/indices and temporary storage,
+    # rather than only the FP32 logits (long mixed prefills can be large).
+    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 32, 1))
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
@@ -1881,29 +1886,7 @@ def qsa_select_paged_tokens(
             sequence_lengths,
             compress_ratio,
         )
-        if use_native_topk:
-            assert blocks_buffer is not None and topk_workspace is not None
-            blocks = blocks_buffer[: row_end - row_start]
-            native_topk(
-                logits,
-                visible_blocks,
-                blocks,
-                topk_workspace,
-                block_topk,
-                columns,
-            )
-        else:
-            # Cross-vendor dispatcher entry point: FlagGems or the vendor
-            # runtime can provide TopK. Sorting keeps finite visible blocks
-            # ahead of the -inf padding consumed by expansion.
-            _, blocks = torch.topk(
-                logits,
-                block_topk,
-                dim=-1,
-                largest=True,
-                sorted=True,
-            )
-            del visible_blocks
+        blocks = _qsa_deterministic_block_topk(logits, visible_blocks, block_topk)
         expand_qsa_block_indices(
             blocks,
             query_positions[row_slice],

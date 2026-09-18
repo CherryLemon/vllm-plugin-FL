@@ -488,11 +488,46 @@ class QSAKeyStateCache(_QSAStateCache):
             )
         super().__init__(head_size=storage_head_size, **kwargs)
 
-    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+    def validate_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Reject an unsupported dtype/layout before any binding mutation.
+
+        The typed key view and the int64 position view both require the last
+        dimension to be contiguous; the position view additionally requires the
+        BF16 offset to be a whole number of int64 elements *and* every outer
+        stride to be view-compatible.  Offset alignment alone is not enough:
+        a non-last-dim stride (e.g. shape ``[2, 2, 1, 140]`` with stride
+        ``(281, 140, 140, 1)``) still fails ``view(torch.int64)`` later.  The
+        preflight therefore constructs the exact position view so a bad layout
+        is rejected before the raw cache is assigned.
+        """
         if kv_cache.ndim != 4 or kv_cache.shape[2] != 1:
             raise ValueError("QSA raw cache must be [blocks, block_size, 1, width]")
         if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
             raise ValueError("QSA raw cache does not match its packed BF16 cache spec")
+        if kv_cache.stride(-1) != 1:
+            raise ValueError(
+                "QSA raw cache requires a contiguous last dimension to build "
+                f"its typed views (stride(-1)={kv_cache.stride(-1)})"
+            )
+        if self.cache_rope_positions:
+            base = kv_cache.storage_offset() + self.rope_position_offset
+            if base % self._BF16_PER_INT64:
+                raise ValueError(
+                    "QSA position view requires the pack offset to align to "
+                    f"int64 ({base} bf16 elements is not a multiple of "
+                    f"{self._BF16_PER_INT64})"
+                )
+            try:
+                kv_cache[..., self.rope_position_offset:].view(torch.int64)
+            except RuntimeError as exc:
+                raise ValueError(
+                    "QSA position cache cannot be viewed as int64 from the raw "
+                    f"cache (shape={tuple(kv_cache.shape)}, "
+                    f"stride={tuple(kv_cache.stride())}): {exc}"
+                ) from exc
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        self.validate_kv_cache(kv_cache)
         super().bind_kv_cache(kv_cache)
         self.key_cache = kv_cache[..., : self.key_head_size]
         if self.cache_rope_positions:
@@ -530,6 +565,13 @@ class QSACompressedKeyCache(_QSAStateCache):
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
         )
+
+
+# Register QSA side caches as KV-cache owners so the common model runner can
+# invoke their bind hook without matching on this module's name.
+from vllm_fl.compat.vllm024.kv_cache import register_kv_cache_owner
+
+register_kv_cache_owner(_QSAStateCache)
 
 
 __all__ = [

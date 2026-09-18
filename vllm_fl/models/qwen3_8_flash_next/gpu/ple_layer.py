@@ -32,6 +32,12 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import copy_ple_embedding_shard_
 from ..config import Qwen3_8FlashNextTextConfig
+from .ops.ple_fusion import (
+    PLE_FUSION_MIN_TOKENS,
+    can_use_ple_gate_norm_triton,
+    ple_gate_norm,
+    ple_prefill_short_conv_,
+)
 from .ops.ple_state import ple_state_gather, ple_state_scatter_
 
 _MASK64 = (1 << 64) - 1
@@ -134,6 +140,7 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.max_num_reqs = int(max_num_reqs)
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
@@ -200,10 +207,12 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             torch.arange(max_total_tokens, dtype=torch.int64),
             persistent=False,
         )
+        # One extra row is the sink for tokens that graph padding places
+        # outside every real request, so they never overwrite real data.
         self.register_buffer(
             "padded_buffer",
             torch.full(
-                (max_num_reqs, max_total_tokens),
+                (self.max_num_reqs + 1, max_total_tokens),
                 self.eos_token_id,
                 dtype=torch.int64,
             ),
@@ -263,10 +272,10 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 f"PLE received {num_tokens} tokens, but its workspace supports "
                 f"at most {self.positions_buffer.numel()}"
             )
-        if num_reqs > self.padded_buffer.shape[0]:
+        if num_reqs > self.max_num_reqs:
             raise ValueError(
                 f"PLE received {num_reqs} requests, but its workspace supports "
-                f"at most {self.padded_buffer.shape[0]}"
+                f"at most {self.max_num_reqs}"
             )
         if num_reqs == 0:
             if num_tokens:
@@ -280,8 +289,9 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             )
 
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs]
-        packed.fill_(self.eos_token_id)
+        workspace = self.padded_buffer[: num_reqs + 1]
+        workspace.fill_(self.eos_token_id)
+        packed = workspace[:num_reqs]
         request_candidates = (
             torch.searchsorted(query_start_loc, positions, right=True) - 1
         )
@@ -295,10 +305,13 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         safe_columns = torch.where(
             valid_tokens, columns, torch.zeros_like(columns)
         )
-        # Padded graph rows are mapped to a known sentinel coordinate and
-        # explicitly filled with EOS.  No malformed request/column is
-        # clamped into a real request's data.
-        packed[safe_requests, safe_columns] = torch.where(
+        # Tokens that graph padding places outside every real request are
+        # written to the extra workspace row, so no invalid token can
+        # overwrite a real request's data.  Reading still uses safe
+        # coordinates and is masked by ``valid_tokens`` below.
+        write_rows = torch.where(valid_tokens, safe_requests, num_reqs)
+        write_cols = torch.where(valid_tokens, safe_columns, positions)
+        workspace[write_rows, write_cols] = torch.where(
             valid_tokens, input_ids, input_ids.new_full((), self.eos_token_id)
         )
         ngram_context = ngram_context[:num_reqs].to(
@@ -612,15 +625,16 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         num_prefills: int,
         num_decode_tokens: int,
         num_prefill_tokens: int,
-    ) -> torch.Tensor:
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
         # requests and equals ``query_start_loc`` when spec-decode is inactive.
         non_spec_query_start_loc = metadata.non_spec_query_start_loc
         if non_spec_query_start_loc is None:
             raise ValueError("query_start_loc is required for prefill short-conv")
-        query_start_loc_p = (
-            non_spec_query_start_loc[-num_prefills - 1 :] - num_decode_tokens
-        )
+        query_start_loc_p = non_spec_query_start_loc[-num_prefills - 1 :]
+        if num_decode_tokens:
+            query_start_loc_p = query_start_loc_p - num_decode_tokens
         # The metadata builder guarantees that the prefill query offsets start
         # at 0 and end at num_prefill_tokens. Avoid reading those values here,
         # since doing so would force a device-to-host synchronization.
@@ -628,7 +642,6 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         if has_initial_states_p is None:
             raise ValueError("has_initial_states_p is required for prefill short-conv")
 
-        output = torch.empty_like(x_p)
         q_starts = query_start_loc_p.to(torch.int64)
         if state_indices_tensor_p.numel() < num_prefills:
             raise ValueError(
@@ -643,14 +656,39 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return output
+            return None if output is not None else torch.empty_like(x_p)
         lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return output
+            return None if output is not None else torch.empty_like(x_p)
 
+        # Direct token-major path: it drops the pack/transpose/copy chain and
+        # the generic depthwise convolution, so the dense [num_prefills,
+        # max_len, hidden] workspace is never materialized.
+        fused_output = output if output is not None else torch.empty_like(x_p)
+        if ple_prefill_short_conv_(
+            x_p,
+            fused_output,
+            conv_state,
+            conv_weights,
+            query_start_loc_p,
+            state_indices_tensor_p[:num_prefills],
+            has_initial_states_p[:num_prefills],
+            num_prefills=num_prefills,
+            max_len=max_len,
+            state_len=self.conv_state_len,
+            kernel_width=self.conv_kernel_size,
+            dilation=self.short_conv_dilation,
+            null_block_id=NULL_BLOCK_ID,
+            min_tokens=PLE_FUSION_MIN_TOKENS,
+        ):
+            # ``None`` tells the caller its preallocated buffer already holds
+            # the result, skipping its former full-tensor copy.
+            return None if output is not None else fused_output
+
+        fallback_output = output if output is not None else torch.empty_like(x_p)
         hidden_size = x_p.shape[1]
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
@@ -708,7 +746,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             num_prefills, 1
         )
         conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
+        fallback_output.copy_(conv_output[req_indices, col_indices])
 
         if self.conv_state_len > 0 and conv_state.shape[0] > 0:
             state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
@@ -742,7 +780,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 write_mask=update_mask,
                 indices_are_safe=True,
             )
-        return output
+        return None if output is not None else fallback_output
 
     def _short_conv_dilated_spec_batched(
         self,
@@ -909,7 +947,8 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         metadata: PleShortConvAttentionMetadata,
         conv_state: torch.Tensor,
         conv_weights: torch.Tensor,
-    ) -> torch.Tensor:
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
         num_prefills = metadata.num_prefills
         num_decodes = metadata.num_decodes
         num_decode_tokens = metadata.num_decode_tokens
@@ -918,6 +957,28 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         has_decode = num_decodes > 0
         has_spec = metadata.spec_sequence_masks is not None
         x = inputs[: metadata.num_actual_tokens]
+
+        # A pure-prefill step reaches the fused path before the generic
+        # spec/non-spec split, so it also avoids the split and vstack copies.
+        if has_prefill and not has_decode and not has_spec:
+            state_indices_tensor = metadata.state_indices_tensor
+            if state_indices_tensor is None:
+                raise ValueError("PLE prefill requires state indices")
+            return self._short_conv_dilated_prefill_batched(
+                x_p=x,
+                metadata=metadata,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices_tensor_p=state_indices_tensor[:num_prefills],
+                num_prefills=num_prefills,
+                num_decode_tokens=0,
+                num_prefill_tokens=num_prefill_tokens,
+                output=(
+                    output[: metadata.num_actual_tokens]
+                    if output is not None
+                    else None
+                ),
+            )
 
         # Split spec / non-spec tokens.
         if has_spec:
@@ -1016,7 +1077,9 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             return x
         return conv_out_non_spec
 
-    def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _short_conv(
+        self, inputs: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -1060,6 +1123,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             layer_attn_metadata,
             conv_state,
             conv_weights.to(dtype=inputs.dtype),
+            output=output,
         )
 
     def forward(
@@ -1082,12 +1146,36 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
-        key = self._apply_norm(self.norm_key, key)
-        query = self._apply_norm(self.norm_query, query)
-        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-        gated_value = gate * value.unsqueeze(-2)
-        normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+        if can_use_ple_gate_norm_triton(
+            key,
+            query,
+            value,
+            self.norm_key.weight,
+            self.norm_query.weight,
+            self.norm_conv.weight,
+            self.hc_count,
+            min_tokens=PLE_FUSION_MIN_TOKENS,
+        ):
+            gated_value, normalized_grouped = ple_gate_norm(
+                key,
+                query,
+                value,
+                self.norm_key.weight,
+                self.norm_query.weight,
+                self.norm_conv.weight,
+                self.hc_count,
+                self.norm_conv.eps,
+            )
+            normalized = normalized_grouped.flatten(-2)
+        else:
+            key = self._apply_norm(self.norm_key, key)
+            query = self._apply_norm(self.norm_query, query)
+            gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(
+                self.hidden_size
+            )
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated_value = gate * value.unsqueeze(-2)
+            normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen3_8_flash_next_ple_short_conv(
             normalized,
@@ -1103,8 +1191,9 @@ def qwen3_8_flash_next_ple_short_conv(
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
-    result = layer._short_conv(inputs)
-    output[: result.shape[0]].copy_(result)
+    result = layer._short_conv(inputs, output=output)
+    if result is not None:
+        output[: result.shape[0]].copy_(result)
 
 
 def qwen3_8_flash_next_ple_short_conv_fake(
