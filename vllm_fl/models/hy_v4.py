@@ -43,7 +43,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -57,6 +56,11 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_fl.configs.hy_v4 import HYV4Config
+from vllm_fl.model_loader.hy_v4_indexer import (
+    IndexerWKLoader,
+    dequantize_mxfp8_wk,
+    quant_metadata_from_quant_config,
+)
 from vllm_fl.models.hy_v4_attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
@@ -170,18 +174,7 @@ def _try_load_mxfp8_indexer_wk(
 
     weight, scale = entry["weight"], entry["scale"]
     del pending[layer_prefix]
-    if weight.shape[:-1] != scale.shape[:-1]:
-        raise ValueError(
-            f"HY4 indexer MXFP8 shape mismatch: {weight.shape} vs {scale.shape}"
-        )
-    group_size = weight.shape[-1] // scale.shape[-1]
-    if group_size != 32:
-        raise ValueError(
-            f"HY4 indexer MXFP8 expected group size 32, got {group_size}"
-        )
-    scales = torch.exp2(scale.to(torch.int16).float() - 127.0)
-    scales = scales.repeat_interleave(group_size, dim=-1)
-    weight_bf16 = (weight.float() * scales).to(torch.bfloat16)
+    weight_bf16 = dequantize_mxfp8_wk(weight, scale)
 
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]
@@ -920,8 +913,6 @@ class HYV4ForCausalLM(
             ("wk_weights_proj", "wk", 0),
             ("wk_weights_proj", "weights_proj", 1),
         ]
-        pending_wk_mxfp8: dict[str, dict[str, torch.Tensor]] = {}
-        pending_wk_fp8: dict[str, dict[str, torch.Tensor]] = {}
         # W8A8 HY4 checkpoints store each routed expert as three independent
         # tensors (``experts.<id>.{gate,up,down}_proj``), with a matching
         # ``.weight_scale`` tensor.  RoutedExperts exposes those tensors as
@@ -940,6 +931,11 @@ class HYV4ForCausalLM(
                 (param_name, expert_id, shard_id)
             )
         pp_missing_layer_names = get_pp_missing_layer_names(self)
+        indexer_wk_loader = IndexerWKLoader(
+            params_dict,
+            pp_missing_layer_names,
+            quant_metadata_from_quant_config(self.quant_config),
+        )
         skip_topk_layers = compute_skip_topk_layers(self.config)
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -952,22 +948,7 @@ class HYV4ForCausalLM(
                 continue
             if is_skip_topk_indexer_weight(name, skip_topk_layers):
                 continue
-            if _try_load_mxfp8_indexer_wk(
-                name,
-                loaded_weight,
-                pending_wk_mxfp8,
-                params_dict,
-                loaded_params,
-            ):
-                continue
-            if _try_load_fp8_indexer_wk(
-                name,
-                loaded_weight,
-                pending_wk_fp8,
-                params_dict,
-                loaded_params,
-                pp_missing_layer_names,
-            ):
+            if indexer_wk_loader.consume(name, loaded_weight):
                 continue
 
             # The W8A8 export uses split per-expert names.  Match the
@@ -1089,12 +1070,7 @@ class HYV4ForCausalLM(
             loader(param, loaded_weight)
             loaded_params.add(name)
 
-        if pending_wk_mxfp8 or pending_wk_fp8:
-            raise ValueError(
-                "HY4 checkpoint coverage failed: incomplete FP8/MXFP8 indexer "
-                "wk weight/scale pairs for "
-                f"{sorted(set(pending_wk_mxfp8) | set(pending_wk_fp8))}"
-            )
+        loaded_params.update(indexer_wk_loader.finish())
 
         runtime_attention_scales = (
             ".self_attn.attn.q_scale",
