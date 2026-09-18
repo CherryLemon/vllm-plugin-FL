@@ -260,6 +260,13 @@ class PlatformFL(Platform):
                 attention_config.use_trtllm_attention = False
                 attention_config.disable_flashinfer_prefill = True
 
+        # Final, model-scoped config validation on the resolved values (e.g. the
+        # late asynchronous-scheduling guard).  This never mutates dispatch
+        # state or touches CUDA.
+        from vllm_fl.runtime.model_policy import validate_model_config
+
+        validate_model_config(vllm_config)
+
     @classmethod
     def get_attn_backend_cls(
         cls,
@@ -273,49 +280,28 @@ class PlatformFL(Platform):
         use_mla = attn_selector_config.use_mla
         use_sparse = attn_selector_config.use_sparse
 
-        # A process-start GLM5 A/B override must also cover attention-backend
-        # selection; the generic FlagOS whitelist may otherwise keep the
-        # validated NVIDIA MLA backend.  Bypass only for MLA, so this env does
-        # not alter ViT/standard attention dispatch.
-        if use_mla:
-            from vllm_fl.kernels.glm5_next.provider import (
-                get_glm5_provider,
-                use_nvidia_reference,
-            )
+        # A runtime plan may carry a static backend path for models whose
+        # choice does not depend on the selector context.  ``None`` (the
+        # default) falls through to the activation plan / generic dispatch.
+        from vllm_fl.runtime.model_policy import get_active_runtime_plan
 
-            provider = get_glm5_provider()
-            auto_portable = (
-                provider == "auto"
-                and cls.device_type == "cuda"
-                and cls.vendor_name == "nvidia"
-                and not use_nvidia_reference()
-            )
-            if provider == "flaggems" or auto_portable:
-                from vllm_fl.dispatch.backends.flaggems.flaggems import (
-                    FlagGemsBackend,
-                )
+        runtime_plan = get_active_runtime_plan()
+        if runtime_plan is not None and runtime_plan.attention_backend:
+            return runtime_plan.attention_backend
 
-                flaggems_backend = FlagGemsBackend()
-                if not flaggems_backend.is_available():
-                    if provider == "flaggems":
-                        raise RuntimeError(
-                            "VLLM_FL_GLM5_PROVIDER=flaggems requires FlagGems"
-                        )
-                    raise RuntimeError(
-                        "GLM5 auto provider selected a portable MLA backend "
-                        "because the NVIDIA ABI/DeepGEMM is unavailable, but "
-                        "FlagGems is not installed"
-                    )
-                backend_path = flaggems_backend.attention_backend(
-                    use_mla=use_mla,
-                    use_sparse=use_sparse,
-                )
-                logger.info_once(
-                    "GLM5 provider override selected attention backend: %s",
-                    backend_path,
-                    scope="local",
-                )
-                return backend_path
+        # A model activation plan may override the attention backend (for
+        # example GLM5's portable MLA path).  Only a plan activated for the
+        # model being loaded is consulted, so a process-level GLM provider
+        # variable no longer rewrites the generic path of other MLA models.
+        from vllm_fl.activation import get_active_plan
+
+        plan = get_active_plan()
+        if use_mla and plan is not None and plan.attention_backend is not None:
+            override = plan.attention_backend(
+                use_mla=use_mla, use_sparse=use_sparse
+            )
+            if override:
+                return override
 
         backend_path = call_op(
             "attention_backend", use_mla=use_mla, use_sparse=use_sparse

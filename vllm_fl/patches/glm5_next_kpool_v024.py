@@ -10,12 +10,22 @@ from functools import wraps
 
 from vllm.utils.math_utils import cdiv
 
+from vllm_fl.activation import PendingPatch
 from vllm_fl.models.glm5_next_kpool import (
     KpoolTailManager,
     KpoolTailSpec,
 )
 
 logger = logging.getLogger(__name__)
+
+# Worker-side kpool patches.  These run when the model runner builds attention
+# metadata and the KV-block zeroer, i.e. after model construction, so they are
+# bound to the GLM5 activation plan instead of plugin registration.  The
+# engine-core / config-time hooks below must stay at registration: vLLM needs
+# them while resolving ``VllmConfig``, registering the KV-cache spec and
+# computing the scheduler's cache config, which can happen before the worker
+# (and therefore before any activation) exists.
+_RUNTIME_BASELINES: dict[str, object] = {}
 
 
 def _inner_specs(groups):
@@ -92,6 +102,242 @@ def _group_glm5_kpool(vllm_config, kv_cache_spec):
     return groups
 
 
+def _kpool_target(owner, attr: str) -> str:
+    return f"{owner.__module__}.{owner.__name__}.{attr}"
+
+
+def _capture_runtime_baseline(owner, attr: str) -> None:
+    _RUNTIME_BASELINES.setdefault(_kpool_target(owner, attr), getattr(owner, attr))
+
+
+def _runtime_pristine(owner, attr: str):
+    target = _kpool_target(owner, attr)
+    value = _RUNTIME_BASELINES.get(target)
+    if value is None:  # pragma: no cover - core install captures these
+        value = getattr(owner, attr)
+        logger.warning(
+            "No import-time kpool runtime baseline for %s; capturing at "
+            "activation time",
+            target,
+        )
+    return value
+
+
+def _runtime_patch(
+    owner,
+    attr: str,
+    value,
+    fingerprint: str,
+    params: tuple[str, ...],
+) -> PendingPatch:
+    return PendingPatch(
+        target=_kpool_target(owner, attr),
+        owner=owner,
+        attr=attr,
+        replacement=value,
+        fingerprint=fingerprint,
+        pristine=_runtime_pristine(owner, attr),
+        expected_params=params,
+    )
+
+
+def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
+    """Keep the compressed indexer at pool-page granularity in metadata."""
+    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm.v1.worker import utils as worker_utils
+
+    owner = worker_utils.AttentionGroup
+    pristine = _runtime_pristine(owner, "create_metadata_builders")
+
+    def create_metadata_builders(
+        self,
+        vllm_config,
+        device,
+        kernel_block_size=None,
+        num_metadata_builders=1,
+    ):
+        spec = self.kv_cache_spec
+        is_compressed = (
+            isinstance(spec, AttentionSpec)
+            and spec.storage_block_size != spec.block_size
+        )
+        if not is_compressed:
+            return pristine(
+                self,
+                vllm_config,
+                device,
+                kernel_block_size,
+                num_metadata_builders,
+            )
+
+        storage_block_size = spec.storage_block_size
+        if storage_block_size <= 64:
+            compressed_kernel_size = storage_block_size
+        else:
+            compressed_kernel_size = 64 if storage_block_size % 64 == 0 else 32
+        assert compressed_kernel_size in (32, 64)
+        assert storage_block_size % compressed_kernel_size == 0
+        compress_ratio = spec.block_size // storage_block_size
+        builder_spec = spec.copy_with_new_block_size(
+            compressed_kernel_size * compress_ratio
+        )
+        self.metadata_builders = [
+            self.backend.get_builder_cls()(
+                builder_spec,
+                self.layer_names,
+                vllm_config,
+                device,
+            )
+            for _ in range(num_metadata_builders)
+        ]
+        if kernel_block_size is not None:
+            for builder in self.metadata_builders:
+                builder.kernel_block_size = kernel_block_size
+
+    return _runtime_patch(
+        owner,
+        "create_metadata_builders",
+        create_metadata_builders,
+        fingerprint,
+        ("self", "vllm_config", "device", "kernel_block_size", "num_metadata_builders"),
+    )
+
+
+def _indexer_build_patch(fingerprint: str) -> PendingPatch:
+    """Translate the shared block table before every indexer build."""
+    from vllm.v1.attention.backends.mla import indexer as indexer_backend
+
+    owner = indexer_backend.DeepseekV32IndexerMetadataBuilder
+    pristine = _runtime_pristine(owner, "build")
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+    ):
+        spec = self.kv_cache_spec
+        kernel_block_size = getattr(self, "kernel_block_size", None)
+        if (
+            getattr(spec, "compress_ratio", 1) > 1
+            and kernel_block_size is not None
+            and spec.block_size != kernel_block_size
+        ):
+            assert spec.block_size % kernel_block_size == 0
+            factor = spec.block_size // kernel_block_size
+            compressed = (
+                common_attn_metadata.block_table_tensor[:, ::factor] // factor
+            )
+            buffer = getattr(self, "_glm5_indexer_block_table", None)
+            rows, cols = compressed.shape
+            if buffer is None:
+                # Keep one base address across B1/B2/... FULL graphs.
+                # Reallocating this tensor when only the request count changes
+                # leaves earlier graphs pointing at freed storage.
+                max_rows = self.vllm_config.scheduler_config.max_num_batched_tokens
+                buffer = compressed.new_empty((max_rows, cols))
+                self._glm5_indexer_block_table = buffer
+            elif buffer.shape[1] != cols:
+                raise RuntimeError(
+                    "GLM5-Next indexer block-table width changed after "
+                    f"initialization: {buffer.shape[1]} -> {cols}"
+                )
+            if rows > buffer.shape[0]:
+                raise RuntimeError(
+                    "GLM5-Next indexer block-table rows exceed the stable "
+                    f"buffer: {rows} > {buffer.shape[0]}"
+                )
+            translated_table = buffer[:rows, :cols]
+            translated_table.copy_(compressed)
+            common_attn_metadata = common_attn_metadata.replace(
+                block_table_tensor=translated_table
+            )
+        return pristine(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+        )
+
+    return _runtime_patch(
+        owner,
+        "build",
+        build,
+        fingerprint,
+        ("self", "common_prefix_len", "common_attn_metadata", "fast_build"),
+    )
+
+
+def _zeroer_init_patch(fingerprint: str) -> PendingPatch:
+    """Exclude compressed index pages from the page-uniform zeroing pass."""
+    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm.v1.worker import utils as worker_utils
+
+    owner = worker_utils.KVBlockZeroer
+    pristine = _runtime_pristine(owner, "__init__")
+
+    def init_zeroer(
+        self,
+        device,
+        pin_memory,
+        attn_groups_iter,
+        kernel_block_sizes,
+        cache_dtype,
+        static_forward_context,
+        runner_only_attn_layers=None,
+    ):
+        groups = [
+            group
+            for group in attn_groups_iter
+            if not (
+                isinstance(group.kv_cache_spec, AttentionSpec)
+                and group.kv_cache_spec.storage_block_size
+                != group.kv_cache_spec.block_size
+            )
+        ]
+        return pristine(
+            self,
+            device,
+            pin_memory,
+            groups,
+            kernel_block_sizes,
+            cache_dtype,
+            static_forward_context,
+            runner_only_attn_layers,
+        )
+
+    return _runtime_patch(
+        owner,
+        "__init__",
+        init_zeroer,
+        fingerprint,
+        (
+            "self",
+            "device",
+            "pin_memory",
+            "attn_groups_iter",
+            "kernel_block_sizes",
+            "cache_dtype",
+            "static_forward_context",
+            "runner_only_attn_layers",
+        ),
+    )
+
+
+def glm5_next_kpool_runtime_patches(fingerprint: str) -> list[PendingPatch]:
+    """Worker-side kpool patches, installed by the GLM5 activation plan.
+
+    Keeping these out of plugin registration means a plain ``import vllm_fl``
+    no longer rewrites ``AttentionGroup``, the indexer metadata builder or
+    ``KVBlockZeroer`` for models that never request the kpool layout.
+    """
+    return [
+        _create_metadata_builders_patch(fingerprint),
+        _indexer_build_patch(fingerprint),
+        _zeroer_init_patch(fingerprint),
+    ]
+
+
 def install_glm5_next_kpool_v024() -> None:
     from vllm.platforms.interface import Platform
     from vllm.v1 import kv_cache_spec_registry
@@ -152,172 +398,16 @@ def install_glm5_next_kpool_v024() -> None:
         align_hybrid._glm5_kpool = True
         Platform._align_hybrid_block_size = classmethod(align_hybrid)
 
-    # Stock v0.24 copies every AttentionSpec to the selected attention-kernel
-    # block size before constructing its metadata builder.  For a compressed
-    # indexer that would turn logical 256 / pool 4 into an invalid 16-entry
-    # DeepGEMM page.  The reference keeps the compressed spec at pool-page
-    # granularity and records the co-located MLA kernel size for block-table
-    # translation.
-    original_create_builders = worker_utils.AttentionGroup.create_metadata_builders
-    if not getattr(original_create_builders, "_glm5_kpool", False):
-
-        def create_metadata_builders(
-            self,
-            vllm_config,
-            device,
-            kernel_block_size=None,
-            num_metadata_builders=1,
-        ):
-            spec = self.kv_cache_spec
-            is_compressed = (
-                isinstance(spec, AttentionSpec)
-                and spec.storage_block_size != spec.block_size
-            )
-            if not is_compressed:
-                return original_create_builders(
-                    self,
-                    vllm_config,
-                    device,
-                    kernel_block_size,
-                    num_metadata_builders,
-                )
-
-            storage_block_size = spec.storage_block_size
-            if storage_block_size <= 64:
-                compressed_kernel_size = storage_block_size
-            else:
-                compressed_kernel_size = (
-                    64 if storage_block_size % 64 == 0 else 32
-                )
-            assert compressed_kernel_size in (32, 64)
-            assert storage_block_size % compressed_kernel_size == 0
-            compress_ratio = spec.block_size // storage_block_size
-            builder_spec = spec.copy_with_new_block_size(
-                compressed_kernel_size * compress_ratio
-            )
-            self.metadata_builders = [
-                self.backend.get_builder_cls()(
-                    builder_spec,
-                    self.layer_names,
-                    vllm_config,
-                    device,
-                )
-                for _ in range(num_metadata_builders)
-            ]
-            if kernel_block_size is not None:
-                for builder in self.metadata_builders:
-                    builder.kernel_block_size = kernel_block_size
-
-        create_metadata_builders._glm5_kpool = True
-        worker_utils.AttentionGroup.create_metadata_builders = (
-            create_metadata_builders
-        )
-
-    # The scheduler table is shared with the MLA cache and therefore contains
-    # one physical id per 64-token kernel sub-page.  The compressed index cache
-    # owns one physical page per logical block.  Translate
-    #   [4*b+0, 4*b+1, 4*b+2, 4*b+3] -> [b]
-    # before *all* stock builder operations, so prefill writes and decode reads
-    # address the same page.  A persistent buffer keeps the path graph-safe
-    # after its warm-up allocation.
-    builder_cls = indexer_backend.DeepseekV32IndexerMetadataBuilder
-    original_indexer_build = builder_cls.build
-    if not getattr(original_indexer_build, "_glm5_kpool", False):
-
-        def build_indexer_metadata(
-            self,
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build=False,
-        ):
-            spec = self.kv_cache_spec
-            kernel_block_size = getattr(self, "kernel_block_size", None)
-            if (
-                getattr(spec, "compress_ratio", 1) > 1
-                and kernel_block_size is not None
-                and spec.block_size != kernel_block_size
-            ):
-                assert spec.block_size % kernel_block_size == 0
-                factor = spec.block_size // kernel_block_size
-                compressed = (
-                    common_attn_metadata.block_table_tensor[:, ::factor]
-                    // factor
-                )
-                buffer = getattr(self, "_glm5_indexer_block_table", None)
-                rows, cols = compressed.shape
-                if buffer is None:
-                    # Keep one base address across B1/B2/... FULL graphs.
-                    # Reallocating this tensor when only the request count
-                    # changes leaves earlier graphs pointing at freed storage.
-                    max_rows = self.vllm_config.scheduler_config.max_num_batched_tokens
-                    buffer = compressed.new_empty((max_rows, cols))
-                    self._glm5_indexer_block_table = buffer
-                elif buffer.shape[1] != cols:
-                    raise RuntimeError(
-                        "GLM5-Next indexer block-table width changed after "
-                        f"initialization: {buffer.shape[1]} -> {cols}"
-                    )
-                if rows > buffer.shape[0]:
-                    raise RuntimeError(
-                        "GLM5-Next indexer block-table rows exceed the stable "
-                        f"buffer: {rows} > {buffer.shape[0]}"
-                    )
-                translated_table = buffer[:rows, :cols]
-                translated_table.copy_(compressed)
-                common_attn_metadata = common_attn_metadata.replace(
-                    block_table_tensor=translated_table
-                )
-            return original_indexer_build(
-                self,
-                common_prefix_len,
-                common_attn_metadata,
-                fast_build,
-            )
-
-        build_indexer_metadata._glm5_kpool = True
-        builder_cls.build = build_indexer_metadata
-
-    # Reference KVBlockZeroer semantics: compressed index pages never share
-    # storage with KDA state and are overwritten before their first read, so
-    # exclude them from the page-uniform zeroing pass.  Stock 0.24 includes
-    # them and asserts because their physical page is intentionally smaller
-    # than an MLA page.
-    zeroer_cls = worker_utils.KVBlockZeroer
-    original_zeroer_init = zeroer_cls.__init__
-    if not getattr(original_zeroer_init, "_glm5_kpool", False):
-
-        def init_zeroer(
-            self,
-            device,
-            pin_memory,
-            attn_groups_iter,
-            kernel_block_sizes,
-            cache_dtype,
-            static_forward_context,
-            runner_only_attn_layers=None,
-        ):
-            groups = [
-                group
-                for group in attn_groups_iter
-                if not (
-                    isinstance(group.kv_cache_spec, AttentionSpec)
-                    and group.kv_cache_spec.storage_block_size
-                    != group.kv_cache_spec.block_size
-                )
-            ]
-            return original_zeroer_init(
-                self,
-                device,
-                pin_memory,
-                groups,
-                kernel_block_sizes,
-                cache_dtype,
-                static_forward_context,
-                runner_only_attn_layers,
-            )
-
-        init_zeroer._glm5_kpool = True
-        zeroer_cls.__init__ = init_zeroer
+    # Capture the pristine worker-side callables before any activation can
+    # rebind them.  The patches themselves are bound by the GLM5 plan, so a
+    # plain plugin import never rewrites these classes.
+    _capture_runtime_baseline(
+        worker_utils.AttentionGroup, "create_metadata_builders"
+    )
+    _capture_runtime_baseline(
+        indexer_backend.DeepseekV32IndexerMetadataBuilder, "build"
+    )
+    _capture_runtime_baseline(worker_utils.KVBlockZeroer, "__init__")
 
     # Register only after the built-ins; registering first would make v0.24's
     # lazy registry incorrectly believe initialization was already complete.

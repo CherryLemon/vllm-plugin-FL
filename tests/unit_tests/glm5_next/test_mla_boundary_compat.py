@@ -108,6 +108,44 @@ def test_mla_cache_missing_vendor_op_uses_bf16_slot_fallback(
         ops.concat_and_cache_mla(kv_c, empty_pe, cache, slots, "fp8_ds_mla", scale)
 
 
+def test_flaggems_writer_failure_after_write_is_not_retried(monkeypatch) -> None:
+    """Finding 6: a writer error after a possible write must propagate."""
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+    calls = {"cache": 0}
+
+    def missing_vendor_cache(*args, **kwargs):
+        del args, kwargs
+        raise AttributeError(
+            "'_OpNamespace' '_C_cache_ops' object has no attribute "
+            "'concat_and_cache_mla'"
+        )
+
+    fake_module = ModuleType("flag_gems.fused.concat_and_cache_mla")
+
+    def writer(kv_c, k_pe, cache, slots, *, kv_cache_dtype, scale):
+        del k_pe, kv_cache_dtype, scale
+        calls["cache"] += 1
+        cache.view(-1, cache.shape[-1])[slots] = 1.0
+        raise RuntimeError("writer failed after writing")
+
+    fake_module.concat_and_cache_mla = writer
+    monkeypatch.setitem(sys.modules, "flag_gems.fused.concat_and_cache_mla", fake_module)
+
+    ops = _fake_ops(cache_impl=missing_vendor_cache)
+    _install_mla_boundary_compat_ops(ops)
+
+    with pytest.raises(RuntimeError, match="after writing"):
+        ops.concat_and_cache_mla(
+            torch.zeros(2, 3),
+            torch.empty(2, 0),
+            torch.zeros(2, 4, 3),
+            torch.tensor([0, 1]),
+            "auto",
+            torch.ones(1),
+        )
+    assert calls["cache"] == 1
+
+
 def test_mla_cache_does_not_hide_unrelated_vendor_errors(monkeypatch) -> None:
     monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
 

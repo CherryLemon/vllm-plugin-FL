@@ -25,9 +25,8 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 )
 from vllm.triton_utils import tl, triton
 from vllm_fl.dispatch import CachedOp
-from vllm_fl.kernels.glm5_next.provider import use_nvidia_reference
 from vllm_fl.ops.fused_moe.activation import apply_moe_activation
-from vllm_fl.utils import use_flaggems
+from vllm_fl.utils import has_native_triton_moe, use_flaggems
 
 _moe_align_block_size = CachedOp("moe_align_block_size")
 _invoke_fused_moe_triton_kernel = CachedOp("invoke_fused_moe_triton_kernel")
@@ -296,19 +295,19 @@ class TritonExpertsFL(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        # FlagGems 5.3.3's fused_experts_impl only accepts the activation
-        # enum/string and therefore drops FusedMoEQuantConfig's
-        # gemm1_clamp_limit.  GLM5-Next was trained with a finite SwiGLU
-        # limit, so taking that fast path changes every routed expert in 42
-        # layers and quickly destroys model semantics.  Keep the FlagGems
-        # path for ordinary, unclamped MoE models.  On NVIDIA, bounded SwiGLU
-        # stays on the already-validated upstream TritonExperts implementation.
-        # Other accelerators continue through the per-step FlagGems GEMMs and
-        # use the exact clamped activation below.
+        # FlagGems' fused_experts_impl only accepts the activation enum/string
+        # and therefore drops FusedMoEQuantConfig's gemm1_clamp_limit.  The
+        # decision is made from the MoE semantics (the clamp requirement) and
+        # the bound implementation's capability, not from any model or provider
+        # identity: a clamped model must never take a path that ignores the
+        # clamp, while an ordinary unclamped MoE keeps the fused fast path.
+        # vLLM's native Triton experts preserve the clamp, so bounded MoE stays
+        # on them when that ABI is available; other runtimes use the per-step
+        # FlagGems GEMMs plus the exact clamped activation below.
         if (
             self.quant_config.gemm1_clamp_limit is not None
             and current_platform.is_cuda()
-            and use_nvidia_reference()
+            and has_native_triton_moe()
         ):
             return super().apply(
                 output,
@@ -334,7 +333,7 @@ class TritonExpertsFL(TritonExperts):
             and current_platform.is_cuda()
             and (
                 self.quant_config.gemm1_clamp_limit is None
-                or use_nvidia_reference()
+                or has_native_triton_moe()
             )
         ):
             import flag_gems
