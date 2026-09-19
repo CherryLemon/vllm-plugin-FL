@@ -67,94 +67,10 @@ from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_fl.kernels.glm5_next.provider import use_nvidia_reference
+from vllm_fl.kernels.glm5_next.vision_attention import Glm5VisionAttention
 from vllm_fl.models.glm5_next import SiluAndMulWithClamp
 
 logger = init_logger(__name__)
-
-
-def _install_glm5_vision_flaggems_fallback() -> None:
-    """Keep GLM5 ViT FlashAttention usable in an empty-build vLLM wheel.
-
-    The empty vLLM build does not ship the native FlashAttention extension.
-    ``vllm_fl`` consequently installs a ``vllm.vllm_flash_attn`` stub whose
-    ``flash_attn_varlen_func`` is ``None``.  vLLM's ViT custom op imports that
-    symbol from ``fa_utils`` at execution time, after the model has already
-    selected the ``FLASH_ATTN`` backend, so changing only the backend selector
-    does not repair the call site.
-
-    This hook is deliberately loaded from the GLM5 model module rather than a
-    common plugin module.  It replaces the imported function references in all
-    vLLM 0.24 layouts seen by GLM5, and remains installed for worker forwards,
-    profile-run, and CUDA-graph replay.  FlagGems currently implements FA2;
-    force that version even if a vendor selector supplied another version.
-    """
-    if not use_nvidia_reference():
-        try:
-            from flag_gems import flash_attn_varlen_func as flaggems_flash_attn
-        except (ImportError, OSError, RuntimeError) as exc:
-            logger.warning(
-                "GLM5 portable vision attention cannot import FlagGems: %s", exc
-            )
-            return
-    else:
-        return
-
-    def _glm5_flaggems_flash_attn_varlen_func(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *args: Any,
-        **kwargs: Any,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        # The vLLM wrapper passes ``fa_version`` when the selector can infer
-        # one.  FlagGems' portable implementation is FA2-only.
-        kwargs["fa_version"] = 2
-        result = flaggems_flash_attn(q, k, v, *args, **kwargs)
-        # ViT callers expect only the attention output.  Keep this adapter
-        # tolerant of FlagGems configurations that return an LSE tuple.
-        if isinstance(result, tuple):
-            return result[0]
-        return result
-
-    _glm5_flaggems_flash_attn_varlen_func.__name__ = (
-        "glm5_flaggems_flash_attn_varlen_func"
-    )
-    _glm5_flaggems_flash_attn_varlen_func._glm5_flaggems_vision = True  # type: ignore[attr-defined]
-
-    # ``vit_attn_wrappers`` imports from fa_utils inside the custom-op
-    # implementation on vLLM 0.24.  Newer/vendor layouts may import the same
-    # symbol at module scope; assign both forms and the owning MM module.
-    import vllm.model_executor.layers.attention.mm_encoder_attention as mm_mod
-    import vllm.v1.attention.backends.fa_utils as fa_utils
-    import vllm.v1.attention.ops.vit_attn_wrappers as vit_ops
-
-    fa_utils.flash_attn_varlen_func = _glm5_flaggems_flash_attn_varlen_func
-    vit_ops.flash_attn_varlen_func = _glm5_flaggems_flash_attn_varlen_func
-    mm_mod.flash_attn_varlen_func = _glm5_flaggems_flash_attn_varlen_func
-
-    # ``patch_mm_encoder_attention`` may query this module directly on an
-    # alternate vLLM build.  Repair its optional stub as well, but do not
-    # overwrite a working native implementation.
-    try:
-        import vllm.vllm_flash_attn as vllm_flash_attn
-
-        if getattr(vllm_flash_attn, "flash_attn_varlen_func", None) is None:
-            vllm_flash_attn.flash_attn_varlen_func = (
-                _glm5_flaggems_flash_attn_varlen_func
-            )
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-    logger.info_once(
-        "GLM5-Next portable vision attention uses persistent FlagGems FA2 "
-        "fallback for empty-build vLLM"
-    )
-
-
-# Install before the vision tower is constructed.  The assignment is
-# intentionally persistent: profile_run and graph replay execute the vLLM
-# custom op long after MMEncoderAttention.__init__ has returned.
-_install_glm5_vision_flaggems_fallback()
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -275,7 +191,10 @@ class Glm5NextVisionAttention(nn.Module):
             disable_tp=use_data_parallel,
         )
 
-        self.attn = MMEncoderAttention(
+        attention_cls = (
+            MMEncoderAttention if use_nvidia_reference() else Glm5VisionAttention
+        )
+        self.attn = attention_cls(
             num_heads=self.num_attention_heads_per_partition,
             head_size=self.hidden_size_per_attention_head,
             scale=self.hidden_size_per_attention_head**-0.5,
@@ -539,9 +458,10 @@ class Glm5NextVisionTransformer(nn.Module):
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
         )
 
-        self.attn_backend = get_vit_attn_backend(
-            head_size=head_dim,
-            dtype=torch.get_default_dtype(),
+        self.attn_backend = (
+            get_vit_attn_backend(head_size=head_dim, dtype=torch.get_default_dtype())
+            if use_nvidia_reference()
+            else AttentionBackendEnum.FLASH_ATTN
         )
 
     @property
@@ -918,6 +838,7 @@ class Glm5NextForConditionalGeneration(
     has_inner_state: ClassVar[Literal[True]] = True
     is_hybrid: ClassVar[Literal[True]] = True
     supports_encoder_tp_data = True
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
@@ -938,6 +859,9 @@ class Glm5NextForConditionalGeneration(
         return Glm5NextForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        from vllm_fl.patches.glm5_next_v024 import validate_glm5_config
+
+        validate_glm5_config(vllm_config)
         # Bypass Glm4vForConditionalGeneration.__init__: its language-model
         # architecture selection does not know GLM5-Next.
         nn.Module.__init__(self)
@@ -976,6 +900,11 @@ class Glm5NextForConditionalGeneration(
         config = super().get_encoder_cudagraph_config()
         config.buffer_keys = [key for key in config.buffer_keys if key != "pos_embeds"]
         return config
+
+    def load_weights(self, weights):
+        from vllm_fl.model_loader.glm5_next import unquantized_weights
+
+        return super().load_weights(unquantized_weights(weights))
 
 
 __all__ = [

@@ -167,4 +167,8 @@ def test_video_sampling_remains_config_selectable() -> None:
     assert len(new_indices) == 20
     assert len(legacy_indices) == 60
     assert new_indices[-1] == 299
-    assert legacy_indices[-1] == 299
+    # Legacy sampling walks at 6 Hz; unlike fps_interval's linspace fixup,
+    # it does not force inclusion of the source's final frame.
+    assert legacy_indices[0] == 0
+    assert legacy_indices[-1] == 295
+    assert all(a < b for a, b in zip(legacy_indices, legacy_indices[1:]))

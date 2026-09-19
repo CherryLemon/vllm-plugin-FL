@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Register the plugin-owned GLM5-Next implementation on vLLM 0.24."""
 
-import logging
 import os
 from functools import wraps
 from importlib.metadata import PackageNotFoundError, version
@@ -9,6 +8,7 @@ from types import ModuleType
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.models.config import (
     HybridAttentionMambaModelConfig,
 )
@@ -32,12 +32,13 @@ from vllm_fl.kernels.glm5_next.provider import (
     use_nvidia_reference,
 )
 from vllm_fl.runtime.model_policy import (
+    ModelPolicyError,
     ModelPolicyFactory,
     RuntimePlan,
     register_model_policy_factory,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _CAUSAL_ARCH = "Glm5NextForCausalLM"
 _CONDITIONAL_ARCH = "Glm5NextForConditionalGeneration"
@@ -474,6 +475,7 @@ class Glm5NextForCausalLMConfig(HybridAttentionMambaModelConfig):
 
     @classmethod
     def verify_and_update_config(cls, vllm_config) -> None:
+        validate_glm5_config(vllm_config)
         HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
 
         # GLM5-Next's TP16 mHC/all-reduce path is not safe to capture with
@@ -617,6 +619,44 @@ def _is_glm5_model(vllm_config) -> bool:
     )
 
 
+def validate_glm5_config(vllm_config) -> None:
+    """Reject modes whose loading/state contracts are not implemented on 0.24.
+
+    Run both before hybrid config adaptation and after vLLM resolves the final
+    configuration. Constructors also use this guard for direct model callers.
+    """
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if getattr(parallel, "pipeline_parallel_size", 1) != 1:
+        raise ModelPolicyError(
+            "GLM5-Next on vLLM 0.24 requires pipeline_parallel_size=1: "
+            "mHC state transfer between pipeline stages is not implemented"
+        )
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        raise ModelPolicyError(
+            "GLM5-Next on vLLM 0.24 does not support speculative decoding: "
+            "KDA rollback and KPool verify grouping are not implemented"
+        )
+    if getattr(parallel, "enable_eplb", False):
+        raise ModelPolicyError(
+            "GLM5-Next on vLLM 0.24 does not support enable_eplb: "
+            "model-level expert remapping is not implemented"
+        )
+    model = getattr(vllm_config, "model_config", None)
+    configs = (
+        getattr(model, "hf_config", None),
+        getattr(model, "hf_text_config", None),
+    )
+    if (
+        getattr(model, "quantization", None) is not None
+        or getattr(vllm_config, "quant_config", None) is not None
+        or any(getattr(cfg, "quantization_config", None) for cfg in configs)
+    ):
+        raise ModelPolicyError(
+            "GLM5-Next on vLLM 0.24 supports unquantized checkpoints only; "
+            "FP8/mixed-precision attention projection loading is not implemented"
+        )
+
+
 def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
     """Attention-backend override contributed by an active GLM plan.
 
@@ -648,8 +688,10 @@ def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
             "GLM5 auto provider selected a portable MLA backend because the "
             "NVIDIA ABI/DeepGEMM is unavailable, but FlagGems is not installed"
         )
-    backend_path = flaggems_backend.attention_backend(
-        use_mla=use_mla, use_sparse=use_sparse
+    backend_path = (
+        "vllm_fl.dispatch.backends.flaggems.impl.mla_sparse.FlagGemsSparseMLABackend"
+        if use_sparse
+        else "vllm_fl.dispatch.backends.flaggems.impl.mla.MLAFLBackend"
     )
     logger.info_once(
         "GLM5 plan selected attention backend: %s", backend_path, scope="local"
@@ -926,6 +968,7 @@ def apply_glm5_next_v024_patches() -> bool:
             architectures=(_CAUSAL_ARCH, _CONDITIONAL_ARCH),
             model_types=("glm5_next", "glm5_next_text"),
             build=_glm5_runtime_plan,
+            validate=validate_glm5_config,
         )
     )
 

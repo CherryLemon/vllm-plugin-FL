@@ -139,10 +139,10 @@ class Glm5NextTextConfig(PretrainedConfig):
             else "linear_attention"
             for i in range(num_hidden_layers)
         ]
-        self.mlp_layer_types = mlp_layer_types or (
-            ["dense"] * first_k_dense_replace
-            + ["sparse"] * (num_hidden_layers - first_k_dense_replace)
-        )
+        self.mlp_layer_types = mlp_layer_types or [
+            "dense" if i < first_k_dense_replace else "sparse"
+            for i in range(num_hidden_layers)
+        ]
         self.linear_attn_config = linear_attn_config
         self.linear_num_heads = linear_attn_config["num_heads"]
         self.linear_head_dim = linear_attn_config["head_dim"]

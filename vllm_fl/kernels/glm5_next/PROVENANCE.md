@@ -38,3 +38,23 @@ newer local `vllm-glm5next-ref` handoff snapshot:
 The TileLang function body is AST-identical to the reference. Plugin changes
 are limited to ownership-safe imports, explicit NVIDIA/DeepGEMM dispatch, and a
 generic materialized-broadcast fallback when the specialization is unavailable.
+
+## Paged MQA page-stride adapter
+
+`paged_mqa.py` derives from FlagGems `src/flag_gems/fused/fp8_fp4_paged_mqa_logits.py`,
+installed distribution `5.3.3.dev15+gf471641e5.pkgfix1` (revision prefix `f471641e5`).
+The Apache-2.0 header is retained. Source SHA256: `eb81d1ae1389a64b3d7bc501b005135b98153b93497a38de2c2ee3e7db782579`.
+
+The FP8 dot/relu/head-weight reduction is unchanged. The adapter reads values
+and FP32 scales from the original physical page using its byte stride, including
+padded pages. It removes the two full-pool repacks. Runtime dispatch is limited
+to NVIDIA FP8 e4m3, D=128, H=16/32/64 and page sizes 32/64. Other platforms
+retain their existing FlagGems entry point. Query scales must already be folded
+into the head weights, as in the GLM indexer caller.
+
+The private `vision_attention.py` custom op composes existing FlagGems FA2; it
+is not a new FlashAttention device kernel. It keeps tuple-to-output adaptation
+local to the GLM vision caller and uses the packed token count as a static
+maximum sequence bound.
+
+Validation and downstream ownership: `docs/models/glm5-next/review-iteration.md`.

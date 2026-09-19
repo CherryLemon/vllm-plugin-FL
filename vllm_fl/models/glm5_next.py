@@ -1081,7 +1081,13 @@ class Glm5NextModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # The v0.24 DeepSeek loader handles fused MLA/indexer projections,
         # dense SwiGLU stacking, expert tensors, and direct KDA/mHC parameters.
-        return DeepseekV2Model.load_weights(self, weights)
+        from vllm_fl.model_loader.glm5_next import (
+            audit_packed_weights,
+            unquantized_weights,
+        )
+
+        with audit_packed_weights(self):
+            return DeepseekV2Model.load_weights(self, unquantized_weights(weights))
 
     def finalize_mhc_broadcast_weights(self) -> None:
         """Build the first-layer projection used by the NVIDIA fast path."""
@@ -1115,7 +1121,12 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        from vllm_fl.patches.glm5_next_v024 import validate_glm5_config
+
+        validate_glm5_config(vllm_config)
         super().__init__()
         self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config
@@ -1192,19 +1203,21 @@ class Glm5NextForCausalLM(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm_fl.model_loader.glm5_next import unquantized_weights
+
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
             ignore_unexpected_prefixes=["model.visual."],
         )
-        loaded = loader.load_weights(weights)
+        loaded = loader.load_weights(unquantized_weights(weights))
 
         # AutoWeightsLoader accepts a checkpoint as soon as every *present*
         # key has a destination; it does not verify the inverse condition that
         # every runtime parameter received a checkpoint tensor.  That is too
-        # weak for a newly adapted architecture: one missed packed projection
-        # otherwise remains torch.empty() and only appears later as meaningless
-        # logits.  Audit the text model at the innermost CausalLM boundary so
+        # weak for a newly adapted architecture. The inner model additionally
+        # audits successful packed-shard/expert loads. Audit destination names
+        # at the innermost CausalLM boundary so
         # vision-only parameters and outer HF prefix mapping cannot obscure the
         # result.
         expected = {name for name, _ in self.named_parameters()}

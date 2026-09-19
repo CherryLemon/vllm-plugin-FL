@@ -66,20 +66,21 @@ def _graph_safe_flaggems_paged_mqa_logits(
         )
 
     num_physical_blocks = kv_cache.shape[0]
-    flat_size = num_physical_blocks * block_size
-    block_stride = block_size * (head_dim + 4)
-    cache_flat = kv_cache.reshape(num_physical_blocks, block_stride)
-    cache_values = cache_flat[:, : block_size * head_dim]
-    cache_values = cache_values.reshape(flat_size, head_dim).contiguous()
-    scale_bytes = cache_flat[:, block_size * head_dim :]
-    cache_scales = (
-        scale_bytes.reshape(num_physical_blocks, block_size, 4)
-        .contiguous()
-        .reshape(flat_size, 4)
-        .view(torch.float32)
-        .reshape(flat_size)
-        .contiguous()
-    )
+    # Keep the original page storage. Values and scales are separate regions
+    # within each page; flattening them would copy the entire physical pool.
+    if (
+        head_dim != 128
+        or block_size not in (32, 64)
+        or num_heads not in (16, 32, 64)
+        or q_values.dtype != torch.float8_e4m3fn
+        or _q_scale is not None
+        or kv_cache.dtype != torch.uint8
+        or kv_cache.stride(-1) != 1
+        or kv_cache.stride(1) != head_dim + 4
+        or kv_cache.stride(0) < block_size * (head_dim + 4)
+    ):
+        raise ValueError("Unsupported GLM5 paged MQA FP8 page/query layout")
+    from .paged_mqa import _paged_mqa_logits_kernel
 
     if block_tables.dim() == 2:
         block_tables_expanded = (
@@ -106,10 +107,9 @@ def _graph_safe_flaggems_paged_mqa_logits(
     block_kv, num_blocks = loaded._select_block_kv(max_model_len, block_size)
     max_blocks_per_sequence = block_tables_expanded.shape[1]
     grid = (loaded.triton.cdiv(max_model_len, block_kv), total_rows)
-    loaded._mqa_logits_kernel[grid](
+    _paged_mqa_logits_kernel[grid](
         query_bytes,
-        cache_values,
-        cache_scales,
+        kv_cache,
         weights,
         block_tables_expanded,
         logits,
@@ -123,7 +123,7 @@ def _graph_safe_flaggems_paged_mqa_logits(
         max_blocks_per_seq=max_blocks_per_sequence,
         num_phys_blocks=num_physical_blocks,
         stride_q_row=num_heads * head_dim,
-        stride_kv_flat=head_dim,
+        stride_kv_page=kv_cache.stride(0),
         stride_bt_row=max_blocks_per_sequence,
         stride_out_row=max_model_len,
         stride_w_row=num_heads,
@@ -160,7 +160,7 @@ def _load_flaggems_op(module: str, name: str) -> Callable | None:
                     name,
                 )
         function = getattr(loaded, name)
-        if module == "fp8_fp4_paged_mqa_logits":
+        if module == "fp8_fp4_paged_mqa_logits" and current_platform.is_cuda():
             required = ("_mqa_logits_kernel", "_select_block_kv", "triton")
             if all(hasattr(loaded, attr) for attr in required):
                 logger.info_once(
@@ -281,10 +281,20 @@ def _dequantize_grouped(
     if scales is None:
         return output
     scales = scales.float()
+    # MQA prefill supplies one scale per key as [N], whereas cache views
+    # retain the trailing group dimension [pages, tokens, groups]. Normalize
+    # only the exact per-vector shape; do not broadcast a token axis as groups.
+    if scales.shape == output.shape[:-1]:
+        scales = scales.unsqueeze(-1)
+    if scales.ndim != output.ndim or scales.shape[:-1] != output.shape[:-1]:
+        raise ValueError(
+            f"Scale shape {tuple(scales.shape)} must match quantized vectors "
+            f"{tuple(output.shape[:-1])} with an optional trailing group axis"
+        )
     num_groups = scales.shape[-1]
     if num_groups == 1:
         return output * scales
-    if output.shape[-1] % num_groups:
+    if num_groups == 0 or output.shape[-1] % num_groups:
         raise ValueError("Quantized width must be divisible by the scale groups")
     group_size = output.shape[-1] // num_groups
     grouped = output.reshape(*output.shape[:-1], num_groups, group_size)

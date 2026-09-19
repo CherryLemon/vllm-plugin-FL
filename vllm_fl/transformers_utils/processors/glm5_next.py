@@ -99,6 +99,8 @@ def glm_sample_frame_indices(
     Request overrides: ``target_fps`` -> fps interval, ``max_frame_count``
     -> frame cap.
     """
+    if total_frames <= 0 or fps <= 0 or temporal_patch_size <= 0:
+        raise ValueError("Video frames, source fps and temporal_patch_size must be positive")
     max_frame_idx = total_frames - 1
     if not duration:
         duration = (round(max_frame_idx / fps) + 1) if fps else 0
@@ -106,8 +108,10 @@ def glm_sample_frame_indices(
         max_frame_count = GLM_VIDEO_DEFAULT_MAX_FRAMES
     if target_fps is None:
         target_fps = GLM_VIDEO_DEFAULT_FPS
+    if target_fps <= 0 or max_frame_count < temporal_patch_size or duration < 0:
+        raise ValueError("Invalid video sampling duration, fps or frame cap")
 
-    extract_t = int(duration * target_fps)
+    extract_t = max(temporal_patch_size, int(duration * target_fps))
     extract_t = min(extract_t, int(max_frame_count))
 
     duration_per_frame = 1 / fps
