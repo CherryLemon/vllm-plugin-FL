@@ -228,6 +228,11 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 
 class KpoolTailBackend(DeepseekV32IndexerBackend):
+    @classmethod
+    def indexes_kv_by_block_stride(cls):
+        # Tail rings occupy padded pages in the shared index-cache allocation.
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "KPOOL_TAIL"

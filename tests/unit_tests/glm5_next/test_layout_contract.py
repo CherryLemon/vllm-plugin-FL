@@ -15,6 +15,24 @@ from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
 from vllm_fl.runtime.kv_layout import get_physical_cache_layout
 
 
+def test_tail_backend_preserves_stride_capability_without_changing_deepseek():
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+
+    from vllm_fl.models.glm5_next_kpool import Glm5NextTailCache
+
+    # The runner replaces the spec's flag with the backend's declaration.
+    # Tail pages share padded index-cache allocations, so that declaration
+    # must survive removing the old global Deepseek backend patch.
+    cache = object.__new__(Glm5NextTailCache)
+    torch.nn.Module.__init__(cache)
+    cache.index_kpool = 4
+    cache.head_dim = 128
+    spec = cache.get_kv_cache_spec(None)
+    assert spec.indexes_kv_by_block_stride
+    assert cache.get_attn_backend().indexes_kv_by_block_stride()
+    assert not DeepseekV32IndexerBackend.indexes_kv_by_block_stride()
+
+
 @pytest.mark.parametrize("preinitialized", [False, True])
 def test_real_kv_registry_handles_lazy_and_late_plugin_registration(preinitialized):
     code = f"""
