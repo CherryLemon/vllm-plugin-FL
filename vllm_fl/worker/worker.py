@@ -255,64 +255,35 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        if fl_envs.USE_FLAGGEMS:
-            # Capture native CUDA aten::mm before FlagGems changes the CUDA
-            # registration. The common policy is opt-in; model integrations
-            # may supply a validated default in their own commit.
-            from vllm_fl.patches.flaggems_mm_shape_aware import (
-                capture_native_mm_kernel,
-                is_mm_dispatch_enabled,
-                is_shape_aware_mm_enabled,
-            )
+        from vllm_fl.patches.flaggems_mm_shape_aware import configure_flaggems_mm
 
-            shape_aware_mm_enabled = is_shape_aware_mm_enabled()
+        whitelist, blacklist = get_flag_gems_whitelist_blacklist()
 
-            # Resolve policy before capturing native mm. An override is valid
-            # only when FlagGems retains ownership of aten::mm.
-            whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-            mm_dispatch_enabled = is_mm_dispatch_enabled(whitelist, blacklist)
-            native_mm_kernel = None
-            if shape_aware_mm_enabled and mm_dispatch_enabled:
-                native_mm_kernel = capture_native_mm_kernel()
-
+        def enable_flaggems(library):
             import flag_gems
 
-            # Only rank 0 records the oplist to avoid file truncation and
-            # interleaved writes when tensor-parallel-size > 1.
-            should_record = (rank == 0)
-
-            # Use whitelist if specified (takes precedence over blacklist)
-            if whitelist:
-                logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
-                flag_gems.only_enable(
-                    include=whitelist,
-                    record=should_record,
-                    once=True,
-                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                )
+            kwargs = dict(
+                record=rank == 0, once=True,
+                path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+            )
+            if library is not None:
+                kwargs["lib"] = library
+            if whitelist is not None:
+                flag_gems.only_enable(include=whitelist, **kwargs)
             elif blacklist:
-                logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
-                flag_gems.enable(
-                    unused=blacklist,
-                    record=should_record,
-                    once=True,
-                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                )
+                flag_gems.enable(unused=blacklist, **kwargs)
             else:
-                logger.info("[FlagGems] Enable all ops")
-                flag_gems.enable(
-                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH
-                )
+                flag_gems.enable(**kwargs)
 
-            from vllm_fl.patches.flaggems_mm_shape_aware import apply_shape_aware_mm
-
-            if shape_aware_mm_enabled and not mm_dispatch_enabled:
-                logger.warning(
-                    "[FlagGems] Skip shape-aware aten.mm because mm is "
-                    "excluded by the active whitelist/blacklist"
-                )
-            elif shape_aware_mm_enabled:
-                apply_shape_aware_mm(native_mm_kernel=native_mm_kernel)
+        mm_status = configure_flaggems_mm(
+            enable_flaggems,
+            use_flaggems=fl_envs.USE_FLAGGEMS,
+            whitelist=whitelist,
+            blacklist=blacklist,
+        )
+        logger.info(
+            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
+        )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator

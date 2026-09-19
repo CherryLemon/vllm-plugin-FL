@@ -28,43 +28,27 @@ class _FakeTensor:
         return self._stride
 
 
-class _FakeLibrary:
-    def __init__(self):
-        self.impl_calls = []
-
-    def impl(
-        self,
-        op_name,
-        fn,
-        dispatch_key,
-        *,
-        with_keyset=False,
-        allow_override=False,
-    ):
-        self.impl_calls.append(
-            (op_name, fn, dispatch_key, with_keyset, allow_override)
-        )
+@pytest.fixture(autouse=True)
+def isolated_policy(monkeypatch):
+    monkeypatch.setattr(shape_aware, "_STATE", None)
+    monkeypatch.setattr(shape_aware, "_FAILED", False)
 
 
-class _FakeSafeKernel:
-    def __init__(self, fn):
-        self.fn = fn
-
-    def call_boxed(self, dispatch_keys, *args):
-        return self.fn(dispatch_keys, *args)
-
-
-def test_default_is_disabled_and_does_not_touch_torch(monkeypatch):
+def test_disabled_policy_is_latched_without_kernel_inspection(monkeypatch):
     monkeypatch.delenv(shape_aware.ENABLE_ENV, raising=False)
     monkeypatch.delenv(shape_aware.THRESHOLD_ENV, raising=False)
-    monkeypatch.setattr(shape_aware, "_STATE", None)
-
-    def fail_get_kernel(*args, **kwargs):
-        raise AssertionError("disabled feature must not inspect dispatch state")
-
-    monkeypatch.setattr(shape_aware.torch.library, "get_kernel", fail_get_kernel)
-    assert shape_aware.apply_shape_aware_mm() is False
-    assert shape_aware._STATE is None
+    calls = []
+    monkeypatch.setattr(
+        shape_aware,
+        "_get_registered_mm_kernel",
+        lambda: pytest.fail("disabled policy inspected mm"),
+    )
+    assert shape_aware.configure_flaggems_mm(calls.append).status == "disabled"
+    assert shape_aware.configure_flaggems_mm(calls.append).status == "disabled"
+    assert calls == [None]
+    monkeypatch.setenv(shape_aware.ENABLE_ENV, "1")
+    with pytest.raises(RuntimeError, match="process-lifetime"):
+        shape_aware.configure_flaggems_mm(calls.append)
 
 
 def test_caller_default_can_enable_but_explicit_disable_wins(monkeypatch):
@@ -89,9 +73,7 @@ def test_caller_default_can_enable_but_explicit_disable_wins(monkeypatch):
 def test_mm_dispatch_guard_preserves_explicit_flaggems_selection(
     whitelist, blacklist, expected
 ):
-    assert (
-        shape_aware.is_mm_dispatch_enabled(whitelist, blacklist) is expected
-    )
+    assert shape_aware.is_mm_dispatch_enabled(whitelist, blacklist) is expected
 
 
 @pytest.mark.parametrize("value", ["", "2 ", " 2", "+2", "-1", "1.0", "abc"])
@@ -127,22 +109,14 @@ def test_native_candidate_boundary_dtype_and_stride():
     b_column_major = _FakeTensor(m=4096, stride=(1, 4096))
     assert shape_aware._is_native_candidate(a, b_column_major, 1)
 
-    assert shape_aware._is_native_candidate(
-        _FakeTensor(m=64), b_column_major, 64
-    )
-    assert not shape_aware._is_native_candidate(
-        _FakeTensor(m=65), b_column_major, 64
-    )
+    assert shape_aware._is_native_candidate(_FakeTensor(m=64), b_column_major, 64)
+    assert not shape_aware._is_native_candidate(_FakeTensor(m=65), b_column_major, 64)
 
-    assert not shape_aware._is_native_candidate(
-        _FakeTensor(m=2), b_column_major, 1
-    )
+    assert not shape_aware._is_native_candidate(_FakeTensor(m=2), b_column_major, 1)
     assert not shape_aware._is_native_candidate(
         a, _FakeTensor(dtype=torch.float16, stride=(1, 4096)), 1
     )
-    assert not shape_aware._is_native_candidate(
-        a, _FakeTensor(stride=(8192, 2)), 1
-    )
+    assert not shape_aware._is_native_candidate(a, _FakeTensor(stride=(8192, 2)), 1)
     assert not shape_aware._is_native_candidate(
         _FakeTensor(stride=(8192, 2)), b_column_major, 1
     )
@@ -154,102 +128,98 @@ def test_native_candidate_boundary_dtype_and_stride():
     )
 
 
-def test_apply_captures_flaggems_before_override_and_routes_shapes(monkeypatch):
-    monkeypatch.setenv(shape_aware.ENABLE_ENV, "1")
-    monkeypatch.setenv(shape_aware.THRESHOLD_ENV, "2")
-    monkeypatch.setattr(shape_aware, "_STATE", None)
+@pytest.mark.parametrize(
+    "scenario",
+    ["reuse", "disable", "threshold", "backend", "external", "filtered", "wrong_owner"],
+)
+@pytest.mark.skipif(
+    not callable(getattr(torch.library, "get_kernel", None))
+    or not torch._C._dispatch_has_kernel_for_dispatch_key("aten::mm", "CUDA"),
+    reason="torch SafeKernelFunction API unavailable",
+)
+def test_real_dispatcher_process_lifetime(monkeypatch, scenario):
+    # Real Library and SafeKernelFunction, isolated so aten registrations never
+    # leak into other tests. CPU tensors go through a captured CUDA Python
+    # implementation for the large-M branch; no CUDA tensors are allocated.
+    import os
+    import subprocess
+    import sys
+    import textwrap
 
-    calls = []
-
-    def flaggems_mm(a, b):
-        calls.append(("flaggems", a, b))
-        return "flaggems-result"
-
-    def native_mm(keyset, a, b):
-        calls.append(("native", keyset, a, b))
-        return "native-result"
-
-    native_kernel = _FakeSafeKernel(native_mm)
-    flaggems_kernel = _FakeSafeKernel(
-        lambda dispatch_keys, a, b: flaggems_mm(a, b)
+    env = os.environ.copy()
+    env[shape_aware.ENABLE_ENV] = "1"
+    env[shape_aware.THRESHOLD_ENV] = "2"
+    code = textwrap.dedent("""
+        import os, sys, torch
+        from vllm_fl.patches import flaggems_mm_shape_aware as m
+        scenario = sys.argv[1]
+        calls = []
+        def fake_mm(a, b):
+            calls.append('large')
+            return a + 7
+        fake_mm.__module__ = 'flag_gems.test_backend'
+        def enable(lib):
+            calls.append('enable')
+            if scenario == 'filtered':
+                return
+            if scenario == 'wrong_owner':
+                fake_mm.__module__ = 'unrelated_backend'
+            lib.impl('mm', fake_mm, 'CUDA')
+        if scenario in ('filtered', 'wrong_owner'):
+            try:
+                m.configure_flaggems_mm(enable)
+            except RuntimeError as e:
+                assert 'expected distinct' in str(e), str(e)
+            else:
+                raise AssertionError('accepted missing/wrong backend')
+            try:
+                m.configure_flaggems_mm(enable)
+            except RuntimeError as e:
+                assert 'previously failed' in str(e)
+            else:
+                raise AssertionError('accepted retry after failed init')
+            sys.exit(0)
+        status = m.configure_flaggems_mm(enable)
+        assert status.status == 'installed'
+        assert status.native != status.flaggems
+        keys = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
+        a, b = torch.ones(3, 2), torch.ones(2, 2)
+        result = torch.library.get_kernel('aten::mm','CUDA').call_boxed(keys,a,b)
+        torch.testing.assert_close(result, a + 7)
+        assert calls == ['enable', 'large']
+        if scenario == 'reuse':
+            assert m.configure_flaggems_mm(enable).status == 'already_active'
+            assert calls == ['enable', 'large']
+            sys.exit(0)
+        kwargs = {}
+        if scenario == 'disable': os.environ[m.ENABLE_ENV] = '0'
+        if scenario == 'threshold': os.environ[m.THRESHOLD_ENV] = '3'
+        if scenario == 'backend': kwargs['blacklist'] = ['mm']
+        if scenario == 'external':
+            external = torch.library.Library('aten','IMPL')
+            external.impl('mm', lambda a,b: a + 100, 'CUDA', allow_override=True)
+        try:
+            m.configure_flaggems_mm(enable, **kwargs)
+        except RuntimeError as e:
+            assert ('conflicting_owner' if scenario == 'external' else 'process-lifetime') in str(e)
+        else:
+            raise AssertionError('accepted changed configuration/owner')
+        assert calls == ['enable', 'large']
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", code, scenario],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
     )
-    library = _FakeLibrary()
-    monkeypatch.setattr(
-        shape_aware.torch.library,
-        "get_kernel",
-        lambda op_name, dispatch_key: flaggems_kernel,
-    )
-    monkeypatch.setattr(
-        shape_aware.torch.library,
-        "Library",
-        lambda namespace, kind: library,
-    )
-
-    assert shape_aware.apply_shape_aware_mm(native_mm_kernel=native_kernel) is True
-    assert len(library.impl_calls) == 1
-    op_name, wrapper, dispatch_key, with_keyset, allow_override = (
-        library.impl_calls[0]
-    )
-    assert (op_name, dispatch_key, with_keyset, allow_override) == (
-        "mm",
-        "CUDA",
-        True,
-        True,
-    )
-    assert wrapper._vllm_fl_original_flaggems_mm is flaggems_kernel
-    assert wrapper._vllm_fl_native_mm is native_kernel
-
-    a = _FakeTensor(m=1)
-    b = _FakeTensor(m=4096, stride=(1, 4096))
-    assert wrapper("dispatch-key", a, b) == "native-result"
-    assert calls[0][0] == "native"
-
-    # Boundary is inclusive: M == threshold is still decode/native.
-    calls.clear()
-    assert wrapper("dispatch-key", _FakeTensor(m=2), b) == "native-result"
-    assert calls[0][0] == "native"
-
-    calls.clear()
-    assert wrapper("dispatch-key", _FakeTensor(m=3), b) == "flaggems-result"
-    assert calls[0][0] == "flaggems"
-
-    # Unsupported dtype/stride remains on the captured FlagGems callable.
-    calls.clear()
-    assert (
-        wrapper("dispatch-key", _FakeTensor(dtype=torch.int8), b)
-        == "flaggems-result"
-    )
-    assert calls[0][0] == "flaggems"
-
-    # Reapplying is idempotent and does not replace the captured kernel again.
-    assert shape_aware.apply_shape_aware_mm() is False
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_apply_fails_without_safe_override_api(monkeypatch):
-    monkeypatch.setenv(shape_aware.ENABLE_ENV, "1")
-    monkeypatch.delenv(shape_aware.THRESHOLD_ENV, raising=False)
-    monkeypatch.setattr(shape_aware, "_STATE", None)
-    safe_kernel = _FakeSafeKernel(lambda dispatch_keys, a, b: None)
-    monkeypatch.setattr(
-        shape_aware.torch.library, "get_kernel", lambda *_: safe_kernel
-    )
+def test_apply_fails_without_safe_override_api():
+    class OldLibrary:
+        def impl(self, name, fn, key):
+            pytest.fail("unsafe registration attempted")
 
-    class _NoAllowOverrideLibrary:
-        def impl(self, op_name, fn, dispatch_key):
-            del op_name, fn, dispatch_key
-
-    monkeypatch.setattr(
-        shape_aware.torch.library,
-        "Library",
-        lambda namespace, kind: _NoAllowOverrideLibrary(),
-    )
     with pytest.raises(RuntimeError, match="with_keyset|allow_override"):
-        shape_aware.apply_shape_aware_mm(native_mm_kernel=safe_kernel)
-    assert shape_aware._STATE is None
-
-
-def test_apply_requires_capture_before_flaggems(monkeypatch):
-    monkeypatch.setenv(shape_aware.ENABLE_ENV, "1")
-    monkeypatch.setattr(shape_aware, "_STATE", None)
-    with pytest.raises(RuntimeError, match="before flag_gems.enable"):
-        shape_aware.apply_shape_aware_mm()
+        shape_aware._register_override(OldLibrary(), lambda *args: None)

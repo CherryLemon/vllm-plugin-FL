@@ -24,6 +24,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 import torch
@@ -36,25 +37,43 @@ DEFAULT_DECODE_MAX_M = 64
 
 
 @dataclass(frozen=True)
-class ShapeAwareMMState:
-    """Handles retained for the lifetime of the process.
+class MMConfig:
+    use_flaggems: bool
+    enabled: bool
+    threshold: int
+    whitelist: tuple[str, ...] | None
+    blacklist: tuple[str, ...] | None
 
-    ``torch.library.Library`` registrations are revoked when the Library
-    object is garbage-collected, so the handle must be kept alive globally.
-    The original kernels are ``torch.library.get_kernel``'s
-    ``SafeKernelFunction`` handles.  They must be retained and called through
-    ``call_boxed(dispatch_keys, ...)`` after the override is installed; a
-    normal Python call is not supported by torch 2.11 and a redispatch using a
-    guessed keyset can recurse or bypass the intended backend.
+
+@dataclass(frozen=True)
+class MMStatus:
+    status: str
+    reason: str
+    native: str | None = None
+    flaggems: str | None = None
+
+
+@dataclass(frozen=True)
+class ShapeAwareMMState:
+    """One immutable worker policy and its retained dispatcher registrations.
+
+    Shutdown does not uninstall process-wide kernels. A subsequent worker
+    must use identical configuration and retain dispatcher ownership; changing
+    enable, threshold, or backend selection requires a new process.
     """
 
-    threshold: int
-    native_mm: Any
-    flaggems_mm: Any
-    library: Any
+    config: MMConfig
+    result: MMStatus
+    native_mm: Any = None
+    flaggems_mm: Any = None
+    flaggems_library: Any = None
+    library: Any = None
+    registration: tuple[str, ...] = ()
 
 
 _STATE: ShapeAwareMMState | None = None
+_FAILED = False
+_LOCK = RLock()
 
 
 def _parse_bool_env(name: str, *, default: bool = False) -> bool:
@@ -67,9 +86,7 @@ def _parse_bool_env(name: str, *, default: bool = False) -> bool:
         return True
     if value == "0" or value == "false":
         return False
-    raise ValueError(
-        f"{name} must be exactly one of 0, 1, false, true; got {value!r}"
-    )
+    raise ValueError(f"{name} must be exactly one of 0, 1, false, true; got {value!r}")
 
 
 def _parse_threshold_env(name: str = THRESHOLD_ENV) -> int:
@@ -186,7 +203,7 @@ def is_mm_dispatch_enabled(
     whitelist: list[str] | None,
     blacklist: list[str] | None,
 ) -> bool:
-    """Return whether FlagGems owns ``aten.mm`` for this worker.
+    """Return whether plugin policy requests FlagGems ``aten.mm``.
 
     A shape-aware override needs both the captured native kernel and the
     post-``flag_gems.enable`` FlagGems kernel. Installing it while ``mm`` is
@@ -232,85 +249,158 @@ def _register_override(library: Any, wrapper: Callable[..., Any]) -> None:
         ) from exc
 
 
-def apply_shape_aware_mm(
-    *,
-    native_mm_kernel: Any | None = None,
-    default_enabled: bool = False,
-) -> bool:
-    """Install the opt-in shape-aware CUDA ``aten.mm`` wrapper.
+def _registration_fingerprint() -> tuple[str, ...]:
+    # Include active AND shadowed registrations: two Libraries constructed at
+    # the same source line still produce a different registration stack.
+    return tuple(
+        line
+        for line in torch._C._dispatch_dump("aten::mm").splitlines()
+        if line.startswith("CUDA:") or line.startswith("CUDA (inactive):")
+    )
 
-    Returns ``True`` when a new override is installed and ``False`` when the
-    feature is disabled or was already installed.  Invalid configuration and
-    unsupported torch registration APIs raise immediately with an actionable
-    error; silently falling back would make a benchmark claim ambiguous.
+
+class _ObservedFlagGemsLibrary(torch.library.Library):
+    """Observe successful registration, after FlagGems' own filtering.
+
+    This is a Library passed through FlagGems' public lib= parameter, not a
+    global monkeypatch. Retain the exact callable and boxed handle installed
+    by that registration rather than inferring ownership from a whitelist.
     """
 
-    global _STATE
+    def __init__(self):
+        super().__init__("aten", "IMPL")
+        self.mm = None
+        self.mm_callable = None
+        self.mm_registration = ()
 
-    if not _parse_bool_env(ENABLE_ENV, default=default_enabled):
-        return False
-    threshold = _parse_threshold_env()
-    if _STATE is not None:
-        if _STATE.threshold != threshold:
+    def impl(
+        self, op_name, fn, dispatch_key="", *, with_keyset=False, allow_override=False
+    ):
+        super().impl(
+            op_name,
+            fn,
+            dispatch_key,
+            with_keyset=with_keyset,
+            allow_override=allow_override,
+        )
+        if op_name in ("mm", "aten::mm") and dispatch_key == "CUDA":
+            self.mm = _get_registered_mm_kernel()
+            self.mm_callable = fn
+            self.mm_registration = _registration_fingerprint()
+
+
+def configure_flaggems_mm(
+    enable_flaggems: Callable[[Any], None],
+    *,
+    use_flaggems: bool = True,
+    whitelist: list[str] | None = None,
+    blacklist: list[str] | None = None,
+    default_enabled: bool = False,
+) -> MMStatus:
+    """Initialize FlagGems once and optionally install shape-aware CUDA mm.
+
+    Repeated worker initialization checks configuration and ownership BEFORE
+    invoking FlagGems again. This prevents capturing our wrapper as the native
+    backend or letting a second enable() overwrite it. No per-mm-call checks,
+    tensor reads, or synchronization are added to inference/capture.
+    """
+    global _STATE, _FAILED
+    config = MMConfig(
+        use_flaggems,
+        is_shape_aware_mm_enabled(default=default_enabled),
+        _parse_threshold_env(),
+        tuple(sorted(whitelist)) if whitelist is not None else None,
+        tuple(sorted(blacklist)) if blacklist is not None else None,
+    )
+    with _LOCK:
+        if _FAILED:
             raise RuntimeError(
-                "Shape-aware FlagGems mm is already installed with threshold "
-                f"{_STATE.threshold}, cannot change it to {threshold} in-process"
+                "FlagGems initialization previously failed; restart the process"
             )
-        return False
+        if _STATE is not None:
+            if config != _STATE.config:
+                raise RuntimeError(
+                    "FlagGems/MM configuration is process-lifetime; restart to change it"
+                )
+            if _STATE.library is not None:
+                if _registration_fingerprint() != _STATE.registration:
+                    raise RuntimeError(
+                        "conflicting_owner: aten::mm/CUDA registration changed; restart the process"
+                    )
+                return MMStatus(
+                    "already_active",
+                    _STATE.result.reason,
+                    _STATE.result.native,
+                    _STATE.result.flaggems,
+                )
+            return _STATE.result
 
-    if native_mm_kernel is None:
-        raise RuntimeError(
-            "Shape-aware FlagGems mm must capture native CUDA aten::mm "
-            "before flag_gems.enable; call capture_native_mm_kernel() first"
+        active = (
+            config.use_flaggems
+            and config.enabled
+            and is_mm_dispatch_enabled(whitelist, blacklist)
         )
-    if not callable(getattr(native_mm_kernel, "call_boxed", None)):
-        raise RuntimeError(
-            "native_mm_kernel is not a SafeKernelFunction with call_boxed; "
-            "refusing a recursive or ambiguous aten::mm override"
-        )
+        if not active:
+            if config.use_flaggems:
+                try:
+                    enable_flaggems(None)
+                except Exception:
+                    _FAILED = True
+                    raise
+            result = MMStatus("disabled", "policy disabled or mm excluded")
+            _STATE = ShapeAwareMMState(config, result)
+            return result
 
-    flaggems_mm = _get_registered_mm_kernel()
+        try:
+            native = capture_native_mm_kernel()
+            if "RegisterCUDA" not in repr(native):
+                raise RuntimeError(
+                    "Expected native CUDA mm before FlagGems initialization"
+                )
+            gems_lib = _ObservedFlagGemsLibrary()
+            enable_flaggems(gems_lib)
+            gems = gems_lib.mm
+            fn = gems_lib.mm_callable
+            if (
+                gems is None
+                or not getattr(fn, "__module__", "").startswith("flag_gems.")
+                or gems_lib.mm_registration != _registration_fingerprint()
+                or repr(gems) == repr(native)
+            ):
+                raise RuntimeError(
+                    "FlagGems did not install the expected distinct CUDA mm kernel"
+                )
 
-    def shape_aware_mm(dispatch_keys: Any, a: Any, b: Any) -> Any:
-        # ``dispatch_keys`` is supplied by torch.library's with_keyset=True
-        # wrapper.  Passing it to the retained SafeKernelFunction preserves
-        # the original dispatcher context without a host sync or guessed
-        # redispatch keyset.
-        if _is_native_candidate(a, b, threshold):
-            return native_mm_kernel.call_boxed(dispatch_keys, a, b)
-        return flaggems_mm.call_boxed(dispatch_keys, a, b)
+            def shape_aware_mm(dispatch_keys, a, b):
+                target = (
+                    native if _is_native_candidate(a, b, config.threshold) else gems
+                )
+                return target.call_boxed(dispatch_keys, a, b)
 
-    shape_aware_mm.__name__ = "shape_aware_mm"
-    shape_aware_mm._vllm_fl_shape_aware_mm = True
-    shape_aware_mm._vllm_fl_original_flaggems_mm = flaggems_mm
-    shape_aware_mm._vllm_fl_native_mm = native_mm_kernel
-
-    library = torch.library.Library("aten", "IMPL")
-    _register_override(library, shape_aware_mm)
-    _STATE = ShapeAwareMMState(
-        threshold=threshold,
-        native_mm=native_mm_kernel,
-        flaggems_mm=flaggems_mm,
-        library=library,
-    )
-    logger.info(
-        "Enabled shape-aware FlagGems aten.mm: native CUDA for M <= %d, "
-        "FlagGems for larger/unsupported shapes",
-        threshold,
-    )
-    return True
-
-
-__all__ = [
-    "DEFAULT_DECODE_MAX_M",
-    "ENABLE_ENV",
-    "ShapeAwareMMState",
-    "THRESHOLD_ENV",
-    "_is_native_candidate",
-    "_parse_bool_env",
-    "_parse_threshold_env",
-    "apply_shape_aware_mm",
-    "capture_native_mm_kernel",
-    "is_mm_dispatch_enabled",
-    "is_shape_aware_mm_enabled",
-]
+            library = torch.library.Library("aten", "IMPL")
+            _register_override(library, shape_aware_mm)
+            registration = _registration_fingerprint()
+            if registration == gems_lib.mm_registration:
+                raise RuntimeError("Shape-aware mm override was not installed")
+            result = MMStatus(
+                "installed",
+                f"native CUDA for M <= {config.threshold}; FlagGems otherwise",
+                repr(native),
+                f"{fn.__module__}.{fn.__name__}: {gems!r}",
+            )
+            _STATE = ShapeAwareMMState(
+                config, result, native, gems, gems_lib, library, registration
+            )
+            logger.info(
+                "Shape-aware MM status=%s policy=%s native=%s flaggems=%s",
+                result.status,
+                result.reason,
+                result.native,
+                result.flaggems,
+            )
+            return result
+        except Exception:
+            # Registration can have side effects; retries in this process must
+            # never reinterpret a partially initialized backend as native.
+            _FAILED = True
+            raise
