@@ -36,7 +36,7 @@ try:  # Keep importing the model usable on non-CUDA/non-Triton installations.
     import triton.language as tl
 
     _TRITON_AVAILABLE = True
-except (ImportError, RuntimeError):  # pragma: no cover - CPU-only environments
+except ImportError:  # pragma: no cover - CPU-only environments
     triton = None  # type: ignore[assignment]
     tl = None  # type: ignore[assignment]
     _TRITON_AVAILABLE = False
@@ -145,6 +145,7 @@ def _is_candidate(flat: torch.Tensor, weight: torch.Tensor) -> bool:
     if not _TRITON_AVAILABLE or not _enabled():
         return False
     from vllm.platforms import current_platform
+
     if not current_platform.is_cuda():
         return False
     if flat.device.type != "cuda" or weight.device != flat.device:
@@ -178,6 +179,7 @@ def _is_large_m_rms_candidate(flat: torch.Tensor, weight: torch.Tensor) -> bool:
     if not _TRITON_AVAILABLE or not _enabled():
         return False
     from vllm.platforms import current_platform
+
     if not current_platform.is_cuda():
         return False
     if flat.device.type != "cuda" or weight.device != flat.device:
@@ -201,9 +203,7 @@ def _is_large_m_rms_candidate(flat: torch.Tensor, weight: torch.Tensor) -> bool:
 def _large_m_inv_rms(flat: torch.Tensor, eps: float) -> torch.Tensor:
     """Compute ``rsqrt(mean(flat**2) + eps)`` as an ``[M, 1]`` tensor."""
 
-    inv_rms = torch.empty(
-        (flat.shape[0], 1), device=flat.device, dtype=torch.float32
-    )
+    inv_rms = torch.empty((flat.shape[0], 1), device=flat.device, dtype=torch.float32)
     _hc_row_inv_rms_kernel[(flat.shape[0],)](
         flat,
         inv_rms,
@@ -243,9 +243,7 @@ def _hc_n8_projection_impl(
             # bytes and is safe to replay in a fixed-shape CUDA graph.
             norm = _large_m_inv_rms(flat_fp32, eps)
         else:
-            norm = torch.rsqrt(
-                flat_fp32.square().mean(dim=-1, keepdim=True) + eps
-            )
+            norm = torch.rsqrt(flat_fp32.square().mean(dim=-1, keepdim=True) + eps)
         return F.linear(flat_fp32, weight) * norm
 
     m = flat.shape[0]
@@ -299,7 +297,10 @@ def _hc_n8_projection_fake(
 
 try:  # vLLM's direct custom-op wrapper keeps Dynamo from graph-breaking here.
     from vllm.utils.torch_utils import direct_register_custom_op
-
+except ImportError:
+    # Optional vLLM import only; errors from an available registrar propagate.
+    pass
+else:
     direct_register_custom_op(
         op_name="hy4_hc_n8_projection",
         op_func=_hc_n8_projection_op,
@@ -307,10 +308,6 @@ try:  # vLLM's direct custom-op wrapper keeps Dynamo from graph-breaking here.
         fake_impl=_hc_n8_projection_fake,
     )
     _HC_N8_OP_REGISTERED = True
-except (ImportError, AttributeError, RuntimeError):
-    # Unit tests and CPU-only tools can load this module without vLLM.  The
-    # direct Python function remains fully usable in those environments.
-    pass
 
 
 def hc_n8_projection(

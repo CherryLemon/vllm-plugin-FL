@@ -582,7 +582,11 @@ try:
     # vLLM's direct registration gives Dynamo/Inductor a fake implementation
     # and keeps this model-specific operator opaque during torch.compile.
     from vllm.utils.torch_utils import direct_register_custom_op
-
+except ImportError:
+    # The pure Torch implementation is available without vLLM. Registration
+    # errors in an installed runtime must fail the import instead of recovering.
+    pass
+else:
     direct_register_custom_op(
         op_name="hy_v4_hc_read_post_linear",
         op_func=_read_post_linear_op,
@@ -596,10 +600,6 @@ try:
         fake_impl=_writeback_fake,
     )
     _CUSTOM_OP_REGISTERED = True
-except (ImportError, AttributeError, RuntimeError, TypeError):
-    # Unit tests and CPU-only plugin imports may not have vLLM's registration
-    # helper; the wrapper remains fully functional through the direct path.
-    pass
 
 
 __all__ = [

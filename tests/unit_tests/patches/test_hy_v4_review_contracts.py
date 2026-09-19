@@ -129,22 +129,20 @@ def test_quantizer_respects_backend_policy(monkeypatch, env, value):
         "per_token_group_quant_fp8",
         lambda *a, **k: pytest.fail("forbidden FlagGems call"),
     )
-    monkeypatch.setattr(attention, "has_device_kernel", lambda *a: True)
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: True)
     expected = object()
     monkeypatch.setattr(
-        attention, "per_token_group_quant_fp8", lambda *a, **k: expected
+        fp8_utils, "per_token_group_quant_fp8", lambda *a, **k: expected
     )
     assert (
-        attention._hy4_per_token_group_quant_fp8(
-            torch.zeros(1, 32), 32, use_ue8m0=False
-        )
+        runtime._resolve_query_quantizer()(torch.zeros(1, 32), 32, use_ue8m0=False)
         is expected
     )
-    monkeypatch.setattr(attention, "has_device_kernel", lambda *a: False)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: False)
     with pytest.raises(RuntimeError, match="no permitted implementation"):
-        attention._hy4_per_token_group_quant_fp8(
-            torch.zeros(1, 32), 32, use_ue8m0=False
-        )
+        runtime._resolve_query_quantizer()(torch.zeros(1, 32), 32, use_ue8m0=False)
 
 
 def test_quantization_wrapper_is_lazy_and_preserves_other_models():
@@ -202,54 +200,72 @@ def test_registration_never_calls_quantization_getter(monkeypatch):
         dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER),
     )
     monkeypatch.setattr(registry.ModelRegistry, "register_model", lambda *a: None)
-    monkeypatch.setattr(compat, "is_vllm_024", lambda: True)
+    monkeypatch.setattr(compat, "is_vllm_024", lambda *_: True)
     assert compat.apply_hy_v4_v024_patches()
 
 
 def test_fallback_failure_rolls_back_real_module_attributes(monkeypatch):
     import vllm._custom_ops as ops
+    import vllm.model_executor.layers.attention.mla_attention as mla
     import vllm.model_executor.layers.sparse_attn_indexer as indexer
     import vllm.v1.attention.backends.mla.flashmla_sparse as native
+    from vllm import platforms
 
-    monkeypatch.delattr(indexer, "_hy4_flaggems_fallback", raising=False)
-    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
-    monkeypatch.setattr(runtime, "require_flaggems_policy", lambda: None)
-    modules = [indexer, native, ops, sparse]
+    monkeypatch.delattr(indexer, "_hy4_runtime_installed", raising=False)
+    monkeypatch.setattr(
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: False)
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
+    monkeypatch.setattr(
+        mla,
+        "get_mla_prefill_backend",
+        lambda cfg: SimpleNamespace(is_available=lambda: False),
+    )
+    plan = runtime.validate_hy4_runtime(_prefill_config())
+    modules = [indexer, native, ops, sparse, mla]
     modules += [
         importlib.import_module("flag_gems.fused." + n)
         for n in ("top_k_per_row_prefill", "top_k_per_row_decode", "flashmla_sparse")
     ]
     snapshots = [dict(vars(m)) for m in modules]
+    original_set = runtime.PatchTransaction.set
+    error = RuntimeError("late installation failure")
 
-    def fail():
-        raise RuntimeError("late installation failure")
+    def fail_last(tx, module, name, value):
+        if name == "_hy4_runtime_installed":
+            raise error
+        original_set(tx, module, name, value)
 
-    monkeypatch.setattr(runtime, "_make_hy4_flaggems_mla_prefill_backend", fail)
+    monkeypatch.setattr(runtime.PatchTransaction, "set", fail_last)
     for _ in range(2):
-        with pytest.raises(RuntimeError, match="late installation failure"):
-            runtime.install_hy4_flaggems_fallback()
-        assert not getattr(indexer, "_hy4_flaggems_fallback", False)
+        with pytest.raises(RuntimeError) as exc:
+            runtime.install_hy4_flaggems_fallback(plan)
+        assert exc.value is error
+        assert not getattr(indexer, "_hy4_runtime_installed", False)
         for module, before in zip(modules, snapshots):
             for name, value in before.items():
                 assert getattr(module, name) is value, (module.__name__, name)
 
 
 def test_fp8_kv_requires_native_metadata(monkeypatch):
+    import vllm.model_executor.layers.attention.mla_attention as mla
     from vllm import platforms
-    from vllm.v1.attention.ops import flashmla
 
     monkeypatch.setattr(
         platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
     )
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
     monkeypatch.setattr(
-        flashmla,
-        "is_flashmla_sparse_supported",
-        lambda: (False, "extension unavailable"),
+        mla,
+        "get_mla_prefill_backend",
+        lambda cfg: SimpleNamespace(is_available=lambda: False),
     )
-    with pytest.raises(ValueError, match="FP8 KV requires native FlashMLA"):
-        runtime.validate_hy4_runtime(
-            SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
-        )
+    config = _prefill_config()
+    config.cache_config.cache_dtype = "fp8"
+    with pytest.raises(ValueError, match="FP8 KV requires a complete native path"):
+        runtime.validate_hy4_runtime(config)
 
 
 def _prefill_config(explicit=None):
@@ -259,6 +275,7 @@ def _prefill_config(explicit=None):
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
             hf_text_config=SimpleNamespace(
+                index_topk=2048,
                 qk_nope_head_dim=192,
                 qk_rope_head_dim=64,
                 v_head_dim=256,
@@ -271,7 +288,7 @@ def test_explicit_valid_prefill_is_preserved():
     backend = SimpleNamespace(is_available=lambda: True, get_name=lambda: "CUSTOM")
     assert (
         runtime.select_hy4_prefill_backend(
-            _prefill_config("CUSTOM"), lambda cfg: backend, object()
+            _prefill_config("CUSTOM"), lambda cfg: backend
         )
         is backend
     )
@@ -290,9 +307,7 @@ def test_explicit_prefill_errors_are_not_swallowed(error):
         raise error
 
     with pytest.raises(type(error), match=str(error)):
-        runtime.select_hy4_prefill_backend(
-            _prefill_config("EXPLICIT"), selector, object()
-        )
+        runtime.select_hy4_prefill_backend(_prefill_config("EXPLICIT"), selector)
 
 
 @pytest.mark.parametrize(
@@ -304,15 +319,11 @@ def test_explicit_prefill_errors_are_not_swallowed(error):
     ],
 )
 def test_automatic_prefill_absence_uses_fallback(error):
-    fallback = object()
 
     def selector(cfg):
         raise error
 
-    assert (
-        runtime.select_hy4_prefill_backend(_prefill_config(), selector, fallback)
-        is fallback
-    )
+    assert runtime.select_hy4_prefill_backend(_prefill_config(), selector) is None
 
 
 @pytest.mark.parametrize(
@@ -324,7 +335,7 @@ def test_automatic_prefill_does_not_hide_configuration_errors(error):
         raise error
 
     with pytest.raises(type(error), match=str(error)):
-        runtime.select_hy4_prefill_backend(_prefill_config(), selector, object())
+        runtime.select_hy4_prefill_backend(_prefill_config(), selector)
 
 
 @pytest.mark.parametrize(
@@ -337,14 +348,15 @@ def test_preflight_requires_callable_implementations(monkeypatch, name):
     from vllm import platforms
 
     monkeypatch.setattr(
-        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda *_: True)
     )
-    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: False)
     monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
     monkeypatch.setattr(
         mla,
         "get_mla_prefill_backend",
-        lambda cfg: SimpleNamespace(is_available=lambda: False),
+        lambda cfg: SimpleNamespace(is_available=lambda *_: False),
     )
     monkeypatch.setattr(flag_gems, name, None)
     with pytest.raises(RuntimeError, match=name):
@@ -354,29 +366,42 @@ def test_preflight_requires_callable_implementations(monkeypatch, name):
 def test_fallback_success_idempotence_and_prefill_selection(monkeypatch):
     import vllm.model_executor.layers.attention.mla_attention as mla
     import vllm.model_executor.layers.sparse_attn_indexer as indexer
+    from vllm import platforms
 
-    monkeypatch.delattr(indexer, "_hy4_flaggems_fallback", raising=False)
-    monkeypatch.delattr(mla, "_hy4_flaggems_prefill_fallback", raising=False)
-    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
+    monkeypatch.delattr(indexer, "_hy4_runtime_installed", raising=False)
+    monkeypatch.setattr(
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: False)
     monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
+    selections = []
 
     def no_backend(cfg):
+        selections.append(cfg)
         raise ValueError("No valid MLA prefill backend found with test")
 
     monkeypatch.setattr(mla, "get_mla_prefill_backend", no_backend)
-    # Exercise successful real module rebinding; restore all globals afterward.
+    config = _prefill_config()
+    plan = runtime.validate_hy4_runtime(config)
+    # Installation consumes the resolved plan without policy/capability probes.
+    monkeypatch.setattr(
+        runtime, "use_flaggems_op", lambda *a: pytest.fail("policy recheck")
+    )
+    monkeypatch.setattr(
+        runtime, "has_device_kernel", lambda *a: pytest.fail("kernel recheck")
+    )
     with runtime.patch_transaction() as tx:
         try:
-            assert runtime._install_fallback(tx)
+            assert runtime._install_fallback(tx, plan)
             installed = indexer.ops
-            assert runtime._install_fallback(tx)
+            assert runtime._install_fallback(tx, plan)
             assert indexer.ops is installed
-            assert mla.get_mla_prefill_backend(_prefill_config()).is_available()
-            with pytest.raises(ValueError, match="No valid MLA prefill"):
-                mla.get_mla_prefill_backend(_prefill_config("EXPLICIT"))
+            assert mla.get_mla_prefill_backend(config) is plan.prefill_backend
+            assert selections == [config]
         finally:
             tx.rollback()
-    assert not getattr(indexer, "_hy4_flaggems_fallback", False)
+    assert not getattr(indexer, "_hy4_runtime_installed", False)
 
 
 @pytest.mark.parametrize("cache_dtype", ["auto", "fp8"])
@@ -388,15 +413,16 @@ def test_native_core_without_prefill_is_not_a_complete_native_plan(
     from vllm.v1.attention.ops import flashmla
 
     monkeypatch.setattr(
-        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda *_: True)
     )
-    monkeypatch.setattr(runtime, "native_hy4_available", lambda: True)
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: True)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: True)
     monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
     monkeypatch.setattr(flashmla, "is_flashmla_sparse_supported", lambda: (True, None))
     monkeypatch.setattr(
         mla,
         "get_mla_prefill_backend",
-        lambda cfg: SimpleNamespace(is_available=lambda: False),
+        lambda cfg: SimpleNamespace(is_available=lambda *_: False),
     )
     config = _prefill_config()
     config.cache_config.cache_dtype = cache_dtype
@@ -407,17 +433,22 @@ def test_native_core_without_prefill_is_not_a_complete_native_plan(
             runtime.validate_hy4_runtime(config)
     else:
         plan = runtime.validate_hy4_runtime(config)
-        assert plan.provider == "flaggems"
+        assert plan.provider == "native"
         assert callable(plan.query_quantizer)
         assert plan.prefill_backend.is_available()
-        assert set(runtime._REQUIRED_GEMS) <= plan.operations.keys()
+        assert set(plan.operations) == {"flash_attn_varlen_func"}
 
 
-def test_runtime_plan_rejects_a_missing_native_callable():
-    with pytest.raises(RuntimeError, match="flash_mla_sparse_fwd"):
-        runtime.HY4RuntimePlan(
-            "native", lambda: None, {"flash_mla_sparse_fwd": None}, object, ("auto",)
-        )
+def test_query_resolver_rejects_missing_native_callable(monkeypatch):
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda *a: False)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: True)
+    monkeypatch.setattr(fp8_utils, "per_token_group_quant_fp8", None)
+    with pytest.raises(
+        RuntimeError, match="per_token_group_quant_fp8 has no permitted implementation"
+    ):
+        runtime._resolve_query_quantizer()
 
 
 @pytest.mark.parametrize("qk_width,v_width", [(576, 512), (192, 256)])
@@ -428,14 +459,14 @@ def test_portable_prefill_rejects_unsupported_dimensions_before_install(
     from vllm import platforms
 
     monkeypatch.setattr(
-        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda *_: True)
     )
-    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
     monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
     monkeypatch.setattr(
         mla,
         "get_mla_prefill_backend",
-        lambda cfg: SimpleNamespace(is_available=lambda: False),
+        lambda cfg: SimpleNamespace(is_available=lambda *_: False),
     )
     config = _prefill_config()
     config.model_config.hf_text_config.qk_nope_head_dim = qk_width - 64

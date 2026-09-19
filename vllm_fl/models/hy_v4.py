@@ -19,7 +19,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -89,57 +88,9 @@ def _hyv4_env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _hyv4_fp32_combine_and_reduce(
-    routed: torch.Tensor,
-    shared: torch.Tensor,
-    *,
-    tp_size: int,
-    ep_size: int,
-    is_sequence_parallel: bool,
-    routed_output_is_global: bool,
-    shared_output_is_global: bool,
-    all_reduce: Callable[[torch.Tensor], torch.Tensor] = tensor_model_parallel_all_reduce,
-) -> torch.Tensor:
-    """Combine routed/shared outputs without a silent BF16 accumulation.
-
-    The runner/SP paths keep the shared MLP's row projection unreduced.  The
-    default non-SP fallback retains the original RowParallelLinear reduction;
-    this helper therefore only performs a collective when its explicit branch
-    ownership flags say one is still needed:
-
-    * standalone vLLM ``FusedMoE`` always returns a TP/EP-global routed output,
-      so the fallback reduces only shared output here when it is unreduced;
-    * a caller that explicitly supplies a local routed output can request one
-      late collective over the FP32 sum with ``routed_output_is_global=False``.
-
-    Sequence parallelism is handled by the caller: its local chunks are summed
-    in FP32 and then all-gathered, so no TP all-reduce occurs in this helper.
-    ``all_reduce`` is injectable for deterministic unit tests.
-    """
-    combined = routed.float() + shared.float()
-
-    if is_sequence_parallel:
-        return combined
-
-    needs_collective = tp_size > 1 or ep_size > 1
-    if not needs_collective:
-        return combined
-
-    if routed_output_is_global:
-        if shared_output_is_global:
-            return combined
-        # The routed result is already global.  Reduce only the unreduced
-        # shared branch, then add in FP32.  The collective is deliberately
-        # issued on the caller's stream after the aux-stream compute is joined.
-        shared = all_reduce(shared.float()).float()
-        return routed.float() + shared
-
-    if shared_output_is_global:
-        return all_reduce(routed.float()).float() + shared.float()
-
-    # Neither branch is global yet.  One collective after the FP32 local add
-    # preserves expert ownership and avoids the old two-collective path.
-    return all_reduce(combined).float()
+def _hyv4_fp32_combine(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
+    """The MoE runner owns reduction; combine its outputs in FP32."""
+    return routed.float() + shared.float()
 
 
 class _HYV4FP32RoutedOutput(nn.Module):
@@ -201,28 +152,20 @@ def _make_hyv4_expert_params_mapping(
     num_experts = int(model.config.n_routed_experts)
     num_redundant_experts = int(getattr(model, "n_redundant_experts", 0))
     helper = fused_moe_make_expert_params_mapping
-    if callable(helper):
-        try:
-            return list(
-                helper(
-                    model,
-                    ckpt_gate_proj_name="gate_proj",
-                    ckpt_down_proj_name="down_proj",
-                    ckpt_up_proj_name="up_proj",
-                    num_experts=num_experts,
-                    num_redundant_experts=num_redundant_experts,
-                )
+    if helper is not None:
+        return list(
+            helper(
+                model,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+                num_redundant_experts=num_redundant_experts,
             )
-        except (AttributeError, TypeError) as exc:
-            if num_redundant_experts:
-                raise RuntimeError(
-                    "HY4 EPLB loading requires vLLM's expert mapping helper"
-                ) from exc
+        )
 
     if num_redundant_experts:
-        raise RuntimeError(
-            "HY4 EPLB loading requires vLLM's expert mapping helper"
-        )
+        raise RuntimeError("HY4 EPLB loading requires vLLM's expert mapping helper")
 
     mapping = []
     for expert_id in range(num_experts):
@@ -320,11 +263,14 @@ class HYV4HyperHead(nn.Module):
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         flat = streams.flatten(1).float()
-        read = torch.sigmoid(
-            hc_n8_projection(flat, self.hc_head_fn, self.normalize_eps)
-            * self.hc_head_scale
-            + self.hc_head_base
-        ) + self.hc_eps
+        read = (
+            torch.sigmoid(
+                hc_n8_projection(flat, self.hc_head_fn, self.normalize_eps)
+                * self.hc_head_scale
+                + self.hc_head_base
+            )
+            + self.hc_eps
+        )
         hidden = (read.unsqueeze(-1) * streams.float()).sum(dim=1)
         return hidden.to(streams.dtype)
 
@@ -455,9 +401,7 @@ class HYV4MoE(nn.Module):
                 self.shared_experts if self._use_shared_experts_runner else None
             ),
             routed_output_transform=(
-                _HYV4FP32RoutedOutput()
-                if self._use_shared_experts_runner
-                else None
+                _HYV4FP32RoutedOutput() if self._use_shared_experts_runner else None
             ),
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
@@ -502,28 +446,9 @@ class HYV4MoE(nn.Module):
                 router_logits=router_logits,
             )
         shared = self.shared_experts(hidden_states)
-        moe_config = getattr(self.experts, "moe_config", None)
-        tp_size_value = getattr(moe_config, "tp_size", None)
-        tp_size = int(
-            tp_size_value
-            if tp_size_value is not None
-            else get_tensor_model_parallel_world_size()
-        )
-        ep_size = int(getattr(moe_config, "ep_size", 1))
-        combined = _hyv4_fp32_combine_and_reduce(
-            routed,
-            shared,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            is_sequence_parallel=self.is_sequence_parallel,
-            # The standalone FusedMoE call above already performs either its
-            # early or late reduction, so its returned routed output is global.
-            routed_output_is_global=True,
-            # The env=false non-SP fallback keeps RowParallelLinear's original
-            # reduce_results=True behavior.  SP returns before this flag is
-            # consulted because its shared weights are replicated.
-            shared_output_is_global=not self.is_sequence_parallel,
-        )
+        # FusedMoE and the non-SP shared projection already own their reductions.
+        # SP combines local token chunks before the existing all-gather below.
+        combined = _hyv4_fp32_combine(routed, shared)
         if self.is_sequence_parallel:
             combined = tensor_model_parallel_all_gather(combined, 0)
             combined = combined[:num_tokens]
@@ -639,7 +564,9 @@ class HYV4Model(nn.Module):
         super().__init__()
         config = typing.cast(HYV4Config, vllm_config.model_config.hf_config)
         self.config = config
-        validate_hy4_parallel_config(config, vllm_config.parallel_config.pipeline_parallel_size)
+        validate_hy4_parallel_config(
+            config, vllm_config.parallel_config.pipeline_parallel_size
+        )
         self.runtime_plan = prepare_hy4_runtime(vllm_config)
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -936,12 +863,13 @@ class HYV4ForCausalLM(
         # Keep all candidates per source name for EPLB configurations that
         # map more than one physical expert to the same logical checkpoint
         # expert.
-        split_expert_mapping: dict[
-            str, list[tuple[str, int, str]]
-        ] = {}
-        for param_name, weight_name, expert_id, shard_id in (
-            _make_hyv4_expert_params_mapping(self)
-        ):
+        split_expert_mapping: dict[str, list[tuple[str, int, str]]] = {}
+        for (
+            param_name,
+            weight_name,
+            expert_id,
+            shard_id,
+        ) in _make_hyv4_expert_params_mapping(self):
             split_expert_mapping.setdefault(weight_name, []).append(
                 (param_name, expert_id, shard_id)
             )
@@ -986,9 +914,7 @@ class HYV4ForCausalLM(
             if split_mapping is not None:
                 mapped = False
                 for target_name, expert_id, shard_id in split_mapping:
-                    mapped_name = name.replace(
-                        source_name, target_name, 1
-                    )
+                    mapped_name = name.replace(source_name, target_name, 1)
                     if is_pp_missing_parameter(mapped_name, self):
                         continue
                     param = params_dict.get(mapped_name)

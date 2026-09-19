@@ -32,9 +32,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    per_token_group_quant_fp8,
-)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -42,47 +39,12 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
 
-from vllm_fl.patches.hy_v4_runtime import (
-    HY4RuntimePlan,
-    has_device_kernel,
-    prepare_hy4_runtime,
-)
-from vllm_fl.utils import use_flaggems_op
+from vllm_fl.patches.hy_v4_runtime import HY4RuntimePlan
 
 logger = init_logger(__name__)
 
 _SPARSE_LAYER_TYPES = ("sparse_attention", "sparse", "deepseek_sparse_attention")
 _WEIGHT_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
-
-
-def _hy4_per_token_group_quant_fp8(
-    x: torch.Tensor,
-    group_size: int,
-    *,
-    use_ue8m0: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize indexer queries without requiring the optional vLLM ``_C``.
-
-    vLLM 0.24.0's public helper unconditionally dispatches to
-    ``torch.ops._C.per_token_group_fp8_quant`` for CUDA tensors.  Empty-build
-    wheels intentionally omit ``vllm._C``; HY4 already ships the portable
-    FlagGems implementation, so prefer it before touching the optional op.
-    """
-    if use_flaggems_op("per_token_group_quant_fp8"):
-        try:
-            from flag_gems import per_token_group_quant_fp8 as flaggems_quant
-        except (ImportError, ModuleNotFoundError):
-            flaggems_quant = None
-        if callable(flaggems_quant):
-            return flaggems_quant(x, group_size, scale_ue8m0=use_ue8m0)
-
-    if has_device_kernel("_C::per_token_group_fp8_quant", x.device.type):
-        return per_token_group_quant_fp8(x, group_size, use_ue8m0=use_ue8m0)
-    raise RuntimeError(
-        "HY4 indexer FP8 quantization: no permitted implementation for "
-        f"device={x.device}, dtype={x.dtype}; FlagGems is disabled/unavailable "
-        "or blacklisted and vLLM _C has no device/composite kernel."
-    )
 
 
 def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
@@ -118,9 +80,7 @@ def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
             raise ValueError(
                 f"indexer_types only supports 'full' and 'shared', got {invalid_types}."
             )
-        skip_layers = {
-            i for i, kind in enumerate(indexer_types) if kind == "shared"
-        }
+        skip_layers = {i for i, kind in enumerate(indexer_types) if kind == "shared"}
         _validate_topk_producers(config, skip_layers)
         return skip_layers
 
@@ -149,7 +109,9 @@ def _validate_topk_producers(config, skip_layers: set[int]) -> None:
             continue
         if i in skip_layers:
             if producer is None:
-                raise ValueError(f"HY4 shared indexer layer {i} has no preceding full sparse producer")
+                raise ValueError(
+                    f"HY4 shared indexer layer {i} has no preceding full sparse producer"
+                )
         else:
             producer = i
 
@@ -193,10 +155,11 @@ class Indexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
-        runtime_plan: HY4RuntimePlan | None = None,
+        *,
+        runtime_plan: HY4RuntimePlan,
     ):
         super().__init__()
-        self.runtime_plan = runtime_plan or prepare_hy4_runtime(vllm_config)
+        self.runtime_plan = runtime_plan
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
@@ -360,12 +323,9 @@ class HYV4MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
-        runtime_plan: HY4RuntimePlan | None = None,
+        *,
+        runtime_plan: HY4RuntimePlan,
     ) -> None:
-        # Install before MLAAttention's constructor selects/instantiates its
-        # prefill backend.  Indexer construction happens later for some
-        # layers, which is too late for the empty-build FlashAttention stub.
-        runtime_plan = runtime_plan or prepare_hy4_runtime(vllm_config)
         super().__init__()
         self.runtime_plan = runtime_plan
         self.config = config

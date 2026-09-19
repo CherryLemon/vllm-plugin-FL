@@ -14,7 +14,7 @@ from vllm_fl.models import hy_v4
 from vllm_fl.models.hy_v4 import (
     HYV4ForCausalLM,
     _hyv4_env_flag,
-    _hyv4_fp32_combine_and_reduce,
+    _hyv4_fp32_combine,
     _HYV4FP32RoutedOutput,
     _try_load_mxfp8_indexer_wk,
 )
@@ -239,99 +239,15 @@ def test_hy4_mxfp8_indexer_wk_is_dequantized_into_fused_projection():
     assert loaded == set(params)
 
 
-def test_hy4_fp32_combine_reduce_order_and_world_size():
-    """The final add stays FP32 on both late-reduce paths."""
-    torch.manual_seed(17)
-    routed = torch.randn(3, 5, dtype=torch.bfloat16)
-    shared = torch.randn(3, 5, dtype=torch.bfloat16)
-    peer_routed = torch.randn(3, 5, dtype=torch.bfloat16)
-    peer_shared = torch.randn(3, 5, dtype=torch.bfloat16)
-
-    calls: list[torch.Tensor] = []
-
-    def mock_all_reduce(value: torch.Tensor) -> torch.Tensor:
-        calls.append(value.detach().clone())
-        assert value.dtype == torch.float32
-        return value + peer_routed.float() + peer_shared.float()
-
-    result = _hyv4_fp32_combine_and_reduce(
-        routed,
-        shared,
-        tp_size=2,
-        ep_size=1,
-        is_sequence_parallel=False,
-        routed_output_is_global=False,
-        shared_output_is_global=False,
-        all_reduce=mock_all_reduce,
-    )
-    expected = (
-        routed.float() + shared.float() + peer_routed.float() + peer_shared.float()
-    )
+def test_hy4_combine_preserves_fp32_sum():
+    routed = torch.tensor([[1.0, 256.0]], dtype=torch.bfloat16)
+    shared = torch.tensor([[2**-8, 1.0]], dtype=torch.bfloat16)
+    result = _hyv4_fp32_combine(routed, shared)
     assert result.dtype == torch.float32
-    torch.testing.assert_close(result, expected, rtol=0, atol=0)
-    late_calls = len(calls)
-
-    # If routed output was reduced by the fused kernel, only the shared branch
-    # is reduced here.  This checks the collective ordering contract.
-    calls.clear()
-    routed_global = (routed.float() + peer_routed.float()).to(torch.bfloat16)
-
-    def mock_shared_all_reduce(value: torch.Tensor) -> torch.Tensor:
-        calls.append(value.detach().clone())
-        assert value.dtype == torch.float32
-        return value + peer_shared.float()
-
-    reduced = _hyv4_fp32_combine_and_reduce(
-        routed_global,
-        shared,
-        tp_size=2,
-        ep_size=1,
-        is_sequence_parallel=False,
-        routed_output_is_global=True,
-        shared_output_is_global=False,
-        all_reduce=mock_shared_all_reduce,
-    )
-    expected_reduced = routed_global.float() + shared.float() + peer_shared.float()
-    torch.testing.assert_close(reduced, expected_reduced, rtol=0, atol=0)
-    early_calls = len(calls)
-
-    # TP=1/EP=1 must not issue a collective.
-    no_collective = _hyv4_fp32_combine_and_reduce(
-        routed,
-        shared,
-        tp_size=1,
-        ep_size=1,
-        is_sequence_parallel=False,
-        routed_output_is_global=True,
-        shared_output_is_global=True,
-        all_reduce=lambda _: (_ for _ in ()).throw(AssertionError("unexpected")),
-    )
-    torch.testing.assert_close(no_collective, routed.float() + shared.float())
-
-    preserved_fallback = _hyv4_fp32_combine_and_reduce(
-        routed_global,
-        shared,
-        tp_size=2,
-        ep_size=1,
-        is_sequence_parallel=False,
-        routed_output_is_global=True,
-        shared_output_is_global=True,
-        all_reduce=lambda _: (_ for _ in ()).throw(AssertionError("unexpected")),
-    )
     torch.testing.assert_close(
-        preserved_fallback, routed_global.float() + shared.float()
+        result, torch.tensor([[1.00390625, 257.0]]), rtol=0, atol=0
     )
-
-    bf16_reference = (routed + peer_routed).to(torch.bfloat16).float() + (
-        shared + peer_shared
-    ).to(torch.bfloat16).float()
-    diff = (result - bf16_reference).abs()
-    print(
-        "HY4 FP32 combine vs BF16-two-reduce "
-        f"max_diff={diff.max().item():.8g} "
-        f"mean_diff={diff.mean().item():.8g} "
-        f"calls_late={late_calls} calls_early={early_calls}"
-    )
+    assert not torch.equal(result, (routed + shared).float())
 
 
 def test_hy4_shared_expert_runner_flag_and_fp32_transform(monkeypatch):

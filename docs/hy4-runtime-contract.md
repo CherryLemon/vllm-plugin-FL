@@ -37,12 +37,18 @@ The fallback installer in `patches/hy_v4_runtime.py` modifies process-global
 vLLM and FlagGems attributes in a dedicated HY4 worker. Before weight buffers
 are allocated, HY4 resolves a runtime plan containing the query quantizer,
 indexer/top-k, cache-update and sparse-attention implementations, MLA prefill
-backend, and supported KV dtypes. Required FlagGems implementations must be
-callable as well as permitted by policy. Native selection also requires a
-usable prefill implementation. The portable dense prefill path requires
+backend, and supported KV dtypes. Only selected FlagGems implementations must
+be callable and permitted by policy: native prefill and cache updates do not
+require their unused FlagGems equivalents. Native decode top-k checks follow
+`index_topk`: 512/1024/2048 need persistent top-k and, on Hopper, cooperative
+top-k; other sizes need the generic decode kernel. The portable dense prefill path requires
 `0 < v_head_dim <= qk_head_dim <= 256`, matching the validated FlagGems API;
-compressed sparse-MLA dimensions are not dense prefill dimensions. Decoder layers consume the resolved plan;
-query quantization no longer imports/probes a provider on every forward.
+compressed sparse-MLA dimensions are not dense prefill dimensions. Only the
+model constructor prepares the runtime. Decoder layers, attention, indexers
+and the installer require that resolved plan; they do not repair a missing
+plan or repeat its policy/capability checks. The prefill selector installed
+for the worker returns the already resolved backend, and query forward uses
+the bound quantizer.
 
 Explicit `mla_prefill_backend` selections preserve upstream errors. Only
 missing automatic candidates may select the portable backend; arbitrary
@@ -52,8 +58,14 @@ Installation is locked,
 failed attempts roll back, and the completion marker is set last. It no
 longer changes the `has_deep_gemm` capability fact. This is still a compatibility
 adapter, not an instance-isolated provider: hot-swapping unrelated models in
-the same initialized process remains unsupported. Replacing these patches
-with explicit provider injection is follow-up work.
+the same initialized process remains unsupported.
+
+The expert mapping helper is used when exported; execution errors propagate.
+Its local no-EPLB mapping is only for images without that export. HC custom-op
+registration errors also propagate once the registration helper is imported.
+MoE combines routed/shared results in FP32, relying on the existing runner and
+shared projection for reduction; sequence-parallel all-gather remains in the
+caller.
 
 The common attention metadata producer optimization is excluded from this
 model change and is tracked separately in #442. `ModelRunnerFL` retains the main branch's BlockTable producer,
@@ -71,6 +83,7 @@ VLLM_PLUGINS=fl OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=. \
   python -m pytest -q -o addopts=--tb=short \
   tests/unit_tests/model_loader/test_hy_v4_indexer.py \
   tests/unit_tests/patches/test_hy_v4_review_contracts.py \
+  tests/unit_tests/patches/test_hy_v4_selected_paths.py \
   tests/unit_tests/patches/test_hy_v4_v024.py
 ```
 

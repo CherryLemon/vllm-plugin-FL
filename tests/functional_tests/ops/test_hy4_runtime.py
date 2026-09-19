@@ -22,7 +22,9 @@ pytestmark = [
 @pytest.mark.parametrize("qk_width,v_width", [(256, 256), (192, 128)])
 def test_portable_prefill_matches_torch_at_mla_dimensions(causal, qk_width, v_width):
     torch.manual_seed(23)
-    cls = runtime._make_hy4_flaggems_mla_prefill_backend()
+    from flag_gems import flash_attn_varlen_func
+
+    cls = runtime._make_hy4_flaggems_mla_prefill_backend(flash_attn_varlen_func)
     backend = cls(2, qk_width**-0.5, 512, qk_width - 64, 64, v_width, None)
     offsets = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
     backend.prepare_metadata(
