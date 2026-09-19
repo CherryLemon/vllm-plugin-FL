@@ -3,6 +3,7 @@
 """Cross-vendor Qwen3.8-Flash-Next position-learning enhancement layers."""
 
 import math
+from functools import wraps
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -128,6 +129,42 @@ class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
+def validate_ple_embedding_weights(load_weights):
+    """Validate row coverage at the outermost model-loading boundary.
+
+    AutoWeightsLoader groups *adjacent* module prefixes, so one PLE table can
+    receive multiple calls as checkpoint files are streamed. Nested loaders
+    participate in the same transaction; a direct embedding call is also a
+    complete transaction. Only bookkeeping is retained, never checkpoint tensors.
+    """
+
+    @wraps(load_weights)
+    def checked_load(model, weights, *args, **kwargs):
+        owners = [
+            module
+            for module in model.modules()
+            if isinstance(module, Qwen3_8FlashNextNGramEmbedding)
+            and getattr(module, "_ple_embedding_load_state", None) is None
+        ]
+        for module in owners:
+            module._ple_embedding_load_state = {"shards": set(), "full": False}
+        try:
+            loaded = load_weights(model, weights, *args, **kwargs)
+            for module in owners:
+                seen = module._ple_embedding_load_state["shards"]
+                missing = sorted(module._required_embedding_shards() - seen)
+                if seen and missing:
+                    raise ValueError(
+                        f"Missing PLE embedding shards for this TP rank: {missing}"
+                    )
+            return loaded
+        finally:
+            for module in owners:
+                del module._ple_embedding_load_state
+
+    return checked_load
+
+
 class Qwen3_8FlashNextNGramEmbedding(nn.Module):
     def __init__(
         self,
@@ -207,55 +244,6 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             torch.arange(max_total_tokens, dtype=torch.int64),
             persistent=False,
         )
-        # One extra row is the sink for tokens that graph padding places
-        # outside every real request, so they never overwrite real data.
-        self.register_buffer(
-            "padded_buffer",
-            torch.full(
-                (self.max_num_reqs + 1, max_total_tokens),
-                self.eos_token_id,
-                dtype=torch.int64,
-            ),
-            persistent=False,
-        )
-
-    @staticmethod
-    def _shift_precompute(
-        tokens: torch.Tensor, eos_token_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if tokens.dim() != 2:
-            raise ValueError("tokens must be a 2D tensor")
-        batch_size, seq_len = tokens.shape
-        positions = torch.arange(seq_len, device=tokens.device, dtype=torch.int64)
-        eos_positions = torch.where(tokens == eos_token_id, positions, -1)
-        previous_eos_inclusive = torch.cummax(eos_positions, dim=1).values
-        previous_eos = torch.cat(
-            [
-                eos_positions.new_full((batch_size, 1), -1),
-                previous_eos_inclusive[:, :-1],
-            ],
-            dim=1,
-        )
-        return positions, positions.unsqueeze(0) - previous_eos - 1
-
-    @staticmethod
-    def _shift_apply(
-        tokens: torch.Tensor,
-        positions: torch.Tensor,
-        position_in_segment: torch.Tensor,
-        shift: int,
-        eos_token_id: int,
-    ) -> torch.Tensor:
-        if shift == 0:
-            return tokens
-        source = positions - shift
-        valid_source = (source >= 0) & (source < tokens.shape[1])
-        gather_indices = torch.where(
-            valid_source, source, torch.zeros_like(source)
-        ).unsqueeze(0).expand(tokens.shape[0], -1)
-        shifted = tokens.gather(1, gather_indices)
-        valid = valid_source.unsqueeze(0) & (position_in_segment >= shift)
-        return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
     def forward(
         self,
@@ -279,84 +267,75 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
             )
         if num_reqs == 0:
             if num_tokens:
-                raise ValueError(
-                    "PLE received token rows without a request boundary"
-                )
+                raise ValueError("PLE received token rows without a request boundary")
             return input_ids.new_empty((0, self.embedding_dim))
         if ngram_context.ndim != 2 or ngram_context.shape[0] < num_reqs:
-            raise ValueError(
-                "PLE ngram_context must contain one row per request"
-            )
+            raise ValueError("PLE ngram_context must contain one row per request")
+
+        if ngram_context.shape[1] != self.ngram_size - 1:
+            raise ValueError("PLE ngram_context has the wrong history width")
+        if num_tokens == 0:
+            empty_ids = input_ids.new_empty((0, self.ngram_heads))
+            return self.ngram_embedding(empty_ids).flatten(-2)
 
         positions = self.positions_buffer[:num_tokens]
-        workspace = self.padded_buffer[: num_reqs + 1]
-        workspace.fill_(self.eos_token_id)
-        packed = workspace[:num_reqs]
-        request_candidates = (
-            torch.searchsorted(query_start_loc, positions, right=True) - 1
-        )
-        valid_requests = (request_candidates >= 0) & (request_candidates < num_reqs)
-        safe_requests = torch.where(
-            valid_requests, request_candidates, torch.zeros_like(request_candidates)
-        )
+        requests = torch.searchsorted(query_start_loc, positions, right=True) - 1
+        valid_tokens = (requests >= 0) & (requests < num_reqs)
+        safe_requests = requests.clamp(0, num_reqs - 1)
         columns = positions - query_start_loc[safe_requests]
-        valid_columns = (columns >= 0) & (columns < packed.shape[1])
-        valid_tokens = valid_requests & valid_columns
-        safe_columns = torch.where(
-            valid_tokens, columns, torch.zeros_like(columns)
-        )
-        # Tokens that graph padding places outside every real request are
-        # written to the extra workspace row, so no invalid token can
-        # overwrite a real request's data.  Reading still uses safe
-        # coordinates and is masked by ``valid_tokens`` below.
-        write_rows = torch.where(valid_tokens, safe_requests, num_reqs)
-        write_cols = torch.where(valid_tokens, safe_columns, positions)
-        workspace[write_rows, write_cols] = torch.where(
-            valid_tokens, input_ids, input_ids.new_full((), self.eos_token_id)
-        )
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
 
-        context = torch.cat([ngram_context, packed], dim=-1)
-        positions_2d, position_in_segment = self._shift_precompute(
-            context, self.eos_token_id
-        )
-        shifted = [context]
+        # Gather only the n-gram window of each flattened token. Work and
+        # intermediate storage depend on this step's token bucket, never on
+        # num_reqs * max_num_batched_tokens. No host read of GPU lengths is
+        # needed, so request boundaries may change during graph replay.
+        eos = input_ids.new_full((), self.eos_token_id)
+        shifted = [input_ids]
+        in_segment = valid_tokens
         for shift in range(1, self.ngram_size):
-            shifted.append(
-                self._shift_apply(
-                    context,
-                    positions_2d,
-                    position_in_segment,
-                    shift,
-                    self.eos_token_id,
-                )
+            source_columns = columns - shift
+            from_input = source_columns >= 0
+            token = input_ids[(positions - shift).clamp_min(0)]
+            history_column = (self.ngram_size - 1 + source_columns).clamp(
+                0, self.ngram_size - 2
             )
-        adjusted_columns = safe_columns + self.ngram_size - 1
+            history = ngram_context[safe_requests, history_column]
+            previous = torch.where(from_input, token, history)
+            # An EOS at the current token does not erase its own history;
+            # an EOS in the preceding window masks all older history.
+            in_segment = in_segment & (previous != self.eos_token_id)
+            shifted.append(torch.where(in_segment, previous, eos))
+
         id_blocks = []
+        mixed = shifted[0] * self.layer_multipliers[0]
         for ngram in range(2, self.ngram_size + 1):
+            index = ngram - 1
+            mixed = torch.bitwise_xor(
+                mixed, shifted[index] * self.layer_multipliers[index]
+            )
             start = (ngram - 2) * self.heads_per_ngram
             end = start + self.heads_per_ngram
-            mixed = shifted[0] * self.layer_multipliers[0]
-            for index in range(1, ngram):
-                mixed = torch.bitwise_xor(
-                    mixed, shifted[index] * self.layer_multipliers[index]
-                )
             sizes = self.ngram_heads_vocab_sizes[start:end]
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
-            id_block = ids[safe_requests, adjusted_columns]
-            id_blocks.append(
-                torch.where(
-                    valid_tokens.unsqueeze(-1),
-                    id_block,
-                    id_block.new_full((), self.eos_token_id),
-                )
-            )
+            id_blocks.append(torch.where(valid_tokens.unsqueeze(-1), ids, eos))
         ngram_ids = torch.cat(id_blocks, dim=-1)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
+    def _required_embedding_shards(self) -> set[int]:
+        embedding = self.ngram_embedding
+        size = (
+            embedding.org_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+        start = embedding.shard_indices.org_vocab_start_index
+        end = min(embedding.shard_indices.org_vocab_end_index, embedding.org_vocab_size)
+        return (
+            set(range(start // size, (end - 1) // size + 1)) if start < end else set()
+        )
+
+    @validate_ple_embedding_weights
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
 
@@ -368,6 +347,8 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
+        state = self._ple_embedding_load_state
+        seen_shards = state["shards"]
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
@@ -383,12 +364,20 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
                 loaded.add(name)
                 continue
+            if name == "ngram_embedding.weight":
+                if state["full"] or seen_shards:
+                    raise ValueError("Duplicate or mixed full/sharded PLE embedding")
+                state["full"] = True
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
-                    regular_weights.append((name, loaded_weight))
-                    continue
+                    raise ValueError(f"Invalid PLE embedding shard name: {name}")
                 shard_index = int(shard_text)
+                if state["full"]:
+                    raise ValueError("Mixed full/sharded PLE embedding")
+                if shard_index in seen_shards:
+                    raise ValueError(f"Duplicate PLE embedding shard {shard_index}")
+                seen_shards.add(shard_index)
                 if shard_index >= self.split_ngram_parts:
                     raise ValueError(
                         f"PLE embedding shard index {shard_index} exceeds "
@@ -417,10 +406,13 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                     tp_start=embedding.shard_indices.org_vocab_start_index,
                     tp_end=embedding.shard_indices.org_vocab_end_index,
                 )
-                loaded.add("ngram_embedding.weight")
                 continue
             regular_weights.append((name, loaded_weight))
 
+        # The outer vLLM check sees only parameter names. Certify the table
+        # only once every locally required row has arrived across all fragments.
+        if seen_shards and self._required_embedding_shards() <= seen_shards:
+            loaded.add("ngram_embedding.weight")
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
@@ -719,9 +711,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             else:
                 state = ple_state_gather(
                     conv_state, state_indices, indices_are_safe=True
-                )[
-                    ..., : self.conv_state_len
-                ].to(x_p.dtype)
+                )[..., : self.conv_state_len].to(x_p.dtype)
             use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
             initial_state = torch.where(
                 use_initial_mask,
@@ -860,8 +850,8 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             rollback_offsets = num_accepted_tokens.to(
                 device=conv_state.device, dtype=torch.int64
             ).sub(1)
-            valid_rollback = valid_state & (rollback_offsets >= 0) & (
-                rollback_offsets < max_len
+            valid_rollback = (
+                valid_state & (rollback_offsets >= 0) & (rollback_offsets < max_len)
             )
             safe_rollback_offsets = torch.where(
                 valid_rollback,
@@ -974,9 +964,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
                 num_decode_tokens=0,
                 num_prefill_tokens=num_prefill_tokens,
                 output=(
-                    output[: metadata.num_actual_tokens]
-                    if output is not None
-                    else None
+                    output[: metadata.num_actual_tokens] if output is not None else None
                 ),
             )
 
@@ -1170,9 +1158,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         else:
             key = self._apply_norm(self.norm_key, key)
             query = self._apply_norm(self.norm_query, query)
-            gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(
-                self.hidden_size
-            )
+            gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
             gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
             gated_value = gate * value.unsqueeze(-2)
             normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)

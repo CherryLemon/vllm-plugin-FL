@@ -102,7 +102,7 @@ from ..common.hyperconnection import (
     pack_gated_hc_projection_weights,
 )
 from ..config import Qwen3_8FlashNextConfig, Qwen3_8FlashNextTextConfig
-from .ple_layer import Qwen3_8FlashNextPLELayer
+from .ple_layer import Qwen3_8FlashNextPLELayer, validate_ple_embedding_weights
 from .qsa import Qwen3_8FlashNextQSAAttention
 
 _HAS_NATIVE_STACKED_WEIGHTS_MAPPER = hasattr(
@@ -836,6 +836,7 @@ class Qwen3_8FlashNextModel(nn.Module):
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
         return sample_hidden_states
 
+    @validate_ple_embedding_weights
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
             (
@@ -1127,6 +1128,7 @@ class Qwen3_8FlashNextForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    @validate_ple_embedding_weights
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1379,6 +1381,7 @@ class Qwen3_8FlashNextForConditionalGeneration(
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
 
+    @validate_ple_embedding_weights
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
