@@ -1,0 +1,127 @@
+{
+  "parent_commit": "d79cd85e7dea03cdb425d276a94af221ac8f35fa",
+  "tested_runtime_files": {
+    "vllm_fl/worker/async_output.py": "659df58a85923d2244748e206b387692b807429b620f7a5b4734fa6ef6ec4a48",
+    "vllm_fl/worker/model_runner.py": "a611968cd0bd8247abe869be052df5e9920642a906c6d0c3930a76a12cf059a8",
+    "vllm_fl/models/qwen3_8_flash_next/gpu/ple_layer.py": "0b5375a0d4eace709663b8f3b5c0955c4a26cd2045e39d2f7ebb3cdef103c3c3",
+    "vllm_fl/models/qwen3_8_flash_next/gpu/model.py": "daffd5bc2d0ba72af1885b37246379d403e479008e320712f8b721231274983b",
+    "vllm_fl/models/qwen3_8_flash_next/gpu/indexer_qsa.py": "6915fca910413e3008f151dfa167a6fd0d48f28b3ce088de30c18256fd9350b7",
+    "vllm_fl/models/qwen3_8_flash_next/vendor/vllm024/dispatch.py": "dfec60db20d07e7b814125c98ad65412c89f408b5b0dfa6924f02231b2433d82"
+  },
+  "gpu": "H100",
+  "torch": "2.11.0+cu129",
+  "vllm": "0.24.0+cu129",
+  "targeted_tests": 128,
+  "model_quality_status": "unresolved: selected matched cases show 2/8 plugin truncations versus 1/8 native",
+  "new_device_kernels": false,
+  "common_dispatch_tests": 15,
+  "wheel_install_tests": 37,
+  "wheel_build": "Python wheel, VLLM_VENDOR empty; native extension not rebuilt",
+  "wheel_version": "0.0.0+pr455.review20260919",
+  "runtime_commit": "b7905af",
+  "isolation_requests": {
+    "plugin": 96,
+    "native": 96,
+    "plugin_mixed_length": 64
+  },
+  "isolation_marker_violations": 0,
+  "matched_selected_cases": {
+    "cases": 8,
+    "temperature": 1.0,
+    "max_tokens": 32768,
+    "matching_prompt_tokens": true,
+    "matching_request_bodies": true,
+    "plugin": {
+      "label_correct": 5,
+      "label_wrong": 1,
+      "truncated": 2,
+      "finished_stop": 6
+    },
+    "native": {
+      "label_correct": 6,
+      "label_wrong": 1,
+      "truncated": 1,
+      "finished_stop": 7
+    },
+    "limitations": [
+      "selected historical anomalies; not a representative accuracy sample",
+      "one stochastic run per arm",
+      "vLLM/PyTorch/Transformers and active kernels differ",
+      "native image packaging derivative omits unused cron files; runtime files unchanged"
+    ]
+  },
+  "standalone_performance": {
+    "server_max_num_seqs": 16,
+    "client_concurrency": 64,
+    "max_model_len": 102400,
+    "plan_cache": false,
+    "output_throughput": [
+      610.9469752506649,
+      611.7078221381556
+    ],
+    "mean_tpot_ms": [
+      24.93831,
+      24.90609
+    ],
+    "formal_requests_per_round": 256,
+    "failed": 0
+  },
+  "next_token_diagnostic": {
+    "cases": 6,
+    "matching_top1": 6,
+    "prefix_lengths": [
+      0,
+      128,
+      512
+    ],
+    "max_common_top20_logprob_delta": 2.312499,
+    "scope": "early fixed prefixes only; not full-logit or long-context equivalence"
+  },
+  "local_only_pr442_fusion": {
+    "commit": "1d334c0bd5297070ad610e262e512e2a2f8454b6",
+    "parents": [
+      "b7905af26598d6c9a3417eb7e516f33ebea9dda3",
+      "ba2343b2ab2a56f5e48a684d24d6c48c8ef349a2"
+    ],
+    "remote_merge_or_push": false,
+    "targeted_tests": 150,
+    "isolated_installed_wheel_tests": 24,
+    "server_max_num_seqs": 64,
+    "max_model_len": 2048,
+    "max_num_batched_tokens": 16384,
+    "plan_cache_verified_ranks": 8,
+    "packed_arena": true,
+    "formal_requests_per_round": 128,
+    "warmup_requests": 64,
+    "warm_repeat_rounds": [
+      {
+        "output_throughput": 1288.2336007092506,
+        "mean_tpot_ms": 47.234421649698824,
+        "completed": 128,
+        "failed": 0
+      },
+      {
+        "output_throughput": 1291.7376227320124,
+        "mean_tpot_ms": 47.09575950407234,
+        "completed": 128,
+        "failed": 0
+      },
+      {
+        "output_throughput": 1294.5044520646547,
+        "mean_tpot_ms": 46.99245011892956,
+        "completed": 128,
+        "failed": 0
+      }
+    ],
+    "warm_repeat_output_throughput": 1291.491891835306,
+    "warm_repeat_mean_tpot_ms": 47.10754375756691,
+    "warm_repeat_drift_percent": 0.4855509659060114,
+    "repeat_reason": "initial three-round throughput range/mean drift 23.0283% exceeded historical 5% rule",
+    "marker_requests": 384,
+    "marker_violations": 0,
+    "observed_running_peak": 64,
+    "observed_waiting_peak": 64,
+    "historical_throughput_recovered": false,
+    "separate_day0_common_review_changes_included": false
+  }
+}
