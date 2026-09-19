@@ -527,7 +527,11 @@ class Glm5NextIndexerBackend:
             self._bindings[name] = OperatorBinding(
                 self._manager,
                 name,
-                graph_capabilities={"glm5.flaggems": graph, "glm5.torch": False},
+                graph_capabilities={
+                    "glm5.flaggems": graph,
+                    "glm5.cuda": None,
+                    "glm5.torch": False,
+                },
             )
         if _preflight:
             return self._bindings[name].describe()

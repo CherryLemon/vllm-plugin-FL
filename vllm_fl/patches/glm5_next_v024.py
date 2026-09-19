@@ -498,15 +498,22 @@ class Glm5NextForCausalLMConfig(HybridAttentionMambaModelConfig):
             cache_config.cache_dtype = "auto"
         if getattr(text_config, "index_kpool_compress", False):
             kpool = int(getattr(text_config, "index_kpool", 1))
-            required = kpool * 32
+            from vllm_fl.models.glm5_next_kpool import glm5_indexer_page_alignment
+
+            page = glm5_indexer_page_alignment(current_platform.get_device_capability())
+            required = kpool * page
             if cache_config.block_size % required:
+                aligned = (
+                    (cache_config.block_size + required - 1) // required
+                ) * required
                 logger.info(
                     "GLM5-Next kpool changes KV block_size from %d to %d "
-                    "for a 32-entry DeepGEMM compressed page",
+                    "for a %d-entry compressed page",
                     cache_config.block_size,
-                    required,
+                    aligned,
+                    page,
                 )
-                cache_config.block_size = required
+                cache_config.block_size = aligned
 
 
 # Pristine (unpatched) attribute values, captured at module import -- i.e.
@@ -845,7 +852,6 @@ def _glm5_runtime_plan(vllm_config, device_caps, user_policy):
 
 def _register_glm5_next_registrations() -> None:
     """Idempotent config/model registration (safe at plugin import time)."""
-    from vllm.config.compilation import CompilationConfig
     from vllm.model_executor.models import config as model_config
     from vllm.model_executor.models import registry as model_registry
     from vllm.transformers_utils import config as transformers_config
@@ -861,12 +867,6 @@ def _register_glm5_next_registrations() -> None:
     )
 
     install_glm5_next_kpool_v024()
-
-    # Match the 0826 integration contract: keep the metadata-dependent kpool
-    # custom op outside Inductor's piecewise CUDA-graph partitions.
-    kpool_op = "vllm::sparse_attn_indexer_kpool"
-    if kpool_op not in CompilationConfig._attention_ops:
-        CompilationConfig._attention_ops.append(kpool_op)
 
     config_registry = transformers_config._CONFIG_REGISTRY
     config_registry["glm5_next"] = Glm5NextConfig

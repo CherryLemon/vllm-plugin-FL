@@ -231,3 +231,17 @@ def test_video_prompt_update_closure_keeps_request_options_separate():
         closures.append((update.replacement, int(grid.prod()) // 4))
     for replacement, count in closures:
         assert replacement(0).full.count(processor.image_token_id) == count
+
+
+def test_checkpoint_sampling_rate_survives_hf_default_fps():
+    processor, info = make_processor({"max_frames": 32})
+    processor.video_processor.fps_interval = 0.1
+    video = np.zeros((60, 28, 28, 3), dtype=np.uint8)
+    metadata = dict(total_num_frames=60, fps=2.0, duration=30.0)
+    out = processor(
+        videos=[video], video_metadata=[metadata], text="<|video|>", return_tensors="pt"
+    )
+    grid = out["video_grid_thw"][0]
+    assert int(grid[0]) == 2
+    prompt = info._construct_glm5_video_placeholder(video, metadata, grid, {})
+    assert prompt.count(processor.image_token_id) == int(grid.prod()) // 4

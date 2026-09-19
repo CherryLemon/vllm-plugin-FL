@@ -671,6 +671,16 @@ def install_glm5_next_kpool_v024() -> None:
             allocate_slots_with_capacity_debug._glm5_capacity_debug = True
             stage(KVCacheManager, "allocate_slots", allocate_slots_with_capacity_debug)
 
+    from vllm.config.compilation import CompilationConfig
+
+    kpool_op = "vllm::sparse_attn_indexer_kpool"
+    if kpool_op not in CompilationConfig._attention_ops:
+        stage(
+            CompilationConfig,
+            "_attention_ops",
+            [*CompilationConfig._attention_ops, kpool_op],
+        )
+
     bind_patches(patches)
     _EARLY_PATCHES = patches
 

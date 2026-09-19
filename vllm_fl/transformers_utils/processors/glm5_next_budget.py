@@ -168,8 +168,13 @@ def resolve_serving_kwargs(processor, deployment, request):
         keys = ["min_image_tokens", "max_image_tokens"]
         if modality == "video":
             keys += ["max_frames", "fps", "target_fps", "do_sample_frames"]
-            target_fps = values.get(
-                "fps", values.get("target_fps", values.get("fps_interval"))
+            target_fps = next(
+                (
+                    values[key]
+                    for key in ("fps", "target_fps", "fps_interval")
+                    if values.get(key) is not None
+                ),
+                sub.fps_interval if sub.sampling_policy == "fps_interval" else None,
             )
             if target_fps is not None:
                 if (
@@ -179,7 +184,9 @@ def resolve_serving_kwargs(processor, deployment, request):
                     or target_fps <= 0
                 ):
                     raise ValueError("GLM5-Next video fps must be finite and positive")
-                values["target_fps"] = target_fps
+                # BaseVideoProcessor supplies its default fps to sample_frames;
+                # normalize aliases to fps too so that default cannot mask them.
+                values["fps"] = values["target_fps"] = target_fps
         for key in keys:
             if key in values:
                 scoped[key] = values[key]

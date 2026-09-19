@@ -31,6 +31,7 @@ class OperatorBinding:
             self._candidates = [
                 impl for impl in self._candidates if impl.impl_id not in failed
             ]
+            self.selected_impl = None
             self._epoch = epoch
         if not self._candidates:
             raise RuntimeError(
