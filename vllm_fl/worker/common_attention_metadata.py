@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -17,7 +18,6 @@ from vllm_fl.compilation.graph import Graph
 
 logger = init_logger(__name__)
 
-_GRAPH_DEVICE_TYPES = frozenset({"cuda", "npu", "musa", "ptpu"})
 _LAYOUT_ATTR = "_vllm_fl_common_attention_metadata_layout"
 
 
@@ -36,12 +36,21 @@ class _CommonAttentionMetadataLayout:
     cp_kv_cache_interleave_size: int
 
 
+def common_attention_metadata_enabled() -> bool:
+    """Keep the original producer on platforms without kernel validation.
+
+    The pointer-table Triton kernel is currently validated on NVIDIA. Other
+    platforms can opt in for validation; setting 0 restores the old producer
+    (not merely eager execution of the new kernel).
+    """
+    value = os.environ.get("VLLM_FL_COMMON_ATTENTION_METADATA")
+    return current_platform.is_cuda() if value is None else value == "1"
+
+
 def supports_accelerator_graph() -> bool:
     """Return whether the active platform exposes the plugin graph API."""
-    return (
-        current_platform.device_type in _GRAPH_DEVICE_TYPES
-        and hasattr(Graph, "graph")
-        and hasattr(current_platform.torch_device_fn, "graph")
+    return callable(getattr(Graph, "graph", None)) and callable(
+        getattr(current_platform.torch_device_fn, "graph", None)
     )
 
 
@@ -340,6 +349,15 @@ class CommonAttentionMetadataGraphRunner:
             ):
                 _get_common_attention_metadata_layout(block_table)
 
+            # Compile outside capture even when model graph warmups are zero.
+            compute(
+                block_table,
+                num_reqs,
+                query_start_loc,
+                positions,
+                seq_lens,
+                num_computed_tokens,
+            )
             graph = Graph.graph()
             with current_platform.torch_device_fn.graph(graph, pool=self.graph_pool):
                 compute(
@@ -351,6 +369,8 @@ class CommonAttentionMetadataGraphRunner:
                     num_computed_tokens,
                 )
             self.graphs[key] = graph
+            # Capture records work; callers immediately consume these outputs.
+            graph.replay()
             return True
 
         if graph is None:

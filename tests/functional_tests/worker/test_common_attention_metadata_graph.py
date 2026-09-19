@@ -135,6 +135,11 @@ def test_common_attention_metadata_graph_replay_uses_updated_metadata(
         seq_lens,
         num_computed_tokens,
     )
+    # First capture must refresh outputs, even after warmup with these inputs.
+    num_computed_tokens.fill_(-12345)
+    for group in table.block_tables:
+        group.slot_mapping.gpu.fill_(-12345)
+
     used_graph = runner.run(
         table,
         4,
@@ -357,3 +362,107 @@ def test_common_attention_metadata_clears_long_context_padded_rows(
     assert torch.all(num_computed_tokens[num_actual_reqs:] == 0)
     for group in table.block_tables:
         assert torch.all(group.block_table.gpu[0] == 1)
+
+
+@pytest.mark.parametrize("mode_name", ["PIECEWISE", "FULL"])
+def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_name):
+    """Exercise the actual dummy-run branch, stopping at the model boundary."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import numpy as np
+
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    from vllm_fl.worker.model_runner import ModelRunnerFL
+
+    if not supports_accelerator_graph():
+        pytest.skip("Accelerator graph capture is unavailable")
+    mode = getattr(CUDAGraphMode, mode_name)
+    runner = object.__new__(ModelRunnerFL)
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(num_ubatches=1),
+    )
+    runner.parallel_config = SimpleNamespace(use_ubatching=False)
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=4)
+    runner.max_num_reqs = 4
+    runner.max_num_tokens = 16
+    runner.uniform_decode_query_len = 1
+    runner.lora_config = None
+    runner.speculative_config = None
+    runner.prepare_inputs_event = None
+    runner.common_attention_metadata_graph = CommonAttentionMetadataGraphRunner()
+    runner.input_batch = SimpleNamespace(block_table=_make_block_table(device))
+    # Use actual fixed-address CPU/GPU buffers and the real cumsum helper.
+    cpu = torch.full((5,), -12345, dtype=torch.int32)
+    gpu = cpu.to(device)
+    runner.query_start_loc = SimpleNamespace(
+        cpu=cpu,
+        gpu=gpu,
+        np=cpu.numpy(),
+        copy_to_gpu=lambda: gpu.copy_(cpu),
+    )
+    runner.query_pos = SimpleNamespace(np=np.zeros(16, dtype=np.int64))
+    runner.arange_np = np.arange(16)
+    runner.optimistic_seq_lens_cpu = torch.full((4,), -12345, dtype=torch.int32)
+    runner.seq_lens = torch.full((4,), -12345, dtype=torch.int32, device=device)
+    runner.num_computed_tokens = torch.full_like(runner.seq_lens, -12345)
+    runner.positions = torch.zeros(16, dtype=torch.int64, device=device)
+    runner._determine_batch_execution_and_padding = Mock(
+        return_value=(
+            mode,
+            BatchDescriptor(num_tokens=2, num_reqs=2),
+            False,
+            None,
+            None,
+        )
+    )
+    slots = {
+        i: group.slot_mapping.gpu[:2]
+        for i, group in enumerate(runner.input_batch.block_table.block_tables)
+    }
+    runner._get_slot_mappings = Mock(return_value=(slots, None))
+    runner._build_attention_metadata = Mock(return_value=({}, None))
+
+    class ModelBoundary(Exception):
+        pass
+
+    def stop_before_model(*args, **kwargs):
+        raise ModelBoundary
+
+    runner.maybe_dummy_run_with_lora = stop_before_model
+    # No preceding warmup; metadata capture is reached by _dummy_run itself.
+    with pytest.raises(ModelBoundary):
+        runner._dummy_run(2, cudagraph_runtime_mode=mode, is_graph_capturing=True)
+    extent = 4 if mode == CUDAGraphMode.PIECEWISE else 2
+    assert (
+        id(runner.input_batch.block_table),
+        extent,
+    ) in runner.common_attention_metadata_graph.graphs
+    torch.testing.assert_close(
+        runner.query_start_loc.gpu.cpu(),
+        torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
+    )
+    assert torch.all(
+        runner.num_computed_tokens[:extent]
+        == torch.tensor([1, 1, 0, 0], device=device)[:extent]
+    )
+    assert all(torch.all(slot == -1) for slot in slots.values())
+    assert runner._build_attention_metadata.call_count == (mode == CUDAGraphMode.FULL)
+    # A different actual request count must reuse the PIECEWISE metadata graph.
+    if mode == CUDAGraphMode.PIECEWISE:
+        runner.input_batch.block_table.commit_block_table(3)
+        runner.query_start_loc.gpu.copy_(
+            torch.tensor([0, 1, 2, 3, 3], dtype=torch.int32, device=device)
+        )
+        runner.seq_lens.copy_(
+            torch.tensor([6, 8, 10, 0], dtype=torch.int32, device=device)
+        )
+        assert runner._run_common_attention_metadata(3, mode)
+        assert not runner.common_attention_metadata_graph._missing_graph_keys
+        torch.testing.assert_close(
+            runner.num_computed_tokens.cpu(),
+            torch.tensor([5, 7, 9, 0], dtype=torch.int32),
+        )

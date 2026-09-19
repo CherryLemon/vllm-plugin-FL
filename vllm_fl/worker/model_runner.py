@@ -283,6 +283,7 @@ from vllm_fl.dispatch.io_dumper import (
 )
 from vllm_fl.worker.common_attention_metadata import (
     CommonAttentionMetadataGraphRunner,
+    common_attention_metadata_enabled,
     compute_common_attention_metadata,
 )
 
@@ -788,7 +789,11 @@ class ModelRunnerFL(
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
-        self.common_attention_metadata_graph = CommonAttentionMetadataGraphRunner()
+        self.common_attention_metadata_graph = (
+            CommonAttentionMetadataGraphRunner()
+            if common_attention_metadata_enabled()
+            else None
+        )
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -2192,6 +2197,13 @@ class ModelRunnerFL(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        if self.common_attention_metadata_graph is None:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -2405,7 +2417,10 @@ class ModelRunnerFL(
             seq_lens=self.seq_lens[:num_reqs_padded],
             _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
-            _num_computed_tokens_cache=self.num_computed_tokens[:num_reqs_padded],
+            _num_computed_tokens_cache=(
+                self.num_computed_tokens[:num_reqs_padded]
+                if self.common_attention_metadata_graph is not None else None
+            ),
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
@@ -4048,6 +4063,13 @@ class ModelRunnerFL(
         *,
         capture: bool = False,
     ) -> bool:
+        if self.common_attention_metadata_graph is None:
+            return False
+        # PIECEWISE descriptors pad tokens, not requests. A fixed request
+        # extent covers mixed batches whose request counts never occur in the
+        # token-size capture list. query_start_loc/seq_lens have padded tails.
+        if cudagraph_mode == CUDAGraphMode.PIECEWISE:
+            num_reqs = self.max_num_reqs
         # Follow the globally resolved graph mode. The standalone metadata
         # graph also benefits piecewise execution; ubatching retains eager
         # generation because its metadata is sliced per microbatch.
@@ -4363,7 +4385,7 @@ class ModelRunnerFL(
                 ),
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
-                slot_mapping_is_current=True,
+                slot_mapping_is_current=self.common_attention_metadata_graph is not None,
             )
 
             attn_metadata, spec_decode_common_attn_metadata = (
@@ -4379,7 +4401,7 @@ class ModelRunnerFL(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
-                    block_table_rows_are_current=True,
+                    block_table_rows_are_current=self.common_attention_metadata_graph is not None,
                 )
             )
 
@@ -5946,7 +5968,7 @@ class ModelRunnerFL(
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
-            slot_mapping_is_current=True,
+            slot_mapping_is_current=self.common_attention_metadata_graph is not None,
         )
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
@@ -5954,9 +5976,12 @@ class ModelRunnerFL(
         # protocol so that back-to-back dummy/real steps don't overwrite
         # pinned memory while a prior non_blocking H2D DMA is still reading.
         with self.synchronize_input_prep():
-            # If force_attention is True, we always capture attention.
-            # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
-            if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            build_attention = (
+                force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
+            )
+            # Metadata has its own graph, including in pure PIECEWISE mode.
+            # Its inputs must be initialized even when attention is not run.
+            if build_attention or self.common_attention_metadata_graph is not None:
                 if profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
@@ -5976,8 +6001,9 @@ class ModelRunnerFL(
                 cum_num_tokens = self._get_cumsum_and_arange(
                     num_scheduled_tokens, self.query_pos.np
                 )
+                self.query_start_loc.np[0] = 0
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
-                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(
+                self.query_start_loc.np[num_reqs + 1 :].fill(
                     cum_num_tokens[-1]
                 )
                 self.query_start_loc.copy_to_gpu()
@@ -5993,6 +6019,7 @@ class ModelRunnerFL(
                     capture=is_graph_capturing,
                 )
 
+            if build_attention:
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -6003,7 +6030,7 @@ class ModelRunnerFL(
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
-                    block_table_rows_are_current=True,
+                    block_table_rows_are_current=self.common_attention_metadata_graph is not None,
                 )
 
             # Dummy forwards must not update real KV-cache slots. Capture the
@@ -6511,7 +6538,8 @@ class ModelRunnerFL(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         _accelerator_synchronize()
-        self.common_attention_metadata_graph.clear()
+        if self.common_attention_metadata_graph is not None:
+            self.common_attention_metadata_graph.clear()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
