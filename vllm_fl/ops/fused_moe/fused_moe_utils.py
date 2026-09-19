@@ -12,7 +12,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
-from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import UnquantizedMoeBackend, map_unquantized_backend, backend_to_kernel_cls
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -35,6 +34,13 @@ _moe_sum = CachedOp("moe_sum")
 logger = init_logger(__name__)
 
 
+def _get_current_platform():
+    """Resolve the platform after OOT plugin activation, not at import time."""
+    from vllm.platforms import current_platform
+
+    return current_platform
+
+
 def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBackend]:
     """
     Get available backends in priority order based on platform and config.
@@ -48,13 +54,15 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
     ) -> None:
         backends.append(backends.pop(backends.index(backend)))
 
-    if current_platform.is_rocm():
+    runtime_platform = _get_current_platform()
+
+    if runtime_platform.is_rocm():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.AITER,
             UnquantizedMoeBackend.TRITON,
             UnquantizedMoeBackend.BATCHED_TRITON,
         ]
-    elif current_platform.is_cuda():
+    elif runtime_platform.is_cuda():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.FLASHINFER_TRTLLM,
             UnquantizedMoeBackend.FLASHINFER_CUTLASS,
@@ -68,10 +76,15 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         if moe_config.moe_parallel_config.dp_size > 1:
             _move_to_back(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.FLASHINFER_CUTLASS)
 
-    elif current_platform.is_xpu():
+    elif runtime_platform.is_xpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
-    elif current_platform.is_cpu():
+    elif runtime_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
+    else:
+        _AVAILABLE_BACKENDS = [
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        ]
     return _AVAILABLE_BACKENDS
 
 ## Adopt from select_unquantized_moe_backend
@@ -82,14 +95,16 @@ def select_unquantized_moe_backend_oot(moe_config: FusedMoEConfig,
     Note: Shape-specific fallbacks may still occur at runtime.
     """
 
-    if current_platform.is_cpu():
+    runtime_platform = _get_current_platform()
+
+    if runtime_platform.is_cpu():
         # TODO: migrate to MK structure.
         return UnquantizedMoeBackend.CPU, None
 
-    if current_platform.is_tpu():
+    if runtime_platform.is_tpu():
         return UnquantizedMoeBackend.TPU, None
 
-    if current_platform.is_out_of_tree() and use_flaggems():
+    if runtime_platform.is_out_of_tree() and use_flaggems():
         return UnquantizedMoeBackend.TRITON, TritonExpertsFL
 
     if moe_config.is_lora_enabled:
@@ -304,9 +319,10 @@ class TritonExpertsFL(TritonExperts):
         # vLLM's native Triton experts preserve the clamp, so bounded MoE stays
         # on them when that ABI is available; other runtimes use the per-step
         # FlagGems GEMMs plus the exact clamped activation below.
+        runtime_platform = _get_current_platform()
         if (
             self.quant_config.gemm1_clamp_limit is not None
-            and current_platform.is_cuda()
+            and runtime_platform.is_cuda()
             and has_native_triton_moe()
         ):
             return super().apply(
@@ -330,7 +346,7 @@ class TritonExpertsFL(TritonExperts):
         # Fast path (no LoRA, NVIDIA only): single fused FlagGems call.
         if (
             self._lora_context is None
-            and current_platform.is_cuda()
+            and runtime_platform.is_cuda()
             and (
                 self.quant_config.gemm1_clamp_limit is None
                 or has_native_triton_moe()
