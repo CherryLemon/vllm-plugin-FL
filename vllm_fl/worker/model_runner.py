@@ -251,7 +251,6 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm_fl.worker.ple_token_history import PLETokenHistory
 from vllm.utils.torch_utils import PIN_MEMORY
 
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -275,6 +274,7 @@ from vllm.v1.worker.utils import (
 )
 
 # FL-specific imports
+from vllm_fl.worker.ple_token_history import PLETokenHistory
 from vllm_fl.compat.vllm024.kv_cache import bind_kv_cache
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch.io_common import managed_inference_mode

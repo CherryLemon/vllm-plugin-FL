@@ -142,5 +142,7 @@ class PLETokenHistory:
         self._write_gpu[:num_tokens].copy_(
             self._write_cpu[:num_tokens], non_blocking=True
         )
-        self.tokens.index_copy_(0, self._write_gpu[:num_tokens], input_ids)
+        # Qwen's runtime policy keeps indexed writes native. FlagGems'
+        # index_copy_ performs a device-to-host bounds check on this path.
+        self.tokens[self._write_gpu[:num_tokens]] = input_ids
         return context
