@@ -122,6 +122,134 @@
     "observed_running_peak": 64,
     "observed_waiting_peak": 64,
     "historical_throughput_recovered": false,
-    "separate_day0_common_review_changes_included": false
+    "separate_day0_common_review_changes_included": false,
+    "host_stability_limitation": "User reports thermal stability problems; prior host had only discrete telemetry, so it is not a clean code-performance baseline"
+  },
+  "second_h100_node_rerun": {
+    "profile": "diagnostic TP8 H100 1k/1k, context2048, server slots64; not a 100K release profile",
+    "fusion_commit": "55f106c9e31e7916bc613f255292169b0c138ad4",
+    "pr442_commit": "4e3540af90ee3582183aba23f801b6e65e15221b",
+    "runtime_byte_identical_to": "1d334c0bd5297070ad610e262e512e2a2f8454b6",
+    "fusion_remote_push_or_merge": false,
+    "image_digest": "sha256:b7faa60041af787c35de236685120fb072697a6547fa4ef5877095f7f1519d87",
+    "driver": "580.126.20",
+    "source_archive_sha256": "2e9b7f5bf8d15fe0ffec3e59b3019fd070d5ad867f93a2c508cf2b964e472cb5",
+    "evidence_archive_sha256": "13f04755b1046b4b8e911139e7a98d91cbbe31bdb221afaa755953bc2d88cf51",
+    "gpu_metadata_tests_passed": 9,
+    "plan_cache_verified_ranks": 8,
+    "packed_arena": true,
+    "native_async_completion": false,
+    "warmup_requests_per_group": 64,
+    "formal_requests_per_round": 128,
+    "client_concurrency": 64,
+    "server_max_num_seqs": 64,
+    "max_model_len": 2048,
+    "max_num_batched_tokens": 16384,
+    "groups": {
+      "perf": {
+        "rounds": [
+          {
+            "output_throughput": 1195.4133493071035,
+            "mean_tpot_ms": 48.36967390537934,
+            "completed": 128,
+            "failed": 0
+          },
+          {
+            "output_throughput": 1512.591190128492,
+            "mean_tpot_ms": 39.94957401524464,
+            "completed": 128,
+            "failed": 0
+          },
+          {
+            "output_throughput": 1513.390093202092,
+            "mean_tpot_ms": 39.93673563696755,
+            "completed": 128,
+            "failed": 0
+          }
+        ],
+        "drift_percent": 22.59751372945944
+      },
+      "perf_repeat": {
+        "rounds": [
+          {
+            "output_throughput": 1526.8504445860797,
+            "mean_tpot_ms": 39.56509191612039,
+            "completed": 128,
+            "failed": 0
+          },
+          {
+            "output_throughput": 1532.5794728234348,
+            "mean_tpot_ms": 39.41891763091968,
+            "completed": 128,
+            "failed": 0
+          },
+          {
+            "output_throughput": 1483.9879467432709,
+            "mean_tpot_ms": 40.59702387892014,
+            "completed": 128,
+            "failed": 0
+          }
+        ],
+        "drift_percent": 3.2084783438178097
+      }
+    },
+    "selected_group": "perf_repeat",
+    "warm_repeat_metrics": {
+      "mean_itl_ms": 39.860344578858445,
+      "mean_tpot_ms": 39.86034447532007,
+      "mean_ttft_ms": 2469.433723417751,
+      "median_itl_ms": 37.41066406170527,
+      "median_tpot_ms": 40.030227388528715,
+      "median_ttft_ms": 2135.0701046176255,
+      "output_throughput": 1514.4726213842619,
+      "p99_itl_ms": 40.24917156901205,
+      "p99_tpot_ms": 41.581220985035195,
+      "p99_ttft_ms": 4606.743462301481,
+      "request_throughput": 1.4789771693205682,
+      "total_token_throughput": 3028.9452427685237
+    },
+    "warm_repeat_range_mean_drift_percent": 3.2084783438178097,
+    "hardware_sampling_interval_seconds": 2,
+    "hardware_sampling_scope": "initial and repeat groups, including gates and warmup",
+    "hardware_samples_all_gpus": 2832,
+    "observed_temperature_celsius": [
+      30.0,
+      48.0
+    ],
+    "observed_sm_clock_mhz": [
+      1830.0
+    ],
+    "observed_memory_clock_mhz": [
+      2619.0
+    ],
+    "observed_hw_or_sw_thermal_slowdown_samples": 0,
+    "observed_metrics_peaks": {
+      "benchmark": {
+        "running": 64.0,
+        "waiting": 47.0,
+        "kv_cache_usage": 0.20326805975380036
+      },
+      "isolation": {
+        "running": 64.0,
+        "waiting": 64.0,
+        "kv_cache_usage": 0.1023349542208788
+      }
+    },
+    "marker_isolation": {
+      "server_max_num_seqs": 64,
+      "requests": 384,
+      "pass": true,
+      "all_stop": true
+    },
+    "benchmark_service_stopped": true,
+    "prior_host_limitation": "User reports thermal stability problems; prior host had only discrete telemetry, so it is not a clean code-performance baseline",
+    "historical_3375_78_recovered": false,
+    "separate_day0_common_review_changes_included": false,
+    "limitations": [
+      "node change does not isolate thermal causality",
+      "two-second samples do not exclude shorter events",
+      "historical QSA predates known request-map correctness fix",
+      "short-request markers do not resolve long-reasoning repetition/truncation"
+    ]
   }
 }

@@ -98,7 +98,7 @@ rounds completed without failures at 610.947 / 611.708 output tokens/s and
 concurrency was only 16, with up to 48 waiting. These settings differ from
 the historical 64-slot throughput experiment.
 
-A separate local-only merge includes PR442 at `ba2343b` and PR455 at `b7905af`.
+The earlier-host local-only merge includes PR442 at `ba2343b` and PR455 at `b7905af`.
 It preserves packed-arena transfers while running PR442's common metadata
 producer, including capture tests with and without packed storage. The fused
 snapshot passed 150 targeted tests and 24 tests against an independently
@@ -122,6 +122,10 @@ All formal requests succeeded; warmed throughput drift was 0.49%. A separate
 384-request marker check at client concurrency 64/128 ended entirely with
 `stop` and no marker violations; telemetry observed Running64/Waiting64.
 
+The owner subsequently reported thermal stability problems on this host;
+its figures are not a clean code-performance baseline. The second-node rerun
+below supersedes this host for the current throughput observation.
+
 Historical 3375.78 tokens/s has **not** been recovered. Historical QSA and
 indexer source hashes match the pre-request-map-fix implementation, so that
 number is not a correctness-equivalent acceptance baseline. This observation
@@ -140,3 +144,48 @@ of the fused Qwen benchmark above. Cross-vendor and every-scheduler validation
 remain outside these NVIDIA results. No new device kernel was added in the
 PR455 review fixes; existing local QSA kernels and PLE composition retain the
 FlagGems/FlagTree follow-up described in the provenance document.
+
+## Rerun on a second H100 node (2026-09-20)
+
+The owner reports thermal stability problems on the earlier benchmark host.
+Those measurements remain diagnostic and cannot establish a code regression;
+the old discrete telemetry cannot quantify the thermal contribution.
+
+PR442 was refreshed to `4e3540a`. Its changes since `ba2343b` are tests and
+documentation only. The new local fusion `55f106c` has byte-identical runtime
+files to the previous `1d334c0` fusion and was not pushed or merged remotely.
+Nine common-metadata GPU tests passed on the new node. The image, driver,
+FlagGems source, model metadata/shard sizes and workload were held constant.
+All eight ranks passed the plan-cache gate.
+
+Initial three-round throughput was 1195.41 / 1512.59 / 1513.39 tokens/s. Range/mean drift
+of 22.60% triggered the predeclared full-repeat rule on the same
+service. All initial results are retained. The repeated group produced:
+
+| Round | Output tokens/s | Mean TPOT (ms) |
+|---|---:|---:|
+| 1 | 1526.85 | 39.5651 |
+| 2 | 1532.58 | 39.4189 |
+| 3 | 1483.99 | 40.5970 |
+| Mean | **1514.47** | **39.8603** |
+
+Every formal round completed all 128 requests without failures; repeated
+throughput drift was 3.21%. This is 17.27% above the earlier host's
+1291.49 tokens/s, but still below historical 3375.78. Node changes do not
+isolate thermal causality, and the historical QSA implementation predates
+the known request-map correctness fix. No root cause is established here.
+
+Two-second hardware sampling throughout both groups, including warmup,
+recorded 2832 GPU observations: 30–48 degrees C, SM clock
+1830 MHz and memory clock 2619 MHz. No sampled hardware or
+software thermal-slowdown flag was active. This does not exclude events
+shorter than the sampling interval. Benchmark telemetry observed a Running
+peak of 64. A subsequent 384-request marker check at client
+concurrency 64/128 passed with every response ending in `stop`; its measured
+Running/Waiting peaks were 64/64. The owned test service was stopped
+and the eight GPUs released after collection.
+
+This remains the short-context diagnostic profile, not a 100K release or
+long-reasoning acceptance result. The separate common-layer changes in #544
+are not included. Exact aggregate metrics and immutable artifact hashes are
+in `review_followup_validation.json` under `second_h100_node_rerun`.
