@@ -72,7 +72,8 @@ def test_policy_adds_measured_nvidia_decode_fast_paths():
         "copy_", "index_select", "conv1d", "_conv_depthwise2d", "conv2d",
         "pad", "constant_pad_nd", "repeat_interleave_tensor",
         "repeat_interleave_self_tensor", "linear", "mm", "mm_out", "addmm",
-        "addmm_out", "addmm_", "addmm_dtype", "addmm_dtype_out"
+        "addmm_out", "addmm_", "addmm_dtype", "addmm_dtype_out",
+        "sort", "sort_stable"
     ]
 
 
@@ -87,6 +88,8 @@ def test_policy_keeps_vendor_flaggems_linear_and_repeat_interleave(vendor_name):
     assert "addmm" not in blacklist
     assert "repeat_interleave_tensor" not in blacklist
     assert "repeat_interleave_self_tensor" not in blacklist
+    assert "sort" not in blacklist
+    assert "sort_stable" not in blacklist
 
 
 @pytest.mark.parametrize("vendor_name", ["amd", "metax", "iluvatar", "mthreads"])
@@ -160,3 +163,24 @@ def test_policy_does_not_change_other_models():
     whitelist, blacklist = apply_native_index_select_policy(config, None, ["copy_"])
     assert whitelist is None
     assert blacklist == ["copy_"]
+
+
+@pytest.mark.parametrize("operator", ["sort", "sort_stable"])
+def test_nvidia_qsa_selection_rejects_conflicting_dispatch(operator):
+    config = _config("qwen4_exp_text")
+    with pytest.raises(ValueError, match=operator):
+        apply_native_index_select_policy(
+            config, [operator], None, vendor_name="nvidia"
+        )
+
+    # The measured NVIDIA policy must not override other vendors or models.
+    whitelist, blacklist = apply_native_index_select_policy(
+        config, [operator], None, vendor_name="amd"
+    )
+    assert whitelist == [operator]
+    assert blacklist is None
+    whitelist, blacklist = apply_native_index_select_policy(
+        _config("qwen3_text"), [operator], None, vendor_name="nvidia"
+    )
+    assert whitelist == [operator]
+    assert blacklist is None

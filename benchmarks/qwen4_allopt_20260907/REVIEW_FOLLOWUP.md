@@ -189,3 +189,14 @@ This remains the short-context diagnostic profile, not a 100K release or
 long-reasoning acceptance result. The separate common-layer changes in #544
 are not included. Exact aggregate metrics and immutable artifact hashes are
 in `review_followup_validation.json` under `second_h100_node_rerun`.
+
+## Throughput gap investigation and native QSA sorting (2026-09-20)
+
+The subsequent same-source sorting-dispatch experiment reached
+**1803.55 output tokens/s**, **34.20 ms TPOT**,
+a **19.09%** throughput improvement over 1514.47. The measured QSA sorting
+hotspot is now handled by the NVIDIA model policy, while stable ordering and
+all existing correctness guards are retained. The serial CPU/output/input
+chain remains the next larger target; historical 3375.78 is still unrecovered.
+See [the gap investigation](PERFORMANCE_GAP_20260920.md) for complete rounds,
+trace attribution, policy tests, source boundaries and remaining limitations.

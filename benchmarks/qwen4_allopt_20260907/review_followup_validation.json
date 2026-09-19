@@ -251,5 +251,13 @@
       "historical QSA predates known request-map correctness fix",
       "short-request markers do not resolve long-reasoning repetition/truncation"
     ]
+  },
+  "performance_gap_followup": {
+    "report": "PERFORMANCE_GAP_20260920.md",
+    "validation": "performance_gap_validation.json",
+    "throughput": 1803.5494454147274,
+    "tpot_ms": 34.1977838284626,
+    "gain_percent": 19.087622975068562,
+    "policy_sha256": "c2808d11adb743804498c435681305092b00d98d6130fa1975ad2ca371ff4964"
   }
 }

@@ -222,9 +222,13 @@ def apply_native_index_select_policy(
     vLLM's host-known ``output_size`` and performs ``cumsum[-1].item()``, which
     introduces one stream synchronization per GDN layer.  Matched H100 nsys
     also shows the generic FlagGems linear path at roughly 3x the native dense
-    GEMM time.  Other accelerator vendors retain their FlagGems paths until
-    they have vendor-specific measurements; this is a performance policy, not
-    a CUDA-only model requirement.
+    GEMM time.  Keep the two stable QSA selection sorts native as well: the
+    measured FlagGems radix-sort path launches 68 kernels per QSA layer and
+    consumes about 5.44 ms per H100 decode step across the 12 QSA layers.
+    Native sorting preserves score ties and canonical logical-index order.
+    Other accelerator vendors retain their FlagGems paths until they have
+    vendor-specific measurements; this is a performance policy, not a CUDA-only
+    model requirement.
     """
 
     if not needs_native_index_select(vllm_config):
@@ -255,6 +259,10 @@ def apply_native_index_select_policy(
                 "addmm_",
                 "addmm_dtype",
                 "addmm_dtype_out",
+                # Implementation names for aten::sort and aten::sort.stable.
+                # Do not replace stable selection with unordered top-k.
+                "sort",
+                "sort_stable",
             )
         )
     if whitelist:
