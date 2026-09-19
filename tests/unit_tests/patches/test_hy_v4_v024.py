@@ -43,7 +43,12 @@ def test_hy4_convertor_uses_compressed_mla_dimensions():
     assert converted.is_deepseek_mla is True
 
 
-def test_hy4_convertor_normalizes_mxfp8_for_override_detection():
+def test_hy4_convertor_normalizes_mxfp8_for_override_detection(monkeypatch):
+    from vllm.model_executor.layers import quantization
+
+    monkeypatch.setattr(
+        quantization, "get_quantization_config", quantization.get_quantization_config
+    )
     quant_config = {
         "quant_method": "mxfp8",
         "ignored_layers": ["lm_head"],
@@ -88,7 +93,12 @@ def test_mxfp8_alias_is_probed_after_canonical_override():
     alias = quantization.get_quantization_config("mxfp8")
     canonical = quantization.get_quantization_config("modelopt_mxfp8")
 
-    assert alias.override_quantization_method({}, None) is None
+    assert (
+        alias.override_quantization_method(
+            {}, None, SimpleNamespace(model_type="hy_v4")
+        )
+        is None
+    )
     assert canonical.override_quantization_method({}, None) == "modelopt_mxfp8"
     assert quantization.get_quantization_config("other") is OtherConfig
 

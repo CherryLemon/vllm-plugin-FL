@@ -1,4 +1,4 @@
-"""Tests for the default-on HY4 skinny-N FP32 projection."""
+"""Tests for the opt-in HY4 skinny-N FP32 projection."""
 
 from __future__ import annotations
 
@@ -6,8 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-if not torch.cuda.is_available():
-    pytest.skip("HY4 HC projection tests require CUDA", allow_module_level=True)
+from vllm.platforms import current_platform
+
+pytestmark = pytest.mark.gpu
+
+if not torch.cuda.is_available() or not current_platform.is_cuda():
+    pytest.skip("HY4 HC projection tests require NVIDIA CUDA", allow_module_level=True)
 
 from vllm_fl.ops.hy4_hc_projection import (  # noqa: E402
     HC_N8_ENABLE_ENV,

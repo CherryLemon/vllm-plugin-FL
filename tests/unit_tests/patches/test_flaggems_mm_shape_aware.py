@@ -60,7 +60,9 @@ def test_default_is_disabled_and_does_not_touch_torch(monkeypatch):
     def fail_get_kernel(*args, **kwargs):
         raise AssertionError("disabled feature must not inspect dispatch state")
 
-    monkeypatch.setattr(shape_aware.torch.library, "get_kernel", fail_get_kernel)
+    monkeypatch.setattr(
+        shape_aware.torch.library, "get_kernel", fail_get_kernel, raising=False
+    )
     assert shape_aware.apply_shape_aware_mm() is False
     assert shape_aware._STATE is None
 
@@ -164,6 +166,7 @@ def test_apply_captures_flaggems_before_override_and_routes_shapes(monkeypatch):
         shape_aware.torch.library,
         "get_kernel",
         lambda op_name, dispatch_key: flaggems_kernel,
+        raising=False,
     )
     monkeypatch.setattr(
         shape_aware.torch.library,
@@ -213,7 +216,9 @@ def test_apply_fails_without_safe_override_api(monkeypatch):
     monkeypatch.delenv(shape_aware.THRESHOLD_ENV, raising=False)
     monkeypatch.setattr(shape_aware, "_STATE", None)
     safe_kernel = _FakeSafeKernel(lambda dispatch_keys, a, b: None)
-    monkeypatch.setattr(shape_aware.torch.library, "get_kernel", lambda *_: safe_kernel)
+    monkeypatch.setattr(
+        shape_aware.torch.library, "get_kernel", lambda *_: safe_kernel, raising=False
+    )
 
     class _NoAllowOverrideLibrary:
         def impl(self, op_name, fn, dispatch_key):

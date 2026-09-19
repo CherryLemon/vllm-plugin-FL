@@ -547,12 +547,13 @@ def test_load_weights_skips_pp_missing_indexer(monkeypatch):
             (f"{missing_layer}.wk.weight_scale", missing_scale),
             (f"{local_layer}.wk.weight", local_weight),
             (f"{local_layer}.wk.weight_scale", local_scale),
+            (f"{local_layer}.weights_proj.weight", torch.ones(2, 32)),
         ],
     )
 
     assert loaded == {fused}
     param = params[fused]
-    assert [shard for shard, _ in param.loads] == [0]
+    assert [shard for shard, _ in param.loads] == [0, 1]
     torch.testing.assert_close(
         param.loads[0][1], _reference_mxfp8(local_weight, local_scale)
     )
@@ -635,3 +636,76 @@ def test_load_weights_rejects_plain_duplicate_without_overwriting(monkeypatch):
     param = params[_fused_name(layer)]
     assert len(param.loads) == 1
     torch.testing.assert_close(param.data, _reference_fp8(weight, scale))
+
+
+@pytest.mark.parametrize("missing_shard", [0, 1])
+def test_load_weights_rejects_missing_stacked_component(monkeypatch, missing_shard):
+    _patch_cpu_parallelism(monkeypatch)
+    name = "model.layers.0.mlp.gate_up_proj.weight"
+    param = _StubParam(8, 32)
+    model = _make_integration_model({name: param})
+    source = "up_proj" if missing_shard == 0 else "gate_proj"
+    with pytest.raises(ValueError, match=f"component coverage.*shard={missing_shard}"):
+        HYV4ForCausalLM.load_weights(
+            model, [(name.replace("gate_up_proj", source), torch.ones(4, 32))]
+        )
+
+
+def test_load_weights_rejects_missing_weights_projection(monkeypatch):
+    _patch_cpu_parallelism(monkeypatch)
+    layer = "model.layers.0.self_attn.indexer"
+    model = _make_integration_model({_fused_name(layer): _StubParam(6, 32)})
+    with pytest.raises(ValueError, match="component coverage.*shard=1"):
+        HYV4ForCausalLM.load_weights(
+            model,
+            [
+                (f"{layer}.wk.weight", torch.ones(4, 32, dtype=torch.float8_e4m3fn)),
+                (
+                    f"{layer}.wk.weight_scale",
+                    torch.full((4, 1), 127, dtype=torch.uint8),
+                ),
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "omitted", [None, (1, "up_proj", "weight"), (1, "up_proj", "weight_scale")]
+)
+def test_split_expert_component_coverage(monkeypatch, omitted):
+    _patch_cpu_parallelism(monkeypatch)
+    prefix = "model.layers.0.mlp.experts"
+    names = [
+        f"{prefix}.routed_experts.{target}_{kind}"
+        for target in ("w13", "w2")
+        for kind in ("weight", "weight_scale")
+    ]
+    params = {name: torch.nn.Parameter(torch.zeros(2, 4, 4)) for name in names}
+    seen = []
+
+    def load(param, tensor, name, *, shard_id, expert_id, return_success):
+        if expert_id != 1:
+            return False
+        seen.append((name, expert_id, shard_id))
+        return True
+
+    for param in params.values():
+        param.weight_loader = load
+    model = _make_integration_model(params)
+    # Only global expert 1 is local; omitted remote expert 0 is legitimate.
+    owner = SimpleNamespace(expert_map=torch.tensor([-1, 0]))
+    model.named_modules = lambda: iter(
+        [("", model), (f"{prefix}.routed_experts", owner)]
+    )
+    weights = [
+        (f"{prefix}.{expert}.{proj}.{kind}", torch.ones(4, 4))
+        for expert in (1,)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for kind in ("weight", "weight_scale")
+        if (expert, proj, kind) != omitted
+    ]
+    if omitted is None:
+        assert HYV4ForCausalLM.load_weights(model, weights) == set(params)
+        assert len(seen) == 6
+    else:
+        with pytest.raises(ValueError, match="component coverage.*expert=1 shard=w3"):
+            HYV4ForCausalLM.load_weights(model, weights)

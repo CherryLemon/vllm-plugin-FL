@@ -12,7 +12,7 @@ projection output and fuse the cheap work that follows it:
 
 The kernels use self-locating two-dimensional grids and pass all strides as
 runtime values.  They therefore do not need host metadata and can be replayed
-from a fixed-address CUDA graph.  The validated HY4 path is enabled by default;
+from a fixed-address CUDA graph.  The HY4 optimization is opt-in;
 set ``VLLM_HY4_HC_POINTWISE_FUSION=0`` for a literal Torch rollback.
 Unsupported devices, dtypes, and capture-before-warmup still use the fallback.
 """
@@ -45,7 +45,7 @@ _WRITE_WARMED: set[tuple[int, str, str, int, int]] = set()
 
 
 def _env_enabled() -> bool:
-    """Return whether the default-on HYV4 HC fusion remains enabled."""
+    """Return whether the opt-in HYV4 HC fusion is enabled."""
     for name in (
         HYV4_HC_FUSION_ENV,
         HYV4_HC_FUSION_LEGACY_ENV,
@@ -54,7 +54,7 @@ def _env_enabled() -> bool:
         value = os.getenv(name)
         if value is not None:
             return value.strip().lower() in _TRUE_VALUES
-    return True
+    return False
 
 
 def _is_capturing(device: torch.device) -> bool:

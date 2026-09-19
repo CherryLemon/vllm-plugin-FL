@@ -70,11 +70,11 @@ def test_hy4_hc_explicit_disable_keeps_literal_torch_fallback(
     torch.testing.assert_close(result[1], reference[1], atol=0, rtol=0)
 
 
-def test_hy4_hc_default_is_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hy4_hc_default_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(hc.HYV4_HC_FUSION_ENV, raising=False)
     monkeypatch.delenv(hc.HYV4_HC_FUSION_LEGACY_ENV, raising=False)
     monkeypatch.delenv(hc.HYV4_HC_FUSION_ALIAS_ENV, raising=False)
-    assert hc._env_enabled()
+    assert not hc._env_enabled()
 
 
 @pytest.mark.parametrize("rows", [1, 8, 64])

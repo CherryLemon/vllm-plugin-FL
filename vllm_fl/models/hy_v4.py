@@ -56,6 +56,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_fl.configs.hy_v4 import HYV4Config
+from vllm_fl.model_loader.hy_v4_coverage import HY4LoadCoverage
 from vllm_fl.model_loader.hy_v4_indexer import (
     IndexerWKLoader,
     dequantize_mxfp8_wk,
@@ -65,6 +66,7 @@ from vllm_fl.models.hy_v4_attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
+    validate_hy4_parallel_config,
 )
 from vllm_fl.ops.hy4_hc_projection import hc_n8_projection
 from vllm_fl.ops.hy_v4_hc import (
@@ -632,6 +634,9 @@ class HYV4Model(nn.Module):
         super().__init__()
         config = typing.cast(HYV4Config, vllm_config.model_config.hf_config)
         self.config = config
+        validate_hy4_parallel_config(config, vllm_config.parallel_config.pipeline_parallel_size)
+        from vllm_fl.patches.hy_v4_runtime import validate_hy4_runtime
+        validate_hy4_runtime(vllm_config)
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
@@ -880,6 +885,7 @@ class HYV4ForCausalLM(
         loaded_weight: torch.Tensor,
         shard_id: str,
         num_experts: int,
+        coverage: HY4LoadCoverage,
     ) -> bool:
         loader = typing.cast(Callable[..., bool], param.weight_loader)
         loaded_any = False
@@ -890,7 +896,7 @@ class HYV4ForCausalLM(
                 f"does not match {len(expert_ids)} selected experts for {name}"
             )
         for loaded_expert_id, expert_id in enumerate(expert_ids):
-            loaded_any |= loader(
+            accepted = loader(
                 param,
                 loaded_weight[loaded_expert_id],
                 name,
@@ -898,6 +904,9 @@ class HYV4ForCausalLM(
                 expert_id=expert_id,
                 return_success=True,
             )
+            if accepted:
+                coverage.record(name, shard_id, expert_id)
+                loaded_any = True
         return loaded_any
 
     def load_weights(
@@ -907,6 +916,7 @@ class HYV4ForCausalLM(
         """Load HY4 split or packed expert weights and their quant scales."""
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        coverage = HY4LoadCoverage(self, params_dict)
         stacked_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -989,6 +999,7 @@ class HYV4ForCausalLM(
                         return_success=True,
                     ):
                         loaded_params.add(mapped_name)
+                        coverage.record(mapped_name, shard_id, expert_id)
                         mapped = True
                 # An expert not owned by this EP rank is still a recognized
                 # checkpoint tensor; do not let it fall through to the
@@ -1019,6 +1030,7 @@ class HYV4ForCausalLM(
                         gate,
                         "w1",
                         self.config.n_routed_experts,
+                        coverage,
                     )
                     loaded_up = self._load_all_experts(
                         mapped,
@@ -1026,6 +1038,7 @@ class HYV4ForCausalLM(
                         up,
                         "w3",
                         self.config.n_routed_experts,
+                        coverage,
                     )
                     loaded = loaded_gate or loaded_up
                 else:
@@ -1035,6 +1048,7 @@ class HYV4ForCausalLM(
                         loaded_weight,
                         "w2",
                         self.config.n_routed_experts,
+                        coverage,
                     )
                 if not loaded:
                     raise ValueError(f"No local HY4 expert accepted {name}")
@@ -1055,6 +1069,7 @@ class HYV4ForCausalLM(
                     continue
                 param = params_dict[mapped]
                 param.weight_loader(param, loaded_weight, shard_id)
+                coverage.record(mapped, shard_id)
                 loaded_params.add(mapped)
                 mapped_stacked = True
                 break
@@ -1070,7 +1085,11 @@ class HYV4ForCausalLM(
             loader(param, loaded_weight)
             loaded_params.add(name)
 
-        loaded_params.update(indexer_wk_loader.finish())
+        wk_loaded = indexer_wk_loader.finish()
+        loaded_params.update(wk_loaded)
+        for name in wk_loaded:
+            coverage.record(name, 0)
+        coverage.finish()
 
         runtime_attention_scales = (
             ".self_attn.attn.q_scale",

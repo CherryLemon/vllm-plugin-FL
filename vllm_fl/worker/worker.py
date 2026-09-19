@@ -265,16 +265,8 @@ class WorkerFL(WorkerBase):
                 is_shape_aware_mm_enabled,
             )
 
-            # The common infrastructure remains opt-in by default. HY4's
-            # validated decode policy is the sole model-specific default:
-            # native CUDA mm for small-M decode GEMVs and FlagGems for larger
-            # prefill GEMMs. An explicit environment value still wins.
-            model_config = getattr(self.vllm_config, "model_config", None)
-            hf_config = getattr(model_config, "hf_config", None)
-            model_type = getattr(hf_config, "model_type", None)
-            shape_aware_mm_enabled = is_shape_aware_mm_enabled(
-                default=model_type == "hy_v4"
-            )
+            # Performance policy remains opt-in pending matched model A/B.
+            shape_aware_mm_enabled = is_shape_aware_mm_enabled(default=False)
 
             # Resolve policy before capturing native mm. An override is valid
             # only when FlagGems retains ownership of aten::mm.

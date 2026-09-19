@@ -20,8 +20,7 @@ The kernel is graph-safe for a fixed shape: it derives all addresses from
 ``program_id`` and tensor metadata, does not read device data on the host, and
 does not build runtime metadata tensors.  Triton autotuning (if enabled by a
 future change) must be warmed up before graph capture; this implementation
-uses a fixed config for that reason.  The validated HY4 path is enabled by
-default.  Set ``VLLM_HY4_HC_N8_PROJECTION=0`` for an exact reference-path
+uses a fixed config for that reason.  The HY4 optimization is opt-in.  Set ``VLLM_HY4_HC_N8_PROJECTION=0`` for an exact reference-path
 rollback.
 """
 
@@ -50,11 +49,11 @@ HC_N8_ENABLE_ENV = "VLLM_HY4_HC_N8_PROJECTION"
 
 
 def _enabled() -> bool:
-    """Return the default-on HY4 switch without doing any device work."""
+    """Return the opt-in HY4 switch without doing any device work."""
 
     value = os.getenv(HC_N8_ENABLE_ENV)
     if value is None:
-        return True
+        return False
     return value.strip().lower() in {"1", "true", "on", "yes"}
 
 
@@ -145,6 +144,9 @@ def _is_candidate(flat: torch.Tensor, weight: torch.Tensor) -> bool:
 
     if not _TRITON_AVAILABLE or not _enabled():
         return False
+    from vllm.platforms import current_platform
+    if not current_platform.is_cuda():
+        return False
     if flat.device.type != "cuda" or weight.device != flat.device:
         return False
     if flat.dtype is not torch.float32 or weight.dtype is not torch.float32:
@@ -174,6 +176,9 @@ def _is_large_m_rms_candidate(flat: torch.Tensor, weight: torch.Tensor) -> bool:
     """Return whether the memory-safe large-M inverse-RMS path is usable."""
 
     if not _TRITON_AVAILABLE or not _enabled():
+        return False
+    from vllm.platforms import current_platform
+    if not current_platform.is_cuda():
         return False
     if flat.device.type != "cuda" or weight.device != flat.device:
         return False
