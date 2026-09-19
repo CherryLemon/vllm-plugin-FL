@@ -70,3 +70,6 @@ Validation uses real dispatcher registrations in isolated processes, GPU graph
 capture/replay, and worker capture entry points. Numerical checks and performance
 measurements for a particular model are separate requirements; these contracts
 do not imply that every model/platform/scheduling combination is validated.
+
+See [the recorded validation and reproduction commands](common_worker_validation.md)
+for the tested snapshot, installed-wheel checks, and scheduling limitations.
