@@ -430,9 +430,8 @@ def install_glm5_next_kpool_v024() -> None:
         def register_all(vllm_config):
             original_register_all(vllm_config)
             kv_cache_spec_registry.KVCacheSpecRegistry.register(
-                KpoolTailSpec,
-                glm5_indexer_page_alignment,
-                KpoolTailManager,
+                kvcache_spec_cls=KpoolTailSpec,
+                manager_class=KpoolTailManager,
                 uniform_type_base_spec=KpoolTailSpec,
             )
 
@@ -688,9 +687,8 @@ def install_glm5_next_kpool_v024() -> None:
     # registration. In that case add only our spec immediately.
     if kv_cache_spec_registry._REGISTRY_KVCACHESPEC_LIST:
         kv_cache_spec_registry.KVCacheSpecRegistry.register(
-            KpoolTailSpec,
-            glm5_indexer_page_alignment,
-            KpoolTailManager,
+            kvcache_spec_cls=KpoolTailSpec,
+            manager_class=KpoolTailManager,
             uniform_type_base_spec=KpoolTailSpec,
         )
 

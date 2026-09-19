@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The real runner honors explicit GLM layouts and preserves other backends."""
 
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +13,45 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
 from vllm_fl.runtime.kv_layout import get_physical_cache_layout
+
+
+@pytest.mark.parametrize("preinitialized", [False, True])
+def test_real_kv_registry_handles_lazy_and_late_plugin_registration(preinitialized):
+    code = f"""
+import torch
+from vllm.v1 import kv_cache_spec_registry as registry
+from vllm.v1.core import single_type_kv_cache_manager as managers
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm_fl.models.glm5_next_kpool import KpoolTailSpec, KpoolTailManager
+from vllm_fl.patches.glm5_next_kpool_v024 import install_glm5_next_kpool_v024
+
+registry._REGISTRY_KVCACHESPEC_LIST.clear()
+if {preinitialized!r}:
+    managers.register_all_kvcache_specs(None)
+install_glm5_next_kpool_v024()
+tail = KpoolTailSpec(block_size=4, num_kv_heads=1, head_size=128,
+                    dtype=torch.float32, sliding_window=4)
+ordinary = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=128,
+                             dtype=torch.float32)
+registry.KVCacheSpecRegistry.check_kv_cache_spec_registry(
+    {{"tail": tail, "ordinary": ordinary}})
+assert registry.KVCacheSpecRegistry.get_manager_class(tail) is KpoolTailManager
+assert registry.KVCacheSpecRegistry.get_uniform_type_base_spec(tail) is KpoolTailSpec
+assert registry.KVCacheSpecRegistry.get_manager_class(ordinary) is managers.FullAttentionManager
+assert registry.KVCacheSpecRegistry.get_uniform_type_base_spec(ordinary) is FullAttentionSpec
+# Re-registration keeps the same native and custom manager contracts.
+install_glm5_next_kpool_v024()
+managers.register_all_kvcache_specs(None)
+assert registry.KVCacheSpecRegistry.get_manager_class(tail) is KpoolTailManager
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=os.environ.copy(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class OtherCompressedBackend:
