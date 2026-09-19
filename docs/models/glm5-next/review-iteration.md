@@ -50,12 +50,11 @@ numerical parity.
 | `kernels/glm5_next/paged_mqa.py` | FlagGems | FP8 page-stride read, per-token FP32 scales, unchanged dot/ReLU/head reduction; `test_paged_mqa_stride.py` covers page boundaries, padding and metadata replay | Upstream page-stride/scale-offset interface; vendor numerical/performance qualification |
 | `kernels/glm5_next/vision_attention.py` | FlagTree + FlagGems | Model-private composition of existing FA2, fake implementation and static sequence bound; FP16/BF16 replay tests | Verify complete vision encoder compile/graph path and dynamic image/video generation workloads |
 
-Other architectural follow-ups remain: make the resolved provider/capability
-decision explicit across plans, replace temporary MLA-constructor capability
-patches, and move compressed-page layout policy out of the generic runner.
-This iteration does not claim those broader restructurings or all merge gates
-are complete. Existing non-GLM model serving and full multimodal quality remain
-separate release checks.
+At that snapshot, architectural follow-ups included explicit provider bindings,
+temporary MLA-constructor capability patches and compressed-page layout
+ownership. The follow-up below addresses bindings and layout ownership, and
+records the remaining constructor boundary. Full multimodal quality remains
+a separate release check.
 
 ## Paged MQA measurement
 
@@ -83,6 +82,11 @@ may lower the deployment ceiling but cannot raise it. Geometry overrides and
 `do_resize=False` are rejected. Profiling uses a maximal aligned image canvas
 and a video canvas derived from its frame and pixel budgets. Video prompt
 updates retain each request's sampling options without mutating cached state.
+When vLLM's media loader has already sampled a video, request and deployment
+sampling select a subset of those decoded frames. Pixel preparation and prompt
+timestamps share the mapping back to source frame IDs. Profiling explicitly
+keeps the maximal dummy frame count, including with a low deployment FPS.
+Both sampler formats retain a nonempty temporal group for short clips.
 
 Indexer and portable vision adapters now bind through the public selection
 policy. Per-op order, strict mode, vendor filters and FlagGems allow/deny lists
@@ -104,6 +108,75 @@ boundary with explicit upstream factories remains follow-up work. Early
 registration hooks delegate unless the config or cache specs identify GLM.
 Provider validation happens only after the model matches.
 
-This follow-up's installed-wheel and serving results will be recorded after
-validation on the final tree merged with the target main. The preceding
-section's serving counts belong to the earlier wheel.
+The follow-up is merged with target main `940480f`. Code candidate `a605ab6`
+passes 809 CPU tests (4 skipped, 7 GPU cases deselected) and 163 installed-wheel
+tests on each of two H100 nodes, including six GPU cases per node. All 277
+package files match the candidate wheel. The native vLLM Python installation
+matches its wheel RECORD on both nodes. The preceding section's serving
+counts belong to the earlier wheel.
+
+The same `a605ab6` wheel passes BF16 TP16/EP serving with normal multimodal
+profiling enabled, without `--skip-mm-profiling`. Both the default image budget
+and the deployment override `images_kwargs.max_image_tokens=16000` complete
+19 piecewise and 11 full-decode graph captures, with breakable graphs enabled.
+
+| Configuration | Targeted checks | Result |
+| --- | --- | --- |
+| GLM default image budget | Arithmetic, four mixed 12,122–23,122-token prompts, 16 independent concurrent codes, image caps/precedence/rejection, short and request-sampled video | 27/27 |
+| GLM deployment image ceiling 16000 | Arithmetic, 4096-square image, lower request cap, pixel precedence, over-budget rejection and both video cases | 7/7 |
+
+Every successful response finishes with `stop` and matches the expected answer;
+the isolation audit checks that each response contains only its own code.
+The over-budget image cases return the expected HTTP 400. Neither GLM run logs
+a CUDA failure or OOM. These are targeted functional checks; full GPQA and
+maximum-capacity measurements were not rerun.
+
+A Qwen3-30B-A3B BF16 TP2 control starts with the deliberately invalid
+`VLLM_FL_GLM5_PROVIDER=invalid`, platform-default FlagGems policy and ordinary
+graphs (five piecewise and four full-decode captures). First-use records select
+FlagGems attention and `topk_softmax`, without a logged fallback. All 16
+independent-code requests pass at client concurrency eight. However, its first
+arithmetic request at temperature 1 returns an unrelated image URL: that run
+is 16/17. A subsequent greedy run on the same service passes 17/17, and
+fixed-seed arithmetic probes also pass. The original failure is retained;
+its cause is not established by these checks.
+
+A separate cold start of the same Qwen wheel with `VLLM_FL_PREFER=vendor`
+passes 17/17 at temperature 1, retaining the invalid GLM provider and ordinary
+graph configuration. Attention and `topk_softmax` select `vendor.cuda`, without
+a logged fallback. This validates that non-GLM startup can ignore the GLM-only
+setting; it does not establish the cause of the earlier sampled-answer anomaly
+or numerical equivalence between providers.
+
+The real checkpoint uses the legacy pixel schema with patch expansion: its
+effective default vision budget is 800 tokens. Real checkpoint preprocessing
+produces 784 vision tokens for a 4096-square image by default, and 15876 with
+a deployment image ceiling of 16000. The synthetic token-schema tests use a
+different default of 8000. The real video dummy uses 400 frames and 800 vision
+tokens; its 2006 prompt tokens remain below the declared 2202-token bound.
+
+Two additional regressions were fixed during startup validation: both lazy
+and already-initialized KV registry paths preserve the registration argument
+contract, and the private tail backend explicitly advertises strided padded
+pages. The generic DeepSeek backend remains unchanged.
+
+The validated GLM deployment retains the historical restricted FlagGems
+operator set and also permits the policy-governed private vision operator:
+
+```bash
+export VLLM_FL_FLAGOS_WHITELIST=grouped_topk,moe_sum,flash_attn_varlen_func
+export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+```
+
+Under the tested `auto` provider, NVIDIA native implementations handle the
+indexer and vision attention; observed `grouped_topk` and `moe_sum` calls select
+FlagGems. The private FA2 path has separate operator-level GPU coverage. When
+that private adapter is selected, omitting `flash_attn_varlen_func` from an
+explicit whitelist correctly rejects it during preflight. On earlier candidate
+`389b737`, the broader platform-default FlagGems operator set passed full TP16
+startup and graph capture, but four concurrent long prompts triggered an illegal
+memory access.
+A synchronous diagnostic reproduced the failure inside graph replay; the
+specific kernel has not been identified. That broader operator configuration
+is not validated by the restricted-deployment checks. The control also includes
+the tail capability fix, so it does not isolate a single causal change.
