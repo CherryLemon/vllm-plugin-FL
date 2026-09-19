@@ -633,47 +633,40 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
         vllm_config = kwargs["vllm_config"]
         config = kwargs["config"]
         cache_config = kwargs["cache_config"]
-        # vLLM's base MLA constructor eagerly creates its stock
-        # ``SparseAttnIndexer`` before this class can replace it with the
-        # plugin-owned kpool implementation below.  On a CUDA empty-build
-        # wheel that stock constructor rejects the missing DeepGEMM ABI even
-        # though all runtime indexer operations will be routed through the
-        # portable backend.  Suppress only that constructor-time capability
-        # guard, and only for GLM5's non-NVIDIA provider; the temporary value
-        # is restored before model construction continues.  Explicit
-        # ``VLLM_FL_GLM5_PROVIDER=nvidia`` still fails fast as intended.
-        sparse_indexer_module = None
-        original_has_deep_gemm = None
-        mla_attention_module = None
-        original_get_prefill_backend = None
+        # v0.24 eagerly constructs its stock indexer and prefill backend.
+        # Scope the compatibility hooks to this constructor and register their
+        # ownership/rollback with the same transaction used by engine hooks.
+        from vllm_fl.activation import PendingPatch, temporary_patches
+
+        construction_patches = []
         if current_platform.is_cuda() and not use_nvidia_reference():
             from vllm.model_executor.layers import sparse_attn_indexer
-            from vllm.model_executor.layers.attention import (
-                mla_attention as mla_attention_module,
-            )
-
+            from vllm.model_executor.layers.attention import mla_attention
             from vllm_fl.dispatch.backends.flaggems.impl.mla_prefill import (
                 FlagGemsMLAPrefillBackend,
             )
 
-            sparse_indexer_module = sparse_attn_indexer
-            original_has_deep_gemm = sparse_indexer_module.has_deep_gemm
-            sparse_indexer_module.has_deep_gemm = lambda: True
-            original_get_prefill_backend = (
-                mla_attention_module.get_mla_prefill_backend
-            )
-            mla_attention_module.get_mla_prefill_backend = (
-                lambda _vllm_config: FlagGemsMLAPrefillBackend
-            )
-        try:
-            super().__init__(*args, **kwargs)
-        finally:
-            if sparse_indexer_module is not None:
-                sparse_indexer_module.has_deep_gemm = original_has_deep_gemm
-            if mla_attention_module is not None:
-                mla_attention_module.get_mla_prefill_backend = (
-                    original_get_prefill_backend
+            for owner, attr, replacement in (
+                (sparse_attn_indexer, "has_deep_gemm", lambda: True),
+                (
+                    mla_attention,
+                    "get_mla_prefill_backend",
+                    lambda _vllm_config: FlagGemsMLAPrefillBackend,
+                ),
+            ):
+                construction_patches.append(
+                    PendingPatch(
+                        target=f"{owner.__name__}.{attr}",
+                        owner=owner,
+                        attr=attr,
+                        replacement=replacement,
+                        pristine=getattr(owner, attr),
+                        fingerprint="glm5.mla.v024",
+                        phase="construction",
+                    )
                 )
+        with temporary_patches(construction_patches):
+            super().__init__(*args, **kwargs)
         if self.indexer is not None and config.index_kpool_compress:
             indexer = self.indexer
             kpool = int(config.index_kpool)
@@ -1109,9 +1102,7 @@ class Glm5NextModel(nn.Module):
                 .sum(dim=1)
                 .contiguous()
             )
-            logger.info_once(
-                "Enabled GLM5-Next first-layer mhc_pre_broadcast_tilelang"
-            )
+            logger.info_once("Enabled GLM5-Next first-layer mhc_pre_broadcast_tilelang")
 
 
 class Glm5NextForCausalLM(
@@ -1123,6 +1114,7 @@ class Glm5NextForCausalLM(
         from vllm_fl.patches.glm5_next_v024 import validate_glm5_config
 
         validate_glm5_config(vllm_config)
+        INDEXER_BACKEND.preflight()
         super().__init__()
         self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config

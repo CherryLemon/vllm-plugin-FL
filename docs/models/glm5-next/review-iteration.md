@@ -73,3 +73,37 @@ at `atol=rtol=2e-5`.
 These are operator-wrapper measurements, not model-serving speedups. The
 PyTorch reference medians were 102.11/101.07/107.79 us. Compute Sanitizer was
 unavailable in the validation image, so no sanitizer pass is claimed.
+
+
+## Follow-up review of 79e5dab
+
+The follow-up unifies deployment pixel/token ceilings with actual image/video
+preprocessing. `max_pixels` takes precedence over `max_image_tokens`; requests
+may lower the deployment ceiling but cannot raise it. Geometry overrides and
+`do_resize=False` are rejected. Profiling uses a maximal aligned image canvas
+and a video canvas derived from its frame and pixel budgets. Video prompt
+updates retain each request's sampling options without mutating cached state.
+
+Indexer and portable vision adapters now bind through the public selection
+policy. Per-op order, strict mode, vendor filters and FlagGems allow/deny lists
+apply to those calls. Only `NotImplementedError` permits fallback; failed
+implementations are removed from the binding and GPU errors propagate.
+Required vision implementations are preflighted before weight loading.
+
+The GLM indexer backend owns its physical layout descriptor. Runner reshaping,
+metadata creation and compressed-cache zeroing consume that capability;
+other compressed backends keep their existing path. The generic DeepSeek
+indexer's capability declaration stays unchanged.
+
+Early engine/config hooks, worker hooks, the temporary MLA constructor hooks
+and the FlagGems TLE compatibility hooks use the same patch ownership records.
+`patch_inventory()` includes their phase, fingerprint and vLLM version.
+Constructor hooks are restored on success or failure. They remain
+process-global during single-model construction; replacing that compatibility
+boundary with explicit upstream factories remains follow-up work. Early
+registration hooks delegate unless the config or cache specs identify GLM.
+Provider validation happens only after the model matches.
+
+This follow-up's installed-wheel and serving results will be recorded after
+validation on the final tree merged with the target main. The preceding
+section's serving counts belong to the earlier wheel.

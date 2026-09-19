@@ -653,7 +653,6 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
     """Build the checkpoint's custom image/video processor locally."""
 
     def get_hf_processor(self, **kwargs: object):
-        del kwargs
         processor = getattr(self, "_glm5_hf_processor", None)
         if processor is None:
             from vllm_fl.transformers_utils.processors.glm5_next import (
@@ -661,36 +660,76 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             )
 
             processor = Glm5NextProcessor.from_pretrained(self.ctx.model_config.model)
+            processor.configure_serving(self.ctx.get_merged_mm_kwargs({}))
             self._glm5_hf_processor = processor
+        processor.resolve_serving_kwargs(kwargs)
         return processor
 
-    @staticmethod
-    def _processor_pixel_budget(processor) -> tuple[int, int]:
-        from vllm_fl.transformers_utils.processors.glm5_next import (
-            _pixel_budget,
+    def _vision_budget(self, modality):
+        from vllm_fl.transformers_utils.processors.glm5_next_budget import (
+            modality_kwargs,
+            resolve_vision_budget,
         )
 
-        return _pixel_budget(
-            processor.min_image_tokens,
-            processor.max_image_tokens,
-            processor.patch_size,
-            processor.merge_size,
-            processor.temporal_patch_size,
+        processor = self.get_hf_processor()
+        return resolve_vision_budget(
+            getattr(processor, modality + "_processor"),
+            modality_kwargs(self.ctx.get_merged_mm_kwargs({}), modality),
         )
 
     def _get_image_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
-        if (override := mm_kwargs.get("max_pixels")) is not None:
-            return int(override)
-        processor = self.get_hf_processor().image_processor
-        return self._processor_pixel_budget(processor)[1]
+        return self._vision_budget("image").max_pixels
 
     def _get_video_max_pixels(self) -> int:
-        mm_kwargs = self.ctx.get_merged_mm_kwargs({})
-        if (override := mm_kwargs.get("max_pixels")) is not None:
-            return int(override)
-        processor = self.get_hf_processor().video_processor
-        return self._processor_pixel_budget(processor)[1]
+        return self._vision_budget("video").max_pixels
+
+    def get_max_image_tokens(self) -> int:
+        return self._vision_budget("image").max_tokens
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        height, width = self._vision_budget("image").largest_canvas()
+        return ImageSize(width=width, height=height)
+
+    def get_num_image_tokens(self, *, image_width, image_height):
+        budget = self._vision_budget("image")
+        return self._get_vision_info(
+            image_width=image_width,
+            image_height=image_height,
+            num_frames=1,
+            min_image_pixels=budget.min_pixels,
+            max_image_pixels=budget.max_pixels,
+        )[1]
+
+    def get_num_video_tokens(self, *, image_width, image_height, num_frames):
+        return self._get_vision_info(
+            image_width=image_width,
+            image_height=image_height,
+            num_frames=num_frames,
+            max_image_pixels=self._get_video_max_pixels(),
+            modality="video",
+            min_image_pixels=self._vision_budget("video").min_pixels,
+        )[1]
+
+    def _video_frame_cap(self):
+        options = self.get_hf_processor().resolve_serving_kwargs({})["videos_kwargs"]
+        return options["max_frames"]
+
+    def _get_max_video_frames(self, max_tokens):
+        # Bound the inherited search even when the total video pixel cap is
+        # below max_tokens: that case never exceeds the token cap as t grows.
+        cap = self._video_frame_cap()
+        width, height = self.get_image_size_with_most_features()
+        frames = 0
+        for candidate in range(1, cap + 1):
+            if (
+                self.get_num_video_tokens(
+                    image_width=width, image_height=height, num_frames=candidate
+                )
+                > max_tokens
+            ):
+                break
+            frames = candidate
+        return frames
 
     def _get_vision_info(
         self,
@@ -700,6 +739,8 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         num_frames: int = 16,
         do_resize: bool = True,
         max_image_pixels: int = 28 * 28 * 2 * 30000,
+        modality: str = "image",
+        min_image_pixels: int = 1,
     ) -> tuple[ImageSize, int]:
         from vllm_fl.transformers_utils.processors.glm5_next import smart_resize
 
@@ -707,8 +748,8 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         patch_size = vision_config.patch_size
         merge_size = vision_config.spatial_merge_size
         temporal_patch_size = vision_config.temporal_patch_size
-        image_processor = self.get_hf_processor().image_processor
-        factor = patch_size * merge_size * image_processor.patch_expand_factor
+        processor = getattr(self.get_hf_processor(), modality + "_processor")
+        factor = patch_size * merge_size * processor.patch_expand_factor
         # The inherited GLM-4V dummy-video token estimator probes frame counts
         # just beyond the pixel budget while finding the largest fitting video.
         # Keep one aligned spatial patch available per probed frame so that the
@@ -717,7 +758,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         max_image_pixels = max(max_image_pixels, padded_frames * factor * factor)
 
         if do_resize:
-            frames = max(num_frames, temporal_patch_size)
+            frames = max(padded_frames, temporal_patch_size)
             resized_height, resized_width = smart_resize(
                 t=frames,
                 h=image_height,
@@ -725,7 +766,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
                 t_factor=temporal_patch_size,
                 h_factor=factor,
                 w_factor=factor,
-                min_pixels=1,
+                min_pixels=min_image_pixels,
                 max_pixels=max_image_pixels,
             )
             preprocessed_size = ImageSize(width=resized_width, height=resized_height)
@@ -758,7 +799,6 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             result["image"] = self.get_max_image_tokens()
 
         if mm_counts.get("video", 0) > 0:
-            video_processor = self.get_video_processor()
             max_pixels = self._get_video_max_pixels()
 
             vision_config = self.get_hf_config().vision_config
@@ -771,8 +811,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             )
 
             max_grid_t = max(
-                int(getattr(video_processor, "max_frame_count_dynamic", 2048))
-                // temporal_patch_size,
+                self._video_frame_cap() // temporal_patch_size,
                 1,
             )
 
@@ -787,7 +826,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         return result
 
     def _get_video_second_idx_glm46v(
-        self, metadata: dict[str, Any], total_frames: int
+        self, metadata: dict[str, Any], total_frames: int, mm_kwargs=None
     ) -> list[int]:
         """Align video prompt timestamps with the processor's frame sampler.
 
@@ -809,11 +848,61 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             frames_indices=metadata.get("frames_indices"),
             do_sample_frames=metadata.get("do_sample_frames", True),
         )
-        return glm_video_timestamp_seconds(self.get_video_processor(), video_metadata)
+        options = self.get_hf_processor().resolve_serving_kwargs(mm_kwargs or {})
+        return glm_video_timestamp_seconds(
+            self.get_video_processor(), video_metadata, **options["videos_kwargs"]
+        )
+
+    def _construct_glm5_video_placeholder(self, video, metadata, grid, mm_kwargs):
+        processor = self.get_hf_processor(**mm_kwargs)
+        config = self.get_hf_config()
+        timestamps = self._get_video_second_idx_glm46v(metadata, len(video), mm_kwargs)
+        frames, height, width = map(int, grid)
+        if len(timestamps) != frames:
+            raise ValueError("GLM5-Next video sampling and encoder grid disagree")
+        num_tokens = height * width // processor.video_processor.merge_size**2
+        placeholder = [config.video_start_token_id]
+        for timestamp in timestamps:
+            placeholder.append(config.image_start_token_id)
+            placeholder.extend([processor.image_token_id] * num_tokens)
+            placeholder.append(config.image_end_token_id)
+            placeholder.extend(
+                self.get_tokenizer().encode(
+                    f"{timestamp:.1f} seconds", add_special_tokens=False
+                )
+            )
+        placeholder.append(config.video_end_token_id)
+        return placeholder
 
 
 class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
     """Let vLLM, rather than the feature-only HF processor, update prompts."""
+
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        from dataclasses import replace
+        from vllm.multimodal.processing import PromptUpdateDetails
+
+        updates = super()._get_prompt_updates(
+            mm_items, hf_processor_mm_kwargs, out_mm_kwargs
+        )
+        processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
+
+        def video_replacement(item_idx):
+            video, metadata = mm_items["video"][item_idx]
+            grid = out_mm_kwargs["video"][item_idx]["video_grid_thw"].data
+            placeholder = self.info._construct_glm5_video_placeholder(
+                video, metadata, grid, hf_processor_mm_kwargs
+            )
+            return PromptUpdateDetails.select_token_id(
+                placeholder, embed_token_id=processor.image_token_id
+            )
+
+        return [
+            replace(update, replacement=video_replacement)
+            if update.modality == "video"
+            else update
+            for update in updates
+        ]
 
     def _hf_processor_applies_updates(
         self,
@@ -825,10 +914,34 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
         return False
 
 
+class Glm5NextDummyInputsBuilder(Glm4vDummyInputsBuilder):
+    def get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
+        # Build video directly at its effective canvas. Repeating the maximal
+        # still-image canvas hundreds of times wastes host memory before resize.
+        image_size = self.info.get_image_size_with_most_features()
+        frames = self.info._video_frame_cap()
+        video_h, video_w = self.info._vision_budget("video").largest_canvas(frames)
+        return {
+            "image": self._get_dummy_images(
+                width=image_size.width,
+                height=image_size.height,
+                num_images=mm_counts.get("image", 0),
+                overrides=mm_options.get("image"),
+            ),
+            "video": self._get_dummy_videos(
+                width=video_w,
+                height=video_h,
+                num_frames=frames,
+                num_videos=mm_counts.get("video", 0),
+                overrides=mm_options.get("video"),
+            ),
+        }
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Glm5NextMultiModalProcessor,
     info=Glm5NextProcessingInfo,
-    dummy_inputs=Glm4vDummyInputsBuilder,
+    dummy_inputs=Glm5NextDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
     Glm4vForConditionalGeneration, HasInnerState, IsHybrid

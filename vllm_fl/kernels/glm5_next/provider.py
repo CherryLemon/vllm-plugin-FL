@@ -83,3 +83,16 @@ def use_nvidia_reference() -> bool:
 
 
 __all__ = ["ENV_NAME", "get_glm5_provider", "use_nvidia_reference"]
+
+
+INDEXER_OPERATORS = (
+    "per_token_group_quant_fp8",
+    "indexer_k_quant_and_cache",
+    "cp_gather_indexer_k_quant_cache",
+    "fp8_fp4_mqa_logits",
+    "fp8_fp4_paged_mqa_logits",
+    "top_k_per_row_prefill",
+    "top_k_per_row_decode",
+    "pack_seq_triton",
+    "unpack_seq_triton",
+)

@@ -121,8 +121,7 @@ def test_platform_ignores_glm_provider_without_active_plan(monkeypatch):
 
     selector = SimpleNamespace(use_mla=True, use_sparse=False)
     assert (
-        PlatformFL.get_attn_backend_cls(None, selector)
-        == "GENERIC_DISPATCH_SENTINEL"
+        PlatformFL.get_attn_backend_cls(None, selector) == "GENERIC_DISPATCH_SENTINEL"
     )
 
 
@@ -206,12 +205,10 @@ def test_real_glm_activation_applies_before_model_construction(monkeypatch):
     assert plan is not None
 
     assert activate(plan) is True
-    assert (
-        DeepseekV32IndexerBackend.indexes_kv_by_block_stride.__func__(
-            DeepseekV32IndexerBackend
-        )
-        is True
-    )
+    from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
+
+    assert Glm5NextIndexerAttentionBackend.indexes_kv_by_block_stride() is True
+    assert DeepseekV32IndexerBackend.indexes_kv_by_block_stride() is False
     assert activate(plan) is False
 
     reset_activation_for_tests()

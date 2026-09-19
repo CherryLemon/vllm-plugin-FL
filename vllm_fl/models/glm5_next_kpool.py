@@ -264,7 +264,33 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
         return KpoolTailMetadataBuilder
 
 
+def glm5_indexer_page_alignment(capability):
+    # DeepGEMM on SM90 only accepts 64-entry pages; SM100 accepts 32 too.
+    return 64 if capability is not None and capability.major < 10 else 32
+
+
+class Glm5NextIndexerAttentionBackend(DeepseekV32IndexerBackend):
+    @classmethod
+    def indexes_kv_by_block_stride(cls):
+        return True
+
+    @staticmethod
+    def get_physical_cache_layout(spec):
+        from vllm.platforms import current_platform
+        from vllm_fl.runtime.kv_layout import PhysicalCacheLayout
+
+        storage = spec.storage_block_size
+        minimum = glm5_indexer_page_alignment(current_platform.get_device_capability())
+        if storage % minimum:
+            raise ValueError(f"GLM5 indexer storage {storage} must align to {minimum}")
+        page = 64 if storage % 64 == 0 else 32
+        return PhysicalCacheLayout(spec.block_size, storage, page)
+
+
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
+    def get_attn_backend(self):
+        return Glm5NextIndexerAttentionBackend
+
     def __init__(self, *, index_kpool: int, **kwargs) -> None:
         super().__init__(**kwargs)
         assert index_kpool > 1
@@ -281,13 +307,7 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MLAAttentionSpec)
         spec = replace(spec, compress_ratio=self.index_kpool)
-        storage_block_size = spec.block_size // self.index_kpool
-        assert (
-            spec.block_size % self.index_kpool == 0 and storage_block_size % 32 == 0
-        ), (
-            "GLM5-Next kpool requires logical block_size to be a multiple of "
-            f"index_kpool*32 ({self.index_kpool * 32}); got {spec.block_size}."
-        )
+        Glm5NextIndexerAttentionBackend.get_physical_cache_layout(spec)
         return spec
 
 

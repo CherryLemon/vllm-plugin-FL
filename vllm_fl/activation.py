@@ -28,6 +28,7 @@ from __future__ import annotations
 import inspect
 import logging
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -49,6 +50,8 @@ __all__ = [
     "merge_per_op_defaults",
     "preflight_activation_config",
     "preflight_patches",
+    "patch_inventory",
+    "temporary_patches",
     "register_plan_provider",
     "reset_activation_for_tests",
     "resolve_model_plan",
@@ -129,6 +132,7 @@ class PendingPatch:
     # identity must be compared through ``__func__``).
     get_current: Callable[[], Any] | None = None
     undo: Callable[[], None] | None = None
+    phase: str = "worker"
 
     def current(self) -> Any:
         if self.get_current is not None:
@@ -150,6 +154,7 @@ class _PatchRecord:
     installed: Any
     version: str
     signature: str
+    phase: str = "worker"
 
 
 _patch_records: dict[str, _PatchRecord] = {}
@@ -176,8 +181,7 @@ def _check_signature(patch: PendingPatch) -> None:
         return
     if not callable(patch.replacement):
         raise ActivationConflict(
-            f"Patch {patch.target!r} replacement is not callable: "
-            f"{patch.replacement!r}"
+            f"Patch {patch.target!r} replacement is not callable: {patch.replacement!r}"
         )
     try:
         parameters = inspect.signature(patch.replacement).parameters
@@ -265,6 +269,7 @@ def bind_patches(patches: Iterable[PendingPatch]) -> int:
                     installed=patch.current(),
                     version=_vllm_version(),
                     signature=_signature_text(patch.replacement),
+                    phase=patch.phase,
                 )
         except Exception:
             for patch in reversed(applied):
@@ -273,6 +278,36 @@ def bind_patches(patches: Iterable[PendingPatch]) -> int:
             logger.exception("Rolled back %d partial patch(es)", len(applied))
             raise
     return len(to_apply)
+
+
+def patch_inventory() -> list[dict[str, str]]:
+    """Serializable ownership for registration, construction and worker hooks."""
+    with _patch_lock:
+        return [
+            {
+                key: getattr(record, key)
+                for key in ("target", "fingerprint", "phase", "version", "signature")
+            }
+            for record in _patch_records.values()
+        ]
+
+
+@contextmanager
+def temporary_patches(patches: Iterable[PendingPatch]):
+    """Use the same conflict checks and rollback for constructor-only hooks.
+
+    These process-global hooks are serialized with other patch transactions;
+    callers must use them only during single-model worker construction.
+    """
+    with _patch_lock:
+        pending = preflight_patches(patches)
+        bind_patches(pending)
+        try:
+            yield
+        finally:
+            for patch in reversed(pending):
+                patch.restore()
+                _patch_records.pop(patch.target, None)
 
 
 # Backwards-compatible single-patch helper.
@@ -327,7 +362,9 @@ _plan_providers: list[Callable[[Any], ActivationPlan | None]] = []
 # been initialized for a model, so a later request for a *different* model
 # (including one that does need a plan) is rejected instead of being allowed to
 # apply process-global patches on top of a plain model.
-_EMPTY_PLAN = ActivationPlan(name="<no-plan>", fingerprint="<no-plan>", apply=lambda: None)
+_EMPTY_PLAN = ActivationPlan(
+    name="<no-plan>", fingerprint="<no-plan>", apply=lambda: None
+)
 
 
 def register_plan_provider(
@@ -544,13 +581,15 @@ def validate_plan_capability(
 
 
 def reset_activation_for_tests() -> None:
-    """Clear all activation state (test-only)."""
+    """Clear worker activation state; retain process bootstrap ownership (test-only)."""
     global _active_plan
     with _plan_lock:
         _active_plan = None
         _plan_providers.clear()
     with _patch_lock:
-        _patch_records.clear()
+        for target, record in list(_patch_records.items()):
+            if record.phase != "engine/config":
+                del _patch_records[target]
 
 
 # ---------------------------------------------------------------------------

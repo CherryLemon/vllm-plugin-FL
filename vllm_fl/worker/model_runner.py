@@ -7281,28 +7281,21 @@ class ModelRunnerFL(
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        # Compressed index caches are addressed in storage
-                        # entries, not logical token slots. DeepGEMM accepts
-                        # 32/64-entry pages; split only the compressed storage
-                        # block and never multiply by logical block_size.
-                        storage_block_size = kv_cache_spec.storage_block_size
-                        shape_block_size = (
-                            64
-                            if storage_block_size % 64 == 0
-                            else 32
-                        )
-                        assert storage_block_size % shape_block_size == 0
-                        num_blocks_per_kv_block = (
-                            storage_block_size // shape_block_size
-                        )
-                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
+                    layout = get_physical_cache_layout(attn_backend, kv_cache_spec)
+                    if layout is not None:
+                        num_blocks_per_kv_block = layout.pages_per_block
+                        shape_block_size = layout.kernel_block_size
                     else:
                         num_blocks_per_kv_block = (
                             kv_cache_spec.block_size // kernel_block_size
                         )
-                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-                        shape_block_size = kernel_block_size
+                        shape_block_size = (
+                            kv_cache_spec.storage_block_size
+                            if kv_cache_spec.storage_block_size != kv_cache_spec.block_size
+                            else kernel_block_size
+                        )
+                    kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
@@ -7342,7 +7335,8 @@ class ModelRunnerFL(
                     # so flattened kernel block ids retain a constant stride.
                     reshape_spec = kv_cache_spec
                     if (
-                        packing is None
+                        layout is not None
+                        and packing is None
                         and kv_cache_spec.page_size_padded is not None
                         and num_blocks_per_kv_block > 1
                     ):
@@ -7353,7 +7347,7 @@ class ModelRunnerFL(
                         )
                         reshape_spec = replace(
                             kv_cache_spec,
-                            block_size=kernel_block_size,
+                            block_size=layout.metadata_block_size,
                             page_size_padded=(
                                 kv_cache_spec.page_size_bytes
                                 // num_blocks_per_kv_block

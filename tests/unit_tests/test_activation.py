@@ -98,7 +98,9 @@ def test_activate_invalidates_cached_policy(monkeypatch):
 
     activate(
         ActivationPlan(
-            name="policy", fingerprint="policy@1", apply=lambda: None,
+            name="policy",
+            fingerprint="policy@1",
+            apply=lambda: None,
             moe_defaults=_defaults(),
         )
     )
@@ -164,6 +166,7 @@ def test_install_patch_refuses_foreign_modification():
 
 def test_bind_patches_preflight_aborts_without_side_effect():
     """Finding 4: a late preflight failure must leave earlier targets pristine."""
+
     class A:
         x = "a"
 
@@ -186,7 +189,12 @@ def test_bind_patches_validates_signature():
 
     pristine = A.f
     patch = PendingPatch(
-        "A.f", A, "f", (lambda: None), "fp", pristine=pristine,
+        "A.f",
+        A,
+        "f",
+        (lambda: None),
+        "fp",
+        pristine=pristine,
         expected_params=("self", "x"),
     )
     with pytest.raises(ActivationConflict, match="does not accept"):
@@ -384,7 +392,9 @@ def test_activate_preserves_explicit_policy(monkeypatch):
     try:
         activate(
             ActivationPlan(
-                name="policy", fingerprint="policy@1", apply=lambda: None,
+                name="policy",
+                fingerprint="policy@1",
+                apply=lambda: None,
                 moe_defaults=_defaults(),
             )
         )
@@ -395,3 +405,29 @@ def test_activate_preserves_explicit_policy(monkeypatch):
         assert policy.get_per_op_order("moe_align_block_size") == ["reference"]
     finally:
         manager.reset_global_policy()
+
+
+def test_constructor_patch_transaction_restores_on_failure():
+    from vllm_fl.activation import patch_inventory, temporary_patches
+
+    owner = SimpleNamespace(capability=lambda: False)
+    original = owner.capability
+    patch = PendingPatch(
+        target="test.constructor.capability",
+        owner=owner,
+        attr="capability",
+        replacement=lambda: True,
+        pristine=original,
+        fingerprint="glm-test",
+        phase="construction",
+    )
+    with pytest.raises(RuntimeError, match="constructor failed"):
+        with temporary_patches([patch]):
+            assert owner.capability() is True
+            assert any(
+                p["target"] == patch.target and p["phase"] == "construction"
+                for p in patch_inventory()
+            )
+            raise RuntimeError("constructor failed")
+    assert owner.capability is original
+    assert not any(p["target"] == patch.target for p in patch_inventory())

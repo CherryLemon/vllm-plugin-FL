@@ -23,7 +23,6 @@ from vllm_fl.activation import (
     PendingPatch,
     bind_patches,
     merge_per_op_defaults,
-    preflight_patches,
     register_plan_provider,
 )
 from vllm_fl.dispatch.policy import SelectionPolicy
@@ -77,12 +76,10 @@ def glm5_portable_moe_defaults() -> MoEDispatchDefaults:
     return MoEDispatchDefaults(
         whitelist_ops=portable_ops,
         per_op_order=tuple(
-            (op_name, order)
-            for op_name, order in zip(portable_ops, portable_order)
+            (op_name, order) for op_name, order in zip(portable_ops, portable_order)
         ),
         required_impls=tuple(
-            (op_name, order)
-            for op_name, order in zip(portable_ops, portable_order)
+            (op_name, order) for op_name, order in zip(portable_ops, portable_order)
         ),
     )
 
@@ -136,20 +133,14 @@ def _concat_and_cache_mla_bf16_fallback(
             "GLM5-Next portable concat_and_cache_mla only supports BF16 KV "
             f"cache, got {kv_cache_dtype!r}"
         )
-    source = (
-        kv_c
-        if k_pe.shape[-1] == 0
-        else torch.cat((kv_c, k_pe), dim=-1)
-    )
+    source = kv_c if k_pe.shape[-1] == 0 else torch.cat((kv_c, k_pe), dim=-1)
     slots = slot_mapping.flatten().to(torch.int64)
     valid = slots >= 0
     cache_flat = kv_cache.view(-1, kv_cache.shape[-1])
     cache_flat[slots[valid]] = source[valid]
 
 
-def _install_mla_boundary_compat_ops(
-    custom_ops: ModuleType | None = None,
-) -> bool:
+def _mla_boundary_patches(custom_ops, fingerprint) -> list[PendingPatch]:
     """Keep vendor sparse MLA while filling its optional vLLM ABI edges.
 
     Vendor backends remain responsible for the actual sparse attention.  The
@@ -159,7 +150,21 @@ def _install_mla_boundary_compat_ops(
     if custom_ops is None:
         from vllm import _custom_ops as custom_ops
 
-    installed = False
+    patches = []
+
+    def stage(attr, replacement):
+        patches.append(
+            PendingPatch(
+                target=f"{custom_ops.__name__}.{attr}",
+                owner=custom_ops,
+                attr=attr,
+                replacement=replacement,
+                pristine=getattr(custom_ops, attr),
+                fingerprint=fingerprint,
+                phase="worker",
+            )
+        )
+
     strict_flaggems = get_glm5_provider() == "flaggems"
 
     concat_mla_q = custom_ops.concat_mla_q
@@ -182,8 +187,7 @@ def _install_mla_boundary_compat_ops(
 
         concat_mla_q_nope._glm5_next_nope_fix = True
         concat_mla_q_nope._glm5_next_original = concat_mla_q
-        custom_ops.concat_mla_q = concat_mla_q_nope
-        installed = True
+        stage("concat_mla_q", concat_mla_q_nope)
 
     concat_and_cache_mla = custom_ops.concat_and_cache_mla
     if not _has_vllm_cache_op("concat_and_cache_mla") and not getattr(
@@ -242,9 +246,7 @@ def _install_mla_boundary_compat_ops(
                 # is propagated instead of retried against the Torch fallback
                 # (which would double-write or corrupt the KV cache).
                 flag_cache_dtype = (
-                    "auto"
-                    if kv_cache_dtype == "bfloat16"
-                    else kv_cache_dtype
+                    "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype
                 )
                 return flaggems_cache_writer(
                     kv_c,
@@ -265,13 +267,16 @@ def _install_mla_boundary_compat_ops(
             )
 
         concat_and_cache_mla_vendor_first._glm5_next_vendor_fallback = True
-        concat_and_cache_mla_vendor_first._glm5_next_original = (
-            concat_and_cache_mla
-        )
-        custom_ops.concat_and_cache_mla = concat_and_cache_mla_vendor_first
-        installed = True
+        concat_and_cache_mla_vendor_first._glm5_next_original = concat_and_cache_mla
+        stage("concat_and_cache_mla", concat_and_cache_mla_vendor_first)
 
-    return installed
+    return patches
+
+
+def _install_mla_boundary_compat_ops(custom_ops: ModuleType | None = None) -> bool:
+    if custom_ops is None:
+        from vllm import _custom_ops as custom_ops
+    return bool(bind_patches(_mla_boundary_patches(custom_ops, _glm5_fingerprint())))
 
 
 def _silu_and_mul_with_clamp_oot(self, x: torch.Tensor) -> torch.Tensor:
@@ -284,9 +289,7 @@ def _silu_and_mul_with_clamp_oot(self, x: torch.Tensor) -> torch.Tensor:
             silu_and_mul_with_clamp,
         )
 
-        return silu_and_mul_with_clamp(
-            x[..., :dim], x[..., dim:], self.swiglu_limit
-        )
+        return silu_and_mul_with_clamp(x[..., :dim], x[..., dim:], self.swiglu_limit)
     except (ImportError, OSError, NotImplementedError, RuntimeError):
         return self.forward_native(x)
 
@@ -303,9 +306,7 @@ def _mhc_rms_norm(
     inv_rms = torch.rsqrt(
         layer_input_fp32.square().mean(dim=-1, keepdim=True) + norm_eps
     )
-    return (layer_input_fp32 * inv_rms * norm_weight.float()).to(
-        layer_input.dtype
-    )
+    return (layer_input_fp32 * inv_rms * norm_weight.float()).to(layer_input.dtype)
 
 
 def _mhc_pre_oot_with_norm(
@@ -443,14 +444,10 @@ def _mhc_post_oot_bounded_cuda(self, x, residual, *args, **kwargs):
     return self.forward_native(x, residual, *args, **kwargs)
 
 
-def _mhc_fused_post_pre_oot_bounded_cuda(
-    self, x, residual, *args, **kwargs
-):
+def _mhc_fused_post_pre_oot_bounded_cuda(self, x, residual, *args, **kwargs):
     if x.shape[0] <= _MHC_CUDA_MAX_TOKENS:
         return self.forward_cuda(x, residual, *args, **kwargs)
-    return _mhc_fused_post_pre_oot_with_norm(
-        self, x, residual, *args, **kwargs
-    )
+    return _mhc_fused_post_pre_oot_with_norm(self, x, residual, *args, **kwargs)
 
 
 class Glm5NextModelArchConfigConvertor(ModelArchConfigConvertorBase):
@@ -539,24 +536,11 @@ def _capture_baselines() -> None:
         )
     except Exception:  # pragma: no cover
         logger.debug("Could not capture SiluAndMulWithClamp baseline", exc_info=True)
-    try:
-        from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
-
-        _BASELINES[_INDEXER_TARGET] = (
-            DeepseekV32IndexerBackend.indexes_kv_by_block_stride.__func__
-        )
-    except Exception:  # pragma: no cover
-        logger.debug("Could not capture indexer baseline", exc_info=True)
 
 
 def _attr_target(owner, attr: str) -> str:
     return f"{owner.__module__}.{owner.__name__}.{attr}"
 
-
-_INDEXER_TARGET = (
-    "vllm.v1.attention.backends.mla.indexer."
-    "DeepseekV32IndexerBackend.indexes_kv_by_block_stride"
-)
 
 _capture_baselines()
 
@@ -614,9 +598,7 @@ def _is_glm5_model(vllm_config) -> bool:
         or getattr(hf_config, "architectures", None)
         or ()
     )
-    return any(
-        arch in (_CAUSAL_ARCH, _CONDITIONAL_ARCH) for arch in architectures
-    )
+    return any(arch in (_CAUSAL_ARCH, _CONDITIONAL_ARCH) for arch in architectures)
 
 
 def validate_glm5_config(vllm_config) -> None:
@@ -625,6 +607,9 @@ def validate_glm5_config(vllm_config) -> None:
     Run both before hybrid config adaptation and after vLLM resolves the final
     configuration. Constructors also use this guard for direct model callers.
     """
+    # Model selection has already matched GLM here; registration must never
+    # validate a model-specific environment variable.
+    get_glm5_provider()
     parallel = getattr(vllm_config, "parallel_config", None)
     if getattr(parallel, "pipeline_parallel_size", 1) != 1:
         raise ModelPolicyError(
@@ -681,9 +666,7 @@ def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
     flaggems_backend = FlagGemsBackend()
     if not flaggems_backend.is_available():
         if provider == "flaggems":
-            raise RuntimeError(
-                "VLLM_FL_GLM5_PROVIDER=flaggems requires FlagGems"
-            )
+            raise RuntimeError("VLLM_FL_GLM5_PROVIDER=flaggems requires FlagGems")
         raise RuntimeError(
             "GLM5 auto provider selected a portable MLA backend because the "
             "NVIDIA ABI/DeepGEMM is unavailable, but FlagGems is not installed"
@@ -765,39 +748,13 @@ def _mhc_patches(fingerprint: str) -> list[PendingPatch]:
     ]
 
 
-def _indexer_patch(fingerprint: str) -> PendingPatch:
-    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
-
-    pristine = _BASELINES.get(_INDEXER_TARGET)
-    get_current = lambda: (  # noqa: E731 - small local accessor
-        DeepseekV32IndexerBackend.indexes_kv_by_block_stride.__func__
-    )
-    if pristine is None:  # pragma: no cover - baseline import failed
-        pristine = get_current()
-    replacement = classmethod(lambda cls: True)
-    return PendingPatch(
-        target=_INDEXER_TARGET,
-        owner=DeepseekV32IndexerBackend,
-        attr="indexes_kv_by_block_stride",
-        replacement=replacement,
-        fingerprint=fingerprint,
-        pristine=pristine,
-        get_current=get_current,
-        undo=lambda: setattr(
-            DeepseekV32IndexerBackend,
-            "indexes_kv_by_block_stride",
-            classmethod(pristine),
-        ),
-    )
-
-
 def _apply_glm5_activation() -> None:
     """Model-scoped side effects, run before the GLM model is constructed.
 
     Everything here used to run at plugin registration for every model in the
     process.  Binding it to the GLM activation plan means a non-GLM model keeps
     the generic vLLM classes and dispatch untouched.  All patches are preflighted
-    and applied as one group; the MLA boundary wrappers are snapshotted so a
+    and applied as one group, including the MLA boundary wrappers, so a
     failure rolls back every side effect of this activation.
     """
     fingerprint = _glm5_fingerprint()
@@ -813,13 +770,6 @@ def _apply_glm5_activation() -> None:
     if current_platform.is_out_of_tree():
         patches.extend(_mhc_patches(fingerprint))
 
-    # The indexer cache is [num_blocks, block_size, head_bytes] and its CUDA
-    # insertion/top-k paths read kv_cache.stride(0).  It therefore supports the
-    # padded physical page view already implemented by vLLM 0.24, even though
-    # the backend conservatively reports False.  Opt in only to block-stride
-    # indexing; this does not enable cross-layer cache sharing.
-    patches.append(_indexer_patch(fingerprint))
-
     # Worker-side kpool layout patches.  These used to be installed at plugin
     # registration for every model; the config-time and registry hooks stay
     # there because vLLM needs them before the worker exists, but the metadata
@@ -832,24 +782,8 @@ def _apply_glm5_activation() -> None:
 
     from vllm import _custom_ops as custom_ops
 
-    boundary_targets = ("concat_mla_q", "concat_and_cache_mla")
-    snapshot = {
-        name: getattr(custom_ops, name)
-        for name in boundary_targets
-        if hasattr(custom_ops, name)
-    }
-
-    try:
-        # Preflight every class patch before touching the boundary wrappers, so
-        # a conflict aborts with no side effect at all.  Then install the
-        # boundary wrappers, then the class patches; any failure restores both.
-        preflight_patches(patches)
-        _install_mla_boundary_compat_ops(custom_ops)
-        bind_patches(patches)
-    except Exception:
-        for name, original in snapshot.items():
-            setattr(custom_ops, name, original)
-        raise
+    patches.extend(_mla_boundary_patches(custom_ops, fingerprint))
+    bind_patches(patches)
 
 
 def _glm5_plan_provider(vllm_config) -> ActivationPlan | None:
@@ -881,6 +815,27 @@ def _glm5_runtime_plan(vllm_config, device_caps, user_policy):
             deny_vendors=set(base.deny_vendors) or None,
             allow_vendors=set(base.allow_vendors) if base.allow_vendors else None,
         )
+
+    # Publish the provider's defaults in the same policy consumed by private
+    # indexer bindings. Explicit per-op user choices keep precedence.
+    from vllm_fl.kernels.glm5_next.provider import INDEXER_OPERATORS
+
+    order = (
+        ("vendor:cuda", "flagos", "reference")
+        if use_nvidia_reference()
+        else ("flagos", "reference")
+    )
+    if policy.prefer != "flagos":
+        order = policy.get_default_order()
+    merged = {name: list(order) for name in INDEXER_OPERATORS}
+    merged.update(policy.per_op_order_dict)
+    policy = SelectionPolicy.from_dict(
+        prefer=policy.prefer,
+        strict=policy.strict,
+        per_op_order=merged,
+        deny_vendors=set(policy.deny_vendors),
+        allow_vendors=set(policy.allow_vendors) if policy.allow_vendors else None,
+    )
 
     # GLM5's attention backend depends on the per-layer selector context
     # (``use_mla`` / ``use_sparse``), so it stays on the activation plan's lazy
@@ -928,9 +883,7 @@ def _register_glm5_next_registrations() -> None:
     model_registry._TEXT_GENERATION_MODELS.setdefault(
         _CAUSAL_ARCH, ("glm5_next", _CAUSAL_ARCH)
     )
-    model_registry._VLLM_MODELS.setdefault(
-        _CAUSAL_ARCH, ("glm5_next", _CAUSAL_ARCH)
-    )
+    model_registry._VLLM_MODELS.setdefault(_CAUSAL_ARCH, ("glm5_next", _CAUSAL_ARCH))
     model_registry.ModelRegistry.register_model(
         _CAUSAL_ARCH,
         f"vllm_fl.models.glm5_next:{_CAUSAL_ARCH}",
@@ -944,8 +897,7 @@ def _register_glm5_next_registrations() -> None:
     )
     model_registry.ModelRegistry.register_model(
         _CONDITIONAL_ARCH,
-        "vllm_fl.models.glm5_next_multimodal:"
-        f"{_CONDITIONAL_ARCH}",
+        f"vllm_fl.models.glm5_next_multimodal:{_CONDITIONAL_ARCH}",
     )
 
 
@@ -974,8 +926,7 @@ def apply_glm5_next_v024_patches() -> bool:
 
     logger.info(
         "Registered vLLM 0.24 GLM5-Next text/VLM runtime with bounded KDA "
-        "gate, kpool, ViT data parallelism, and provider=%s",
-        get_glm5_provider(),
+        "gate, kpool, and ViT data parallelism"
     )
     return True
 

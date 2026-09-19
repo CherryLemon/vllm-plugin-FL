@@ -11,6 +11,15 @@ from vllm_fl.patches import glm5_next_v024 as glm5_patch
 _install_mla_boundary_compat_ops = glm5_patch._install_mla_boundary_compat_ops
 
 
+@pytest.fixture(autouse=True)
+def clean_worker_patch_records():
+    from vllm_fl.activation import reset_activation_for_tests
+
+    reset_activation_for_tests()
+    yield
+    reset_activation_for_tests()
+
+
 def _fake_ops(*, cache_impl):
     module = ModuleType("fake_vllm_custom_ops")
 
@@ -129,7 +138,9 @@ def test_flaggems_writer_failure_after_write_is_not_retried(monkeypatch) -> None
         raise RuntimeError("writer failed after writing")
 
     fake_module.concat_and_cache_mla = writer
-    monkeypatch.setitem(sys.modules, "flag_gems.fused.concat_and_cache_mla", fake_module)
+    monkeypatch.setitem(
+        sys.modules, "flag_gems.fused.concat_and_cache_mla", fake_module
+    )
 
     ops = _fake_ops(cache_impl=missing_vendor_cache)
     _install_mla_boundary_compat_ops(ops)

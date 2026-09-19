@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from . import portable
-from .provider import get_glm5_provider, use_nvidia_reference
+from .provider import use_nvidia_reference
 
 logger = init_logger(__name__)
 
@@ -94,9 +94,7 @@ def _graph_safe_flaggems_paged_mqa_logits(
         block_tables_expanded = block_tables.contiguous().to(torch.int32)
 
     query = q_values.reshape(total_rows, num_heads, head_dim).contiguous()
-    query_bytes = query.view(torch.uint8).reshape(
-        total_rows, num_heads * head_dim
-    )
+    query_bytes = query.view(torch.uint8).reshape(total_rows, num_heads * head_dim)
     logits = torch.full(
         (total_rows, max_model_len),
         float("-inf") if clean_logits else 0.0,
@@ -134,6 +132,51 @@ def _graph_safe_flaggems_paged_mqa_logits(
     return logits
 
 
+_TLE_PATCHES = {}
+
+
+def _bind_tle_compat(loaded):
+    from vllm_fl.activation import PendingPatch, bind_patches
+
+    key = loaded.__name__
+    if key in _TLE_PATCHES:
+        bind_patches(_TLE_PATCHES[key])
+        return
+    tle = getattr(loaded, "tle", None)
+    if not getattr(loaded, "HAS_TLE", False) or tle is None:
+        return
+    if hasattr(tle, "cumsum") and not getattr(tle, "_vllm_fl_cumsum_compat", False):
+        return
+    patches = []
+
+    def stage(owner, attr, value):
+        existed = hasattr(owner, attr)
+        original = getattr(owner, attr, None)
+        patches.append(
+            PendingPatch(
+                target=f"{owner.__name__}.{attr}",
+                owner=owner,
+                attr=attr,
+                replacement=value,
+                pristine=original,
+                get_current=lambda: getattr(owner, attr, None),
+                undo=lambda: (
+                    setattr(owner, attr, original) if existed else delattr(owner, attr)
+                ),
+                fingerprint="glm5.flaggems.tle-cumsum",
+                phase="operator binding",
+            )
+        )
+
+    stage(loaded, "HAS_TLE", False)
+    if not hasattr(tle, "cumsum"):
+        stage(tle, "cumsum", loaded.tl.cumsum)
+        stage(tle, "_vllm_fl_cumsum_compat", True)
+    bind_patches(patches)
+    _TLE_PATCHES[key] = patches
+    logger.warning_once("GLM5 FlagGems top-k: bound tracked non-TLE compatibility")
+
+
 def _load_flaggems_op(module: str, name: str) -> Callable | None:
     try:
         loaded = importlib.import_module(f"flag_gems.fused.{module}")
@@ -145,20 +188,7 @@ def _load_flaggems_op(module: str, name: str) -> Callable | None:
         # dependency scanner still resolves the dead TLE branch while hashing
         # the shared JIT helper, so provide the standard tl.cumsum symbol too.
         if module in {"top_k_per_row_prefill", "top_k_per_row_decode"}:
-            tle = getattr(loaded, "tle", None)
-            compat_cumsum = getattr(tle, "_vllm_fl_cumsum_compat", False)
-            if getattr(loaded, "HAS_TLE", False) and (
-                compat_cumsum or not hasattr(tle, "cumsum")
-            ):
-                loaded.HAS_TLE = False
-                if not hasattr(tle, "cumsum"):
-                    setattr(tle, "cumsum", loaded.tl.cumsum)
-                    setattr(tle, "_vllm_fl_cumsum_compat", True)
-                logger.warning_once(
-                    "FlagGems %s TLE path requires tle.cumsum; using its "
-                    "non-TLE Triton kernel for GLM5-Next",
-                    name,
-                )
+            _bind_tle_compat(loaded)
         function = getattr(loaded, name)
         if module == "fp8_fp4_paged_mqa_logits" and current_platform.is_cuda():
             required = ("_mqa_logits_kernel", "_select_block_kv", "triton")
@@ -229,9 +259,7 @@ def _torch_indexer_k_quant_and_cache(
     scales = absmax / fp8_max
     if scale_fmt is not None:
         scales = torch.pow(2.0, torch.ceil(torch.log2(scales)))
-    quantized = (blocks / scales.unsqueeze(-1)).clamp(
-        -fp8_max, fp8_max
-    )
+    quantized = (blocks / scales.unsqueeze(-1)).clamp(-fp8_max, fp8_max)
     try:
         quantized = quantized.reshape(num_tokens, head_dim).to(fp8_dtype)
     except RuntimeError as exc:
@@ -263,14 +291,14 @@ def _torch_cp_gather_indexer_k_quant_cache(
         length = end - start
         num_pages = (length + page_size - 1) // page_size
         physical = block_table[request, :num_pages].to(torch.int64)
-        gathered_values = values.index_select(0, physical).reshape(-1, head_dim)[:length]
+        gathered_values = values.index_select(0, physical).reshape(-1, head_dim)[
+            :length
+        ]
         gathered_scales = scales.index_select(0, physical).reshape(
             -1, scales.shape[-1]
         )[:length]
         k_fp8[cursor : cursor + length].view(torch.uint8).copy_(gathered_values)
-        k_fp8_scale[cursor : cursor + length].view(torch.float32).copy_(
-            gathered_scales
-        )
+        k_fp8_scale[cursor : cursor + length].view(torch.float32).copy_(gathered_scales)
         cursor += length
 
 
@@ -371,9 +399,7 @@ def _torch_paged_mqa_logits(
         request_logits = scores.sum(dim=0)
         columns = torch.arange(max_len, device=q_values.device).unsqueeze(0)
         request_logits.masked_fill_(columns >= limits.reshape(-1, 1), float("-inf"))
-        logits[
-            request * next_n : (request + 1) * next_n, :max_len
-        ] = request_logits
+        logits[request * next_n : (request + 1) * next_n, :max_len] = request_logits
     return logits
 
 
@@ -430,102 +456,134 @@ def _torch_unpack_seq(tensor: torch.Tensor, lengths: torch.Tensor) -> torch.Tens
 
 
 class Glm5NextIndexerBackend:
-    """Per-op provider selection with a stable NVIDIA reference path."""
+    """GLM implementations selected by the published common dispatch policy."""
 
     def __init__(self) -> None:
-        self.is_nvidia = use_nvidia_reference()
-        # kpool has no FlagGems equivalent yet.  When H100 explicitly forces
-        # the FlagGems A/B path, retain the plugin's reference Triton kpool
-        # rather than replacing it with the intentionally slow PyTorch
-        # bring-up fallback.  Real non-NVIDIA platforms still use portable.
-        self.use_nvidia_kpool = current_platform.is_cuda()
-        self._flag_ops: dict[str, Callable | None] = {}
-        self._provider_logged: set[str] = set()
-        if self.is_nvidia:
-            self.name = "nvidia-reference"
-        else:
-            probe = _load_flaggems_op(
-                "indexer_k_quant_and_cache", "indexer_k_quant_and_cache"
-            )
-            self._flag_ops["indexer_k_quant_and_cache"] = probe
-            self.name = "flaggems" if probe is not None else "torch-portable"
-        logger.info_once(
-            "GLM5-Next provider override=%s, indexer provider=%s",
-            get_glm5_provider(),
-            self.name,
-        )
+        from vllm_fl.dispatch.manager import OpManager
 
-    def _flag(self, module: str, name: str) -> Callable | None:
+        self.is_nvidia = use_nvidia_reference()
+        self.use_nvidia_kpool = current_platform.is_cuda()
+        self._flag_ops = {}
+        self._bindings = {}
+        self._manager = OpManager()
+        self.name = "common-policy"
+
+    def _flag(self, module, name):
+        from vllm_fl.utils import use_flaggems_op
+
+        if not use_flaggems_op(name):
+            return None
         if name not in self._flag_ops:
-            self._flag_ops[name] = _load_flaggems_op(module, name)
-        fn = self._flag_ops[name]
-        if name not in self._provider_logged:
-            logger.info(
-                "GLM5-Next op %s provider: %s",
-                name,
-                "FlagGems" if fn is not None else "PyTorch correctness fallback",
+            loader = (
+                _load_flaggems_ops_op
+                if module == "per_token_group_quant_fp8"
+                else _load_flaggems_op
             )
-            self._provider_logged.add(name)
-        return fn
+            self._flag_ops[name] = loader(module, name)
+        return self._flag_ops[name]
 
     def _call_flag(
         self,
-        name: str,
-        fn: Callable | None,
-        fallback: Callable,
+        name,
+        fn,
+        fallback,
         *args,
+        native=None,
+        native_available=None,
+        graph=False,
+        _preflight=False,
         **kwargs,
     ):
-        if fn is not None:
-            try:
-                return fn(*args, **kwargs)
-            except (NotImplementedError, RuntimeError) as exc:
-                logger.warning(
-                    "FlagGems op %s rejected this GLM5-Next workload; "
-                    "using the PyTorch correctness fallback: %s",
-                    name,
-                    exc,
+        from vllm_fl.dispatch.binding import OperatorBinding
+        from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+        from vllm_fl.utils import use_flaggems_op
+
+        if name not in self._bindings:
+            implementations = []
+            if fn is not None:
+
+                def flag(*a, **k):
+                    if name == "per_token_group_quant_fp8":
+                        k["scale_ue8m0"] = k.pop("use_ue8m0", False)
+                    return fn(*a, **k)
+
+                flag._is_available = lambda: use_flaggems_op(name)
+                implementations.append(
+                    OpImpl(name, "glm5.flaggems", BackendImplKind.DEFAULT, flag)
                 )
-        return fallback(*args, **kwargs)
-
-    def per_token_group_quant_fp8(self, *args, **kwargs):
-        if self.is_nvidia:
-            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-                per_token_group_quant_fp8,
-            )
-
-            return per_token_group_quant_fp8(*args, **kwargs)
-        name = "per_token_group_quant_fp8"
-        if name not in self._flag_ops:
-            self._flag_ops[name] = _load_flaggems_ops_op(name, name)
-        fn = self._flag_ops[name]
-        if name not in self._provider_logged:
-            logger.info(
-                "GLM5-Next op %s provider: %s",
+            if native is not None:
+                native._is_available = native_available or (lambda: self.is_nvidia)
+                implementations.append(
+                    OpImpl(
+                        name, "glm5.cuda", BackendImplKind.VENDOR, native, vendor="cuda"
+                    )
+                )
+            if fallback is not None:
+                implementations.append(
+                    OpImpl(name, "glm5.torch", BackendImplKind.REFERENCE, fallback)
+                )
+            self._manager.registry.register_many(implementations)
+            self._manager.bump_policy_epoch()
+            self._bindings[name] = OperatorBinding(
+                self._manager,
                 name,
-                "FlagGems" if fn is not None else "PyTorch correctness fallback",
+                graph_capabilities={"glm5.flaggems": graph, "glm5.torch": False},
             )
-            self._provider_logged.add(name)
-        if fn is not None:
-            flag_kwargs = dict(kwargs)
-            flag_kwargs["scale_ue8m0"] = flag_kwargs.pop("use_ue8m0", False)
-            try:
-                return fn(*args, **flag_kwargs)
-            except (NotImplementedError, RuntimeError) as exc:
-                logger.warning(
-                    "FlagGems op %s rejected this GLM5-Next workload; "
-                    "using the PyTorch correctness fallback: %s",
-                    name,
-                    exc,
-                )
-        return _torch_per_token_group_quant_fp8(*args, **kwargs)
+        if _preflight:
+            return self._bindings[name].describe()
+        return self._bindings[name](*args, **kwargs)
 
-    def fwht128_quant_fp8(self, q: torch.Tensor):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import fwht128_quant_fp8
+    def _run(self, name, module, fallback, native_module, native_name, *args, **kwargs):
+        if name in self._bindings:
+            if kwargs.pop("_preflight", False):
+                return self._bindings[name].describe()
+            return self._bindings[name](*args, **kwargs)
+        fn = self._flag(module, name)
 
-            return fwht128_quant_fp8(q)
-        return portable.fwht128_quant_fp8(q)
+        def native(*a, **k):
+            module = (
+                torch.ops._C
+                if native_module == "torch.ops._C"
+                else importlib.import_module(native_module)
+            )
+            return getattr(module, native_name)(*a, **k)
+
+        return self._call_flag(
+            name,
+            fn,
+            fallback,
+            *args,
+            native=native,
+            graph=(name == "fp8_fp4_paged_mqa_logits" and current_platform.is_cuda()),
+            **kwargs,
+        )
+
+    def preflight(self):
+        descriptions = []
+        for method in (
+            self.per_token_group_quant_fp8,
+            self.indexer_k_quant_and_cache,
+            self.cp_gather_indexer_k_quant_cache,
+            self.mqa_logits,
+            self.paged_mqa_logits,
+        ):
+            descriptions.append(method(_preflight=True))
+        descriptions.append(self.topk_prefill(*([None] * 8), _preflight=True))
+        descriptions.append(self.topk_decode(*([None] * 8), _preflight=True))
+        descriptions.append(self.pack_seq(None, None, _preflight=True))
+        descriptions.append(self.unpack_seq(None, None, _preflight=True))
+        for method in (
+            self.fwht128_quant_fp8,
+            self.kpool_compress_and_write_cache,
+            self.kpool_decode_update_and_maybe_write_cache_batched,
+            self.kpool_seed_tail_cache,
+            self.expand_pools_to_tokens,
+            self.append_tail_to_topk,
+            self.expand_pools_and_append_tail,
+        ):
+            descriptions.append(method(_preflight=True))
+        logger.warning("GLM5-Next resolved indexer bindings: %s", descriptions)
+        return descriptions
 
     @cached_property
     def has_nvidia_deep_gemm(self) -> bool:
@@ -535,227 +593,200 @@ class Glm5NextIndexerBackend:
 
         return has_deep_gemm()
 
-    def indexer_k_quant_and_cache(self, *args, **kwargs) -> None:
-        if self.is_nvidia:
-            from vllm import _custom_ops as ops
+    def per_token_group_quant_fp8(self, *args, **kwargs):
+        return self._run(
+            "per_token_group_quant_fp8",
+            "per_token_group_quant_fp8",
+            _torch_per_token_group_quant_fp8,
+            "vllm.model_executor.layers.quantization.utils.fp8_utils",
+            "per_token_group_quant_fp8",
+            *args,
+            **kwargs,
+        )
 
-            return ops.indexer_k_quant_and_cache(*args, **kwargs)
-        fn = self._flag("indexer_k_quant_and_cache", "indexer_k_quant_and_cache")
-        return self._call_flag(
+    def indexer_k_quant_and_cache(self, *args, **kwargs):
+        return self._run(
             "indexer_k_quant_and_cache",
-            fn,
+            "indexer_k_quant_and_cache",
             _torch_indexer_k_quant_and_cache,
+            "vllm._custom_ops",
+            "indexer_k_quant_and_cache",
             *args,
             **kwargs,
         )
 
-    def cp_gather_indexer_k_quant_cache(self, *args, **kwargs) -> None:
-        if self.is_nvidia:
-            from vllm import _custom_ops as ops
-
-            return ops.cp_gather_indexer_k_quant_cache(*args, **kwargs)
-        fn = self._flag(
-            "cp_gather_indexer_k_quant_cache", "cp_gather_indexer_k_quant_cache"
-        )
-        return self._call_flag(
+    def cp_gather_indexer_k_quant_cache(self, *args, **kwargs):
+        return self._run(
             "cp_gather_indexer_k_quant_cache",
-            fn,
+            "cp_gather_indexer_k_quant_cache",
             _torch_cp_gather_indexer_k_quant_cache,
+            "vllm._custom_ops",
+            "cp_gather_indexer_k_quant_cache",
             *args,
             **kwargs,
         )
 
-    def mqa_logits(self, *args, **kwargs) -> torch.Tensor:
-        if self.is_nvidia:
-            from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
-
-            return fp8_fp4_mqa_logits(*args, **kwargs)
-        fn = self._flag("fp8_fp4_mqa_logits", "fp8_fp4_mqa_logits")
-        return self._call_flag(
-            "fp8_fp4_mqa_logits", fn, _torch_mqa_logits, *args, **kwargs
+    def mqa_logits(self, *args, **kwargs):
+        return self._run(
+            "fp8_fp4_mqa_logits",
+            "fp8_fp4_mqa_logits",
+            _torch_mqa_logits,
+            "vllm.utils.deep_gemm",
+            "fp8_fp4_mqa_logits",
+            *args,
+            **kwargs,
         )
 
-    def paged_mqa_logits(self, *args, **kwargs) -> torch.Tensor:
-        if self.is_nvidia:
-            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
-
-            return fp8_fp4_paged_mqa_logits(*args, **kwargs)
-        fn = self._flag("fp8_fp4_paged_mqa_logits", "fp8_fp4_paged_mqa_logits")
-        # A failed GPU launch invalidates CUDA graph capture, so attempting a
-        # PyTorch fallback from an exception only obscures the first error.
-        # Fall back when the FlagGems operator is absent; otherwise surface a
-        # launch error directly.
-        if fn is not None:
-            return fn(*args, **kwargs)
-        return _torch_paged_mqa_logits(*args, **kwargs)
+    def paged_mqa_logits(self, *args, **kwargs):
+        return self._run(
+            "fp8_fp4_paged_mqa_logits",
+            "fp8_fp4_paged_mqa_logits",
+            _torch_paged_mqa_logits,
+            "vllm.utils.deep_gemm",
+            "fp8_fp4_paged_mqa_logits",
+            *args,
+            **kwargs,
+        )
 
     def topk_prefill(
         self,
-        logits: torch.Tensor,
-        row_starts: torch.Tensor,
-        row_ends: torch.Tensor,
-        indices: torch.Tensor,
-        num_rows: int,
-        stride0: int,
-        stride1: int,
-        top_k: int,
-    ) -> None:
-        if self.is_nvidia:
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                row_starts,
-                row_ends,
-                indices,
-                num_rows,
-                stride0,
-                stride1,
-                top_k,
-            )
-            return
-        fn = self._flag("top_k_per_row_prefill", "top_k_per_row_prefill")
-        if fn is not None:
-            try:
-                fn(
-                    logits,
-                    row_starts,
-                    row_ends,
-                    indices,
-                    num_rows,
-                    stride0,
-                    stride1,
-                    top_k,
-                )
-                return
-            except (NotImplementedError, RuntimeError) as exc:
-                logger.warning(
-                    "FlagGems top_k_per_row_prefill rejected this workload; "
-                    "using the PyTorch correctness fallback: %s",
-                    exc,
-                )
-        indices.copy_(_torch_topk(logits, row_starts, row_ends, top_k, True))
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        top_k,
+        *,
+        _preflight=False,
+    ):
+        def fallback(logits, starts, ends, output, rows, s0, s1, k):
+            output.copy_(_torch_topk(logits, starts, ends, k, True))
+
+        return self._run(
+            "top_k_per_row_prefill",
+            "top_k_per_row_prefill",
+            fallback,
+            "torch.ops._C",
+            "top_k_per_row_prefill",
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            num_rows,
+            stride0,
+            stride1,
+            top_k,
+            _preflight=_preflight,
+        )
 
     def topk_decode(
         self,
-        logits: torch.Tensor,
-        next_n: int,
-        seq_lens: torch.Tensor,
-        indices: torch.Tensor,
-        num_rows: int,
-        stride0: int,
-        stride1: int,
-        top_k: int,
-    ) -> None:
-        if self.is_nvidia:
-            torch.ops._C.top_k_per_row_decode(
-                logits,
-                next_n,
-                seq_lens,
-                indices,
-                num_rows,
-                stride0,
-                stride1,
-                top_k,
-            )
-            return
-        fn = self._flag("top_k_per_row_decode", "top_k_per_row_decode")
-        if fn is not None:
-            try:
-                fn(
-                    logits,
-                    next_n,
-                    seq_lens,
-                    indices,
-                    num_rows,
-                    stride0,
-                    stride1,
-                    top_k,
-                )
-                return
-            except (NotImplementedError, RuntimeError) as exc:
-                logger.warning(
-                    "FlagGems top_k_per_row_decode rejected this workload; "
-                    "using the PyTorch correctness fallback: %s",
-                    exc,
-                )
-        if seq_lens.ndim == 2:
-            ends = seq_lens.reshape(-1)[:num_rows]
-        else:
-            ends = seq_lens.repeat_interleave(next_n)[:num_rows]
-        starts = torch.zeros_like(ends)
-        indices.copy_(_torch_topk(logits, starts, ends, top_k, False))
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        top_k,
+        *,
+        _preflight=False,
+    ):
+        def fallback(logits, next_n, lengths, output, rows, s0, s1, k):
+            ends = (
+                lengths.reshape(-1)
+                if lengths.ndim == 2
+                else lengths.repeat_interleave(next_n)
+            )[:rows]
+            output.copy_(_torch_topk(logits, torch.zeros_like(ends), ends, k, False))
 
-    def pack_seq(self, tensor, lengths, pad_value=-float("inf")):
-        if self.is_nvidia:
-            from vllm.v1.attention.ops.common import pack_seq_triton
+        return self._run(
+            "top_k_per_row_decode",
+            "top_k_per_row_decode",
+            fallback,
+            "torch.ops._C",
+            "top_k_per_row_decode",
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            num_rows,
+            stride0,
+            stride1,
+            top_k,
+            _preflight=_preflight,
+        )
 
-            return pack_seq_triton(tensor, lengths, pad_value=pad_value)
-        fn = self._flag("pack_seq", "pack_seq_triton")
-        return self._call_flag(
+    def pack_seq(self, tensor, lengths, pad_value=-float("inf"), *, _preflight=False):
+        return self._run(
             "pack_seq_triton",
-            fn,
+            "pack_seq",
             _torch_pack_seq,
+            "vllm.v1.attention.ops.common",
+            "pack_seq_triton",
             tensor,
             lengths,
             pad_value=pad_value,
+            _preflight=_preflight,
         )
 
-    def unpack_seq(self, tensor, lengths):
-        if self.is_nvidia:
-            from vllm.v1.attention.ops.common import unpack_seq_triton
+    def unpack_seq(self, tensor, lengths, *, _preflight=False):
+        return self._run(
+            "unpack_seq_triton",
+            "unpack_seq",
+            _torch_unpack_seq,
+            "vllm.v1.attention.ops.common",
+            "unpack_seq_triton",
+            tensor,
+            lengths,
+            _preflight=_preflight,
+        )
 
-            return unpack_seq_triton(tensor, lengths)
-        fn = self._flag("unpack_seq", "unpack_seq_triton")
+    def _kpool(self, name, *args, **kwargs):
+        if name in self._bindings:
+            if kwargs.pop("_preflight", False):
+                return self._bindings[name].describe()
+            return self._bindings[name](*args, **kwargs)
+
+        def native(*a, **k):
+            from . import kpool_compress
+
+            return getattr(kpool_compress, name)(*a, **k)
+
         return self._call_flag(
-            "unpack_seq_triton", fn, _torch_unpack_seq, tensor, lengths
+            name,
+            None,
+            getattr(portable, name),
+            *args,
+            native=native,
+            native_available=lambda: self.use_nvidia_kpool,
+            **kwargs,
         )
+
+    def fwht128_quant_fp8(self, *args, **kwargs):
+        return self._kpool("fwht128_quant_fp8", *args, **kwargs)
 
     def kpool_compress_and_write_cache(self, *args, **kwargs):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import kpool_compress_and_write_cache
-
-            return kpool_compress_and_write_cache(*args, **kwargs)
-        return portable.kpool_compress_and_write_cache(*args, **kwargs)
+        return self._kpool("kpool_compress_and_write_cache", *args, **kwargs)
 
     def kpool_decode_update_and_maybe_write_cache_batched(self, *args, **kwargs):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import (
-                kpool_decode_update_and_maybe_write_cache_batched,
-            )
-
-            return kpool_decode_update_and_maybe_write_cache_batched(*args, **kwargs)
-        return portable.kpool_decode_update_and_maybe_write_cache_batched(
-            *args, **kwargs
+        return self._kpool(
+            "kpool_decode_update_and_maybe_write_cache_batched", *args, **kwargs
         )
 
     def kpool_seed_tail_cache(self, *args, **kwargs):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import kpool_seed_tail_cache
-
-            return kpool_seed_tail_cache(*args, **kwargs)
-        return portable.kpool_seed_tail_cache(*args, **kwargs)
+        return self._kpool("kpool_seed_tail_cache", *args, **kwargs)
 
     def expand_pools_to_tokens(self, *args, **kwargs):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import expand_pools_to_tokens
-
-            return expand_pools_to_tokens(*args, **kwargs)
-        return portable.expand_pools_to_tokens(*args, **kwargs)
+        return self._kpool("expand_pools_to_tokens", *args, **kwargs)
 
     def append_tail_to_topk(self, *args, **kwargs):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import append_tail_to_topk
-
-            return append_tail_to_topk(*args, **kwargs)
-        return portable.append_tail_to_topk(*args, **kwargs)
+        return self._kpool("append_tail_to_topk", *args, **kwargs)
 
     def expand_pools_and_append_tail(self, *args, **kwargs):
-        if self.use_nvidia_kpool:
-            from .kpool_compress import expand_pools_and_append_tail
-
-            return expand_pools_and_append_tail(*args, **kwargs)
-        return portable.expand_pools_and_append_tail(*args, **kwargs)
+        return self._kpool("expand_pools_and_append_tail", *args, **kwargs)
 
 
 INDEXER_BACKEND = Glm5NextIndexerBackend()
-
-__all__ = ["Glm5NextIndexerBackend", "INDEXER_BACKEND"]

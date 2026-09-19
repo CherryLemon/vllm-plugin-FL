@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from dataclasses import replace
@@ -10,8 +11,9 @@ from functools import wraps
 
 from vllm.utils.math_utils import cdiv
 
-from vllm_fl.activation import PendingPatch
+from vllm_fl.activation import PendingPatch, bind_patches
 from vllm_fl.models.glm5_next_kpool import (
+    glm5_indexer_page_alignment,
     KpoolTailManager,
     KpoolTailSpec,
 )
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 # computing the scheduler's cache config, which can happen before the worker
 # (and therefore before any activation) exists.
 _RUNTIME_BASELINES: dict[str, object] = {}
+_EARLY_PATCHES: list[PendingPatch] | None = None
 
 
 def _inner_specs(groups):
@@ -61,7 +64,9 @@ def _group_glm5_kpool(vllm_config, kv_cache_spec):
 
     del vllm_config
     mamba_specs = {
-        name: spec for name, spec in kv_cache_spec.items() if isinstance(spec, MambaSpec)
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, MambaSpec)
     }
     tail_specs = {
         name: spec
@@ -73,11 +78,11 @@ def _group_glm5_kpool(vllm_config, kv_cache_spec):
         for name, spec in kv_cache_spec.items()
         if not isinstance(spec, (MambaSpec, KpoolTailSpec))
     }
-    assert tail_specs and all(type(spec) is MLAAttentionSpec for spec in attn_specs.values())
+    assert tail_specs and all(
+        type(spec) is MLAAttentionSpec for spec in attn_specs.values()
+    )
     index_pages = {
-        spec.page_size_bytes
-        for spec in attn_specs.values()
-        if spec.compress_ratio > 1
+        spec.page_size_bytes for spec in attn_specs.values() if spec.compress_ratio > 1
     }
     assert len(index_pages) == 1
     index_page = next(iter(index_pages))
@@ -143,7 +148,7 @@ def _runtime_patch(
 
 def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
     """Keep the compressed indexer at pool-page granularity in metadata."""
-    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
     from vllm.v1.worker import utils as worker_utils
 
     owner = worker_utils.AttentionGroup
@@ -157,11 +162,8 @@ def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
         num_metadata_builders=1,
     ):
         spec = self.kv_cache_spec
-        is_compressed = (
-            isinstance(spec, AttentionSpec)
-            and spec.storage_block_size != spec.block_size
-        )
-        if not is_compressed:
+        layout = get_physical_cache_layout(self.backend, spec)
+        if layout is None:
             return pristine(
                 self,
                 vllm_config,
@@ -170,17 +172,7 @@ def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
                 num_metadata_builders,
             )
 
-        storage_block_size = spec.storage_block_size
-        if storage_block_size <= 64:
-            compressed_kernel_size = storage_block_size
-        else:
-            compressed_kernel_size = 64 if storage_block_size % 64 == 0 else 32
-        assert compressed_kernel_size in (32, 64)
-        assert storage_block_size % compressed_kernel_size == 0
-        compress_ratio = spec.block_size // storage_block_size
-        builder_spec = spec.copy_with_new_block_size(
-            compressed_kernel_size * compress_ratio
-        )
+        builder_spec = spec.copy_with_new_block_size(layout.metadata_block_size)
         self.metadata_builders = [
             self.backend.get_builder_cls()(
                 builder_spec,
@@ -190,8 +182,9 @@ def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
             )
             for _ in range(num_metadata_builders)
         ]
-        if kernel_block_size is not None:
-            for builder in self.metadata_builders:
+        for builder in self.metadata_builders:
+            builder._glm5_physical_layout = layout
+            if kernel_block_size is not None:
                 builder.kernel_block_size = kernel_block_size
 
     return _runtime_patch(
@@ -219,15 +212,13 @@ def _indexer_build_patch(fingerprint: str) -> PendingPatch:
         spec = self.kv_cache_spec
         kernel_block_size = getattr(self, "kernel_block_size", None)
         if (
-            getattr(spec, "compress_ratio", 1) > 1
+            getattr(self, "_glm5_physical_layout", None) is not None
             and kernel_block_size is not None
             and spec.block_size != kernel_block_size
         ):
             assert spec.block_size % kernel_block_size == 0
             factor = spec.block_size // kernel_block_size
-            compressed = (
-                common_attn_metadata.block_table_tensor[:, ::factor] // factor
-            )
+            compressed = common_attn_metadata.block_table_tensor[:, ::factor] // factor
             buffer = getattr(self, "_glm5_indexer_block_table", None)
             rows, cols = compressed.shape
             if buffer is None:
@@ -270,7 +261,7 @@ def _indexer_build_patch(fingerprint: str) -> PendingPatch:
 
 def _zeroer_init_patch(fingerprint: str) -> PendingPatch:
     """Exclude compressed index pages from the page-uniform zeroing pass."""
-    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
     from vllm.v1.worker import utils as worker_utils
 
     owner = worker_utils.KVBlockZeroer
@@ -290,9 +281,8 @@ def _zeroer_init_patch(fingerprint: str) -> PendingPatch:
             group
             for group in attn_groups_iter
             if not (
-                isinstance(group.kv_cache_spec, AttentionSpec)
-                and group.kv_cache_spec.storage_block_size
-                != group.kv_cache_spec.block_size
+                get_physical_cache_layout(group.backend, group.kv_cache_spec)
+                is not None
             )
         ]
         return pristine(
@@ -339,6 +329,29 @@ def glm5_next_kpool_runtime_patches(fingerprint: str) -> list[PendingPatch]:
 
 
 def install_glm5_next_kpool_v024() -> None:
+    """Register scoped engine hooks as one owned, rollback-safe transaction."""
+    global _EARLY_PATCHES
+    if _EARLY_PATCHES is not None:
+        bind_patches(_EARLY_PATCHES)
+        return
+    patches = []
+
+    def stage(owner, attr, replacement):
+        name = getattr(owner, "__module__", "")
+        target = f"{name}.{owner.__name__}.{attr}".lstrip(".")
+        patches.append(
+            PendingPatch(
+                target=target,
+                owner=owner,
+                attr=attr,
+                replacement=replacement,
+                pristine=inspect.getattr_static(owner, attr),
+                get_current=lambda: inspect.getattr_static(owner, attr),
+                fingerprint="glm5.kpool.v024",
+                phase="engine/config",
+            )
+        )
+
     from vllm.platforms.interface import Platform
     from vllm.v1 import kv_cache_spec_registry
     from vllm.v1.attention.backends.mla import indexer as indexer_backend
@@ -351,7 +364,6 @@ def install_glm5_next_kpool_v024() -> None:
         KVCacheConfig,
         KVCacheTensor,
     )
-    from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker import utils as worker_utils
 
     # Upstream GLM5-Next rounds the hybrid attention block *after* accounting
@@ -366,7 +378,11 @@ def install_glm5_next_kpool_v024() -> None:
         def align_hybrid(cls, vllm_config, backend_cls):
             original_align(cls, vllm_config, backend_cls)
             text_config = vllm_config.model_config.hf_text_config
-            if not getattr(text_config, "index_kpool_compress", False):
+            if getattr(
+                text_config, "model_type", None
+            ) != "glm5_next_text" or not getattr(
+                text_config, "index_kpool_compress", False
+            ):
                 return
             kpool = int(getattr(text_config, "index_kpool", 1) or 1)
             if kpool <= 1:
@@ -377,9 +393,7 @@ def install_glm5_next_kpool_v024() -> None:
             # DeepGEMM accepts a 32-entry paged-MQA block only on SM100.
             # H100/SM90 therefore needs kpool*64 alignment; otherwise a
             # 384/4=96 storage block would be split into illegal 32 pages.
-            compressed_page = (
-                64 if capability is not None and capability.major < 10 else 32
-            )
+            compressed_page = glm5_indexer_page_alignment(capability)
             alignment = kpool * compressed_page
             aligned_block_size = alignment * cdiv(old_block_size, alignment)
             if aligned_block_size == old_block_size:
@@ -396,14 +410,12 @@ def install_glm5_next_kpool_v024() -> None:
                 )
 
         align_hybrid._glm5_kpool = True
-        Platform._align_hybrid_block_size = classmethod(align_hybrid)
+        stage(Platform, "_align_hybrid_block_size", classmethod(align_hybrid))
 
     # Capture the pristine worker-side callables before any activation can
     # rebind them.  The patches themselves are bound by the GLM5 plan, so a
     # plain plugin import never rewrites these classes.
-    _capture_runtime_baseline(
-        worker_utils.AttentionGroup, "create_metadata_builders"
-    )
+    _capture_runtime_baseline(worker_utils.AttentionGroup, "create_metadata_builders")
     _capture_runtime_baseline(
         indexer_backend.DeepseekV32IndexerMetadataBuilder, "build"
     )
@@ -419,21 +431,13 @@ def install_glm5_next_kpool_v024() -> None:
             original_register_all(vllm_config)
             kv_cache_spec_registry.KVCacheSpecRegistry.register(
                 KpoolTailSpec,
+                glm5_indexer_page_alignment,
                 KpoolTailManager,
                 uniform_type_base_spec=KpoolTailSpec,
             )
 
         register_all._glm5_kpool = True
-        single_type_kv_cache_manager.register_all_kvcache_specs = register_all
-
-    # Plugin loading can happen after another component has forced lazy
-    # registration. In that case add only our spec immediately.
-    if kv_cache_spec_registry._REGISTRY_KVCACHESPEC_LIST:
-        kv_cache_spec_registry.KVCacheSpecRegistry.register(
-            KpoolTailSpec,
-            KpoolTailManager,
-            uniform_type_base_spec=KpoolTailSpec,
-        )
+        stage(single_type_kv_cache_manager, "register_all_kvcache_specs", register_all)
 
     # Plugin activation can occur after vLLM has imported the manager factory
     # into kv_cache_coordinator, and on that path the lazy registry may already
@@ -441,9 +445,7 @@ def install_glm5_next_kpool_v024() -> None:
     # Explicitly route the exact tail spec here.  The native sitecustomize path
     # registers before that import; this OOT compatibility hook makes the two
     # activation orders semantically identical without editing vLLM.
-    original_get_manager = (
-        single_type_kv_cache_manager.get_manager_for_kv_cache_spec
-    )
+    original_get_manager = single_type_kv_cache_manager.get_manager_for_kv_cache_spec
     if not getattr(original_get_manager, "_glm5_kpool", False):
 
         @wraps(original_get_manager)
@@ -463,11 +465,15 @@ def install_glm5_next_kpool_v024() -> None:
             )
 
         get_manager_for_kv_cache_spec._glm5_kpool = True
-        single_type_kv_cache_manager.get_manager_for_kv_cache_spec = (
-            get_manager_for_kv_cache_spec
+        stage(
+            single_type_kv_cache_manager,
+            "get_manager_for_kv_cache_spec",
+            get_manager_for_kv_cache_spec,
         )
-        kv_cache_coordinator.get_manager_for_kv_cache_spec = (
-            get_manager_for_kv_cache_spec
+        stage(
+            kv_cache_coordinator,
+            "get_manager_for_kv_cache_spec",
+            get_manager_for_kv_cache_spec,
         )
 
     original_groups = kv_cache_utils.get_kv_cache_groups
@@ -480,7 +486,7 @@ def install_glm5_next_kpool_v024() -> None:
             return original_groups(vllm_config, kv_cache_spec)
 
         get_groups._glm5_kpool = True
-        kv_cache_utils.get_kv_cache_groups = get_groups
+        stage(kv_cache_utils, "get_kv_cache_groups", get_groups)
 
     original_pool_bytes = kv_cache_utils._pool_bytes_per_block
     if not getattr(original_pool_bytes, "_glm5_kpool", False):
@@ -498,7 +504,7 @@ def install_glm5_next_kpool_v024() -> None:
             return original_pool_bytes(vllm_config, groups)
 
         pool_bytes._glm5_kpool = True
-        kv_cache_utils._pool_bytes_per_block = pool_bytes
+        stage(kv_cache_utils, "_pool_bytes_per_block", pool_bytes)
 
     original_max_usage = kv_cache_utils._max_memory_usage_bytes_from_groups
     if not getattr(original_max_usage, "_glm5_kpool", False):
@@ -521,7 +527,7 @@ def install_glm5_next_kpool_v024() -> None:
             return original_max_usage(vllm_config, groups)
 
         max_usage._glm5_kpool = True
-        kv_cache_utils._max_memory_usage_bytes_from_groups = max_usage
+        stage(kv_cache_utils, "_max_memory_usage_bytes_from_groups", max_usage)
 
     original_config = kv_cache_utils.get_kv_cache_config_from_groups
     if not getattr(original_config, "_glm5_kpool", False):
@@ -533,7 +539,9 @@ def install_glm5_next_kpool_v024() -> None:
 
             per_layer = dict(_inner_specs(groups))
             tail_names = {
-                name for name, spec in per_layer.items() if isinstance(spec, KpoolTailSpec)
+                name
+                for name, spec in per_layer.items()
+                if isinstance(spec, KpoolTailSpec)
             }
             index_names = {
                 name
@@ -574,7 +582,7 @@ def install_glm5_next_kpool_v024() -> None:
             )
 
         cache_config._glm5_kpool = True
-        kv_cache_utils.get_kv_cache_config_from_groups = cache_config
+        stage(kv_cache_utils, "get_kv_cache_config_from_groups", cache_config)
 
     original_concurrency = kv_cache_utils.get_max_concurrency_for_kv_cache_config
     if not getattr(original_concurrency, "_glm5_kpool", False):
@@ -593,7 +601,7 @@ def install_glm5_next_kpool_v024() -> None:
             return original_concurrency(vllm_config, cache)
 
         concurrency._glm5_kpool = True
-        kv_cache_utils.get_max_concurrency_for_kv_cache_config = concurrency
+        stage(kv_cache_utils, "get_max_concurrency_for_kv_cache_config", concurrency)
 
     # Opt-in scheduler-capacity diagnostics.  This remains dormant in normal
     # serving and is useful on immutable-vLLM FlagOS images because it reports
@@ -611,7 +619,10 @@ def install_glm5_next_kpool_v024() -> None:
                 result = original_allocate_slots(
                     self, request, num_new_tokens, *args, **kwargs
                 )
-                if result is None:
+                if result is None and any(
+                    isinstance(manager, KpoolTailManager)
+                    for manager in self.coordinator.single_type_managers
+                ):
                     count = getattr(self, "_glm5_capacity_debug_count", 0)
                     if count < 8:
                         self._glm5_capacity_debug_count = count + 1
@@ -658,7 +669,20 @@ def install_glm5_next_kpool_v024() -> None:
                 return result
 
             allocate_slots_with_capacity_debug._glm5_capacity_debug = True
-            KVCacheManager.allocate_slots = allocate_slots_with_capacity_debug
+            stage(KVCacheManager, "allocate_slots", allocate_slots_with_capacity_debug)
+
+    bind_patches(patches)
+    _EARLY_PATCHES = patches
+
+    # Plugin loading can happen after another component has forced lazy
+    # registration. In that case add only our spec immediately.
+    if kv_cache_spec_registry._REGISTRY_KVCACHESPEC_LIST:
+        kv_cache_spec_registry.KVCacheSpecRegistry.register(
+            KpoolTailSpec,
+            glm5_indexer_page_alignment,
+            KpoolTailManager,
+            uniform_type_base_spec=KpoolTailSpec,
+        )
 
 
 __all__ = ["install_glm5_next_kpool_v024"]

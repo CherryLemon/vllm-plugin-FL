@@ -38,6 +38,7 @@ def _other_config():
 
 def _probe_state():
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
+    from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
     from vllm_fl.activation import get_active_plan
     from vllm_fl.dispatch.policy import PolicyManager
     from vllm_fl.patches import glm5_next_kpool_v024 as kpool
@@ -49,6 +50,7 @@ def _probe_state():
     )
     return {
         "active": active.name if active is not None else None,
+        "private_indexer": Glm5NextIndexerAttentionBackend.indexes_kv_by_block_stride(),
         "indexer": bool(
             DeepseekV32IndexerBackend.indexes_kv_by_block_stride.__func__(
                 DeepseekV32IndexerBackend
@@ -129,7 +131,8 @@ def test_spawn_worker_activates_real_plan_and_policy():
     assert "error" not in result, result
     assert result["activated"] is True
     assert result["active"] == "glm5_next_v024"
-    assert result["indexer"] is True
+    assert result["indexer"] is False
+    assert result["private_indexer"] is True
     assert result["kpool_bound"] is True
     assert result["order"] == ["flagos", "reference"]
 
@@ -187,7 +190,11 @@ def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
     import vllm_fl
 
     vllm_fl.register_model()
-    from vllm_fl.activation import activate_for_model, get_active_plan, reset_activation_for_tests
+    from vllm_fl.activation import (
+        activate_for_model,
+        get_active_plan,
+        reset_activation_for_tests,
+    )
 
     # reset_activation_for_tests clears the provider registry, so re-run the
     # production registration before activating (mirrors a fresh process).
@@ -204,7 +211,8 @@ def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
         # Same plan in the child: idempotent, and state stays bound.
         assert result["same_is_none"] is False
         assert result["after"]["kpool_bound"] is True
-        assert result["after"]["indexer"] is True
+        assert result["after"]["indexer"] is False
+        assert result["after"]["private_indexer"] is True
         # A different model in the child is rejected.
         assert result["conflict"] is True
         # Parent process state is untouched by the child.

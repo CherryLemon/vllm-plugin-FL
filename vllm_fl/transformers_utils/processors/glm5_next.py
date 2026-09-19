@@ -57,6 +57,8 @@ from transformers.video_utils import (
     reorder_videos,
 )
 
+from .glm5_next_budget import resolve_serving_kwargs, resolve_vision_budget
+
 logger = logging.get_logger(__name__)
 
 # The earlier size-budget config can advertise a huge ``longest_edge``. Keep
@@ -100,7 +102,9 @@ def glm_sample_frame_indices(
     -> frame cap.
     """
     if total_frames <= 0 or fps <= 0 or temporal_patch_size <= 0:
-        raise ValueError("Video frames, source fps and temporal_patch_size must be positive")
+        raise ValueError(
+            "Video frames, source fps and temporal_patch_size must be positive"
+        )
     max_frame_idx = total_frames - 1
     if not duration:
         duration = (round(max_frame_idx / fps) + 1) if fps else 0
@@ -200,6 +204,7 @@ def glm_sample_frame_indices_legacy(
 def glm_video_timestamp_seconds(
     video_processor,
     metadata,
+    **sampling_kwargs,
 ) -> list[int]:
     """Prompt-visible per-frame second indices for a GLM-5-Next video.
 
@@ -224,7 +229,10 @@ def glm_video_timestamp_seconds(
         frames_indices = getattr(metadata, "frames_indices", None)
         frames = [] if frames_indices is None else [int(i) for i in frames_indices]
     else:
-        frames = [int(index) for index in video_processor.sample_frames(metadata)]
+        frames = [
+            int(index)
+            for index in video_processor.sample_frames(metadata, **sampling_kwargs)
+        ]
 
     if not frames:
         return []
@@ -482,6 +490,8 @@ class Glm5NextImageProcessorKwargs(ImagesKwargs, total=False):  # type: ignore[c
     resize_mode: str | None
     min_image_tokens: int | None
     max_image_tokens: int | None
+    min_pixels: int | None
+    max_pixels: int | None
 
 
 class Glm5NextImageProcessor(BaseImageProcessorFast):
@@ -535,13 +545,19 @@ class Glm5NextImageProcessor(BaseImageProcessorFast):
         **kwargs,
     ) -> BatchFeature:
         resize_mode = resize_mode if resize_mode is not None else self.resize_mode
-        min_pixels, max_pixels = _pixel_budget(
-            min_image_tokens if min_image_tokens is not None else self.min_image_tokens,
-            max_image_tokens if max_image_tokens is not None else self.max_image_tokens,
-            patch_size,
-            merge_size,
-            temporal_patch_size,
+        budget = resolve_vision_budget(
+            self,
+            dict(
+                kwargs,
+                min_image_tokens=min_image_tokens,
+                max_image_tokens=max_image_tokens,
+                patch_size=patch_size,
+                merge_size=merge_size,
+                temporal_patch_size=temporal_patch_size,
+                patch_expand_factor=patch_expand_factor,
+            ),
         )
+        min_pixels, max_pixels = budget.min_pixels, budget.max_pixels
         grouped_images, grouped_images_index = group_images_by_shape(
             images, disable_grouping=disable_grouping
         )
@@ -658,13 +674,8 @@ class Glm5NextImageProcessor(BaseImageProcessorFast):
         patch_expand_factor = images_kwargs.get(
             "patch_expand_factor", self.patch_expand_factor
         )
-        min_pixels, max_pixels = _pixel_budget(
-            images_kwargs.get("min_image_tokens", self.min_image_tokens),
-            images_kwargs.get("max_image_tokens", self.max_image_tokens),
-            patch_size,
-            merge_size,
-            self.temporal_patch_size,
-        )
+        budget = resolve_vision_budget(self, images_kwargs)
+        min_pixels, max_pixels = budget.min_pixels, budget.max_pixels
         resized_height, resized_width = smart_resize(
             t=self.temporal_patch_size,
             h=height,
@@ -692,6 +703,10 @@ class Glm5NextVideoProcessorKwargs(VideosKwargs, total=False):  # type: ignore[c
     max_frame_count_dynamic: int | None
     min_image_tokens: int | None
     max_image_tokens: int | None
+    min_pixels: int | None
+    max_pixels: int | None
+    max_frames: int | None
+    target_fps: float | None
     sampling_policy: str | None
 
 
@@ -817,13 +832,19 @@ class Glm5NextVideoProcessor(BaseVideoProcessor):
         )
         merge_size = merge_size if merge_size is not None else self.merge_size
         resize_mode = resize_mode if resize_mode is not None else self.resize_mode
-        min_pixels, max_pixels = _pixel_budget(
-            min_image_tokens if min_image_tokens is not None else self.min_image_tokens,
-            max_image_tokens if max_image_tokens is not None else self.max_image_tokens,
-            patch_size,
-            merge_size,
-            temporal_patch_size,
+        budget = resolve_vision_budget(
+            self,
+            dict(
+                kwargs,
+                min_image_tokens=min_image_tokens,
+                max_image_tokens=max_image_tokens,
+                patch_size=patch_size,
+                merge_size=merge_size,
+                temporal_patch_size=temporal_patch_size,
+                patch_expand_factor=patch_expand_factor,
+            ),
         )
+        min_pixels, max_pixels = budget.min_pixels, budget.max_pixels
         grouped_videos, grouped_videos_index = group_videos_by_shape(videos)
         resized_videos_grouped = {}
         for shape, stacked_videos in grouped_videos.items():
@@ -831,9 +852,17 @@ class Glm5NextVideoProcessor(BaseVideoProcessor):
                 stacked_videos = self.convert_to_rgb(stacked_videos)
             b, t_len, c, h, w = stacked_videos.shape
             num_frames, height, width = t_len, h, w
+            frame_cap = kwargs.get("max_frames")
+            if (
+                frame_cap is not None
+                and t_len + (-t_len % temporal_patch_size) > frame_cap
+            ):
+                raise ValueError(
+                    "GLM5-Next decoded video exceeds the reserved max_frames"
+                )
             if do_resize:
                 resized_height, resized_width = smart_resize(
-                    t=num_frames,
+                    t=num_frames + (-num_frames % temporal_patch_size),
                     h=height,
                     w=width,
                     t_factor=temporal_patch_size,
@@ -1022,6 +1051,19 @@ class Glm5NextProcessor(ProcessorMixin):
             video_processor=video_processor,
         )
 
+    def configure_serving(self, deployment_kwargs):
+        """Freeze deployment ceilings before profiling or processing a request."""
+        from copy import deepcopy
+
+        self._serving_mm_kwargs = deepcopy(deployment_kwargs)
+        # Resolve once now so unsupported deployment options fail before profiling.
+        resolve_serving_kwargs(self, self._serving_mm_kwargs, {})
+
+    def resolve_serving_kwargs(self, request_kwargs):
+        return resolve_serving_kwargs(
+            self, getattr(self, "_serving_mm_kwargs", {}), request_kwargs
+        )
+
     def __call__(
         self,
         images: ImageInput | None = None,
@@ -1032,6 +1074,8 @@ class Glm5NextProcessor(ProcessorMixin):
         videos: VideoInput | None = None,
         **kwargs: Unpack[Glm5NextProcessorKwargs],
     ) -> BatchFeature:
+        if hasattr(self, "_serving_mm_kwargs"):
+            kwargs = self.resolve_serving_kwargs(kwargs)
         output_kwargs = self._merge_kwargs(
             Glm5NextProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,

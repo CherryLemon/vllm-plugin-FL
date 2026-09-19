@@ -7,6 +7,40 @@ from torch import nn
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+_BINDING = None
+
+
+def get_vision_binding():
+    global _BINDING
+    if _BINDING is None:
+        from vllm_fl.dispatch.binding import OperatorBinding
+        from vllm_fl.dispatch.manager import OpManager
+        from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+        from vllm_fl.utils import use_flaggems_op
+
+        def flag(*args, **kwargs):
+            from flag_gems import flash_attn_varlen_func
+
+            return flash_attn_varlen_func(*args, **kwargs)
+
+        flag._is_available = lambda: use_flaggems_op("flash_attn_varlen_func")
+        manager = OpManager()
+        manager.registry.register_impl(
+            OpImpl(
+                "flash_attn_varlen_func",
+                "glm5.vision.flaggems",
+                BackendImplKind.DEFAULT,
+                flag,
+            )
+        )
+        _BINDING = OperatorBinding(
+            manager,
+            "flash_attn_varlen_func",
+            graph_capabilities={"glm5.vision.flaggems": True},
+        )
+    return _BINDING
+
+
 def _vision_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -14,7 +48,7 @@ def _vision_attention(
     cu_seqlens: torch.Tensor | None,
     scale: float,
 ) -> torch.Tensor:
-    from flag_gems import flash_attn_varlen_func
+    flash_attn_varlen_func = get_vision_binding()
 
     batch, seq_len, heads, head_dim = query.shape
     if cu_seqlens is None:
@@ -62,6 +96,9 @@ class Glm5VisionAttention(nn.Module):
     def __init__(self, num_heads, head_size, scale, prefix=""):
         super().__init__()
         self.scale = scale
+        # This adapter requires FA2; a conflicting user policy is a startup
+        # error, before loading weights or warming the encoder.
+        get_vision_binding().preflight()
 
     def forward(self, query, key, value, cu_seqlens=None, max_seqlen=None):
         return torch.ops.vllm.glm5_vision_attention(
