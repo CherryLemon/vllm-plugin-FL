@@ -78,6 +78,7 @@ def _callable_identity(fn: Callable[..., Any]) -> dict[str, Any]:
 def qsa_runtime_status(
     *,
     compression_impl: Callable[..., Any] | None = None,
+    select_all_tokens: bool = False,
 ) -> dict[str, Any]:
     """Describe executable entry points; this is selection, not a launch trace.
 
@@ -95,14 +96,20 @@ def qsa_runtime_status(
         "attention": qsa.qsa_sparse_paged_attention,
         "cache_store": qsa.qsa_store_cache_rows,
     }
-    if compression_impl is not None:
+    if select_all_tokens:
+        stages = {
+            "metadata": qsa.build_qsa_forward_metadata,
+            "selection": qsa.qsa_select_all_paged_tokens,
+            "attention": qsa.qsa_sparse_paged_attention,
+        }
+    elif compression_impl is not None:
         stages["compression"] = compression_impl
     return {
         "backend": "local_qsa_composition",
         "evidence": "selected_callables_not_launch_trace",
         "stages": {name: _callable_identity(fn) for name, fn in stages.items()},
         "compression_candidates": []
-        if compression_impl is not None
+        if compression_impl is not None or select_all_tokens
         else [
             _callable_identity(qsa.qsa_compress_norm_mrope_store_groups),
             _callable_identity(qsa.qsa_compress_groups_with_ratio),

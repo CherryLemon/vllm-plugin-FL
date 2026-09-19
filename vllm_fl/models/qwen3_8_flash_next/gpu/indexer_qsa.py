@@ -102,6 +102,15 @@ class QSAIndexer(nn.Module):
         self.index_head_dim = int(config.indexer_head_dim)
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
+        # This must be a lifetime context bound, not the current batch length:
+        # a branch chosen during graph capture must remain valid on replay.
+        self.max_model_len = int(vllm_config.model_config.max_model_len)
+        self.select_all_tokens = (
+            0 < self.max_model_len <= self.token_topk
+            # A KV consumer may have a larger context limit; exported side
+            # caches must retain the ordinary projection/compression state.
+            and vllm_config.kv_transfer_config is None
+        )
         self.rotary_emb = rotary_emb
         self.prefix = prefix
 
@@ -232,7 +241,10 @@ class QSAIndexer(nn.Module):
     def runtime_status(self) -> dict[str, Any]:
         from ..vendor.vllm024.dispatch import qsa_runtime_status
 
-        return qsa_runtime_status(compression_impl=self._compression_impl())
+        return qsa_runtime_status(
+            compression_impl=self._compression_impl(),
+            select_all_tokens=self.select_all_tokens,
+        )
 
     def _update_and_compress(
         self,
@@ -347,6 +359,21 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
+        if self.select_all_tokens:
+            from .ops.qsa import qsa_select_all_paged_tokens
+
+            # _metadata() above still prepares the shared request mapping used
+            # by the main attention. The side-cache projections/stores can be
+            # skipped because this worker can never exceed the selection budget.
+            return qsa_select_all_paged_tokens(
+                compressed_metadata.logical_positions,
+                compressed_metadata.seq_lens,
+                compressed_metadata.token_to_req,
+                self.token_topk,
+                self.compress_ratio,
+                self.max_model_len,
+                out,
+            )
         q, token_k = self.project_qk(
             hidden_states[:num_tokens], positions[..., :num_tokens]
         )

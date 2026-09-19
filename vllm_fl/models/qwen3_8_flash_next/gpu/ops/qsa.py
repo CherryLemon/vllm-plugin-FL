@@ -1847,6 +1847,41 @@ def _qsa_deterministic_block_topk(
     return result
 
 
+def qsa_select_all_paged_tokens(
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_to_req: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+    max_model_len: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Select every visible block when the worker's context fits the budget.
+
+    With at most ``token_topk`` tokens, score ranking cannot exclude any
+    visible block. Canonical block order is just arange. Reuse the existing
+    expansion kernel for causal tails, padding and invalid request rows.
+    ``max_model_len`` is the immutable serving limit, never a capture-time
+    observation of a short batch in a worker that can later serve long input.
+    """
+    if not 0 < max_model_len <= token_topk:
+        raise ValueError("Selecting all QSA tokens requires a context within budget")
+    if compress_ratio <= 0 or token_topk % compress_ratio:
+        raise ValueError("QSA token top-k must be divisible by compression ratio")
+    blocks = torch.arange(
+        token_topk // compress_ratio, dtype=torch.int32, device=query_positions.device
+    ).expand(query_positions.numel(), -1)
+    return expand_qsa_block_indices(
+        blocks,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+        out,
+    )
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2336,6 +2371,7 @@ __all__ = [
     "qsa_mqa_paged",
     "qsa_forward_metadata_triton_supported",
     "qsa_select_paged_tokens",
+    "qsa_select_all_paged_tokens",
     "qsa_prepare_split_workspace",
     "qsa_sparse_split_count",
     "qsa_sparse_paged_attention",

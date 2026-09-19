@@ -29,6 +29,7 @@ def test_compression_status_uses_execution_selector(
     monkeypatch.setattr(indexer_qsa, "_QSA_FUSED_COMPRESS_ENABLED", enabled)
     instance = indexer_qsa.QSAIndexer.__new__(indexer_qsa.QSAIndexer)
     instance.index_head_dim = dim
+    instance.select_all_tokens = False
     instance.rotary_emb = SimpleNamespace(rotary_dim=64, is_neox_style=neox)
     selected = instance._compression_impl()
     assert selected is (
