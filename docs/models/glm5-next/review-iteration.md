@@ -14,7 +14,7 @@ storage is distinct from the FP8 indexer KV cache; the latter remains supported.
 | FP8 projection loading and KDA quantization exclusion | Reject quantization configs and undeclared non-floating/FP8 checkpoint tensors before ordinary loading. FP8 checkpoint conversion is deferred. |
 | Incomplete EPLB outer-model interface | Reject EPLB; ordinary EP is a separate mode. |
 | Missing packed quantization mapping | Declare GLM gate/up mapping on both public model wrappers; this does not enable quantized loading. |
-| Parameter-name-only weight audit | Additionally record successful destination/shard/local-expert loader calls; reject missing/duplicate packed slices and restore loaders on failure. |
+| Parameter-name-only weight audit | Additionally record successful destination/shard/local-expert loader calls; reject missing/duplicate packed slices and restore loaders on failure. Scope the audit to the complete checkpoint, including interleaved text/head/vision prefix groups. |
 | MQA per-token scale interpreted as groups | Normalize exact per-vector shapes; reject incompatible scale shapes. Force missing/rejecting FlagGems fallback with N=128/512/2051. |
 | Import-time public vision FlashAttention replacement | Remove all global assignments; private GLM custom op consumes FA2 output and leaves public tuple/LSE contracts untouched. |
 | Whole-pool KV repacking | Read page bytes and scale offsets directly, respecting padded physical strides. |
@@ -22,7 +22,7 @@ storage is distinct from the FP8 indexer KV cache; the latter remains supported.
 | Integrated clamped MoE NameError | Resolve the runtime platform before both clamp and fused paths; retain clamp behavior and cover ROCm/unknown priority selection. |
 
 Validation uses vLLM 0.24.0, Torch 2.11.0+cu129, Transformers 5.12.1 and
-FlagGems 5.3.3.dev15+gf471641e5.pkgfix1. The CPU suite passed 713 tests (7 GPU
+FlagGems 5.3.3.dev15+gf471641e5.pkgfix1. The CPU suite passed 718 tests (7 GPU
 cases deselected). Installed-wheel H100 operator tests passed six cases,
 including updated block-table/context replay, padded page strides, and
 FP16/BF16 variable-length vision attention. These checks do not by themselves

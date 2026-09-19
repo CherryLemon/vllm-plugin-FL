@@ -7,7 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_fl.models.glm5_next import Glm5NextModel
+from vllm_fl.model_loader.glm5_next import audit_packed_weights
+from vllm_fl.models.glm5_next import Glm5NextForCausalLM, Glm5NextModel
+from vllm_fl.models.glm5_next_multimodal import Glm5NextForConditionalGeneration
 
 
 class _Fixture(nn.Module):
@@ -84,7 +86,8 @@ def _weights():
 def test_complete_packed_and_expert_weights(ep):
     model = _Fixture(ep)
     originals = [p.weight_loader for p in model.parameters()]
-    loaded = model.load_weights(iter(_weights()))
+    with audit_packed_weights(model):
+        loaded = model.load_weights(iter(_weights()))
     assert set(dict(model.named_parameters())) <= loaded
     assert all(not (p == -99).any() for p in model.parameters())
     assert all(p.weight_loader is old for p, old in zip(model.parameters(), originals))
@@ -102,7 +105,8 @@ def test_missing_shard_fails_even_when_destination_name_is_loaded(missing):
     model = _Fixture()
     originals = [p.weight_loader for p in model.parameters()]
     with pytest.raises(RuntimeError, match="missing packed weight shards"):
-        model.load_weights((n, w) for n, w in _weights() if n != missing)
+        with audit_packed_weights(model):
+            model.load_weights((n, w) for n, w in _weights() if n != missing)
     assert all(p.weight_loader is old for p, old in zip(model.parameters(), originals))
 
 
@@ -112,3 +116,72 @@ def test_undeclared_fp8_rejected_before_copy():
     with pytest.raises(ValueError, match="unquantized checkpoint required"):
         model.load_weights([(name, value.to(torch.float8_e4m3fn))])
     assert (model.layers[0].mlp.gate_up_proj.weight == -99).all()
+
+
+def _causal_model():
+    model = Glm5NextForCausalLM.__new__(Glm5NextForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(tie_word_embeddings=False)
+    model.model = _Fixture()
+    model.lm_head = nn.Linear(2, 2, bias=False)
+    model.finalizations = 0
+
+    def finalize():
+        model.finalizations += 1
+
+    model.model.finalize_mhc_broadcast_weights = finalize
+    return model
+
+
+def _interleaved_weights(multimodal):
+    prefix = "model.language_model." if multimodal else "model."
+    weights = [(prefix + n, w) for n, w in _weights()]
+    # File 45 starts with lm_head, interrupting the text subtree.
+    weights.insert(4, ("lm_head.weight", torch.ones(2, 2)))
+    if multimodal:
+        # A separate vision file can also interrupt the language-model prefix.
+        weights.insert(2, ("model.visual.weight", torch.ones(2, 2)))
+    return weights
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+@pytest.mark.parametrize("missing_up", [False, True])
+def test_checkpoint_audit_spans_interleaved_subtree_calls(multimodal, missing_up):
+    causal = _causal_model()
+    model = causal
+    if multimodal:
+        model = Glm5NextForConditionalGeneration.__new__(
+            Glm5NextForConditionalGeneration
+        )
+        nn.Module.__init__(model)
+        model.language_model = causal
+        model.visual = nn.Linear(2, 2, bias=False)
+    weights = _interleaved_weights(multimodal)
+    if missing_up:
+        weights = [
+            (n, w) for n, w in weights if not n.endswith("experts.1.up_proj.weight")
+        ]
+    originals = [p.weight_loader for p in causal.model.parameters()]
+    if missing_up:
+        with pytest.raises(RuntimeError, match="missing packed weight shards"):
+            model.load_weights(iter(weights))
+        assert causal.finalizations == 0
+    else:
+        loaded = model.load_weights(iter(weights))
+        assert set(dict(model.named_parameters())) <= loaded
+        assert all(not (p == -99).any() for p in causal.model.parameters())
+        assert causal.finalizations == 1
+    assert not hasattr(causal, "_glm5_loading_names")
+    assert all(
+        p.weight_loader is old for p, old in zip(causal.model.parameters(), originals)
+    )
+
+
+def test_interleaved_duplicate_shard_rejected():
+    model = _causal_model()
+    weights = _interleaved_weights(False)
+    weights.append(weights[0])
+    with pytest.raises(ValueError, match="Duplicate GLM5-Next packed weight"):
+        model.load_weights(iter(weights))
+    assert model.finalizations == 0
+    assert not hasattr(model, "_glm5_loading_names")

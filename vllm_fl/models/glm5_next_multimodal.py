@@ -902,9 +902,13 @@ class Glm5NextForConditionalGeneration(
         return config
 
     def load_weights(self, weights):
-        from vllm_fl.model_loader.glm5_next import unquantized_weights
+        from vllm_fl.model_loader.glm5_next import (
+            audit_text_weights,
+            unquantized_weights,
+        )
 
-        return super().load_weights(unquantized_weights(weights))
+        with audit_text_weights(self.language_model):
+            return super().load_weights(unquantized_weights(weights))
 
 
 __all__ = [

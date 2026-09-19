@@ -1081,13 +1081,9 @@ class Glm5NextModel(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # The v0.24 DeepSeek loader handles fused MLA/indexer projections,
         # dense SwiGLU stacking, expert tensors, and direct KDA/mHC parameters.
-        from vllm_fl.model_loader.glm5_next import (
-            audit_packed_weights,
-            unquantized_weights,
-        )
+        from vllm_fl.model_loader.glm5_next import unquantized_weights
 
-        with audit_packed_weights(self):
-            return DeepseekV2Model.load_weights(self, unquantized_weights(weights))
+        return DeepseekV2Model.load_weights(self, unquantized_weights(weights))
 
     def finalize_mhc_broadcast_weights(self) -> None:
         """Build the first-layer projection used by the NVIDIA fast path."""
@@ -1203,45 +1199,19 @@ class Glm5NextForCausalLM(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm_fl.model_loader.glm5_next import unquantized_weights
+        from vllm_fl.model_loader.glm5_next import (
+            audit_text_weights,
+            unquantized_weights,
+        )
 
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
             ignore_unexpected_prefixes=["model.visual."],
         )
-        loaded = loader.load_weights(unquantized_weights(weights))
-
-        # AutoWeightsLoader accepts a checkpoint as soon as every *present*
-        # key has a destination; it does not verify the inverse condition that
-        # every runtime parameter received a checkpoint tensor.  That is too
-        # weak for a newly adapted architecture. The inner model additionally
-        # audits successful packed-shard/expert loads. Audit destination names
-        # at the innermost CausalLM boundary so
-        # vision-only parameters and outer HF prefix mapping cannot obscure the
-        # result.
-        expected = {name for name, _ in self.named_parameters()}
-        missing = sorted(expected - loaded)
-        unexpected = sorted(loaded - expected)
-        logger.info(
-            "GLM5-Next strict text weight audit: loaded=%d expected=%d "
-            "missing=%d unexpected=%d",
-            len(loaded),
-            len(expected),
-            len(missing),
-            len(unexpected),
-        )
-        if unexpected:
-            logger.warning(
-                "GLM5-Next weight audit returned unexpected names: %s",
-                unexpected[:32],
-            )
-        if missing:
-            raise RuntimeError(
-                "GLM5-Next checkpoint did not initialize all text parameters; "
-                f"first missing names: {missing[:64]}"
-            )
-        self.model.finalize_mhc_broadcast_weights()
+        with audit_text_weights(self) as all_loaded:
+            loaded = loader.load_weights(unquantized_weights(weights))
+            all_loaded.update(loaded)
         return loaded
 
 

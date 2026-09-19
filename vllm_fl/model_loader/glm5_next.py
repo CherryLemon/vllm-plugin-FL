@@ -4,6 +4,9 @@
 from contextlib import contextmanager
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def unquantized_weights(weights):
@@ -94,3 +97,48 @@ def audit_packed_weights(model):
     finally:
         for param, original in originals:
             param.weight_loader = original
+
+
+@contextmanager
+def audit_text_weights(model):
+    """Audit one complete checkpoint, including interleaved subtree calls.
+
+    AutoWeightsLoader streams consecutive prefix groups. A language model can
+    therefore be invoked several times when lm_head or vision keys interrupt
+    its weights. The outer multimodal loader owns the audit when present;
+    nested CausalLM loads contribute to the same set without finalizing early.
+    """
+    active = getattr(model, "_glm5_loading_names", None)
+    if active is not None:
+        yield active
+        return
+
+    loaded = set()
+    model._glm5_loading_names = loaded
+    try:
+        with audit_packed_weights(model.model):
+            yield loaded
+            expected = {name for name, _ in model.named_parameters()}
+            missing = sorted(expected - loaded)
+            unexpected = sorted(loaded - expected)
+            logger.info(
+                "GLM5-Next strict text weight audit: loaded=%d expected=%d "
+                "missing=%d unexpected=%d",
+                len(loaded),
+                len(expected),
+                len(missing),
+                len(unexpected),
+            )
+            if unexpected:
+                logger.warning(
+                    "GLM5-Next weight audit returned unexpected names: %s",
+                    unexpected[:32],
+                )
+            if missing:
+                raise RuntimeError(
+                    "GLM5-Next checkpoint did not initialize all text parameters; "
+                    f"first missing names: {missing[:64]}"
+                )
+        model.model.finalize_mhc_broadcast_weights()
+    finally:
+        del model._glm5_loading_names
