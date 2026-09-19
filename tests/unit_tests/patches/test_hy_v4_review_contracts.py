@@ -256,7 +256,14 @@ def _prefill_config(explicit=None):
     return SimpleNamespace(
         attention_config=SimpleNamespace(mla_prefill_backend=explicit),
         cache_config=SimpleNamespace(cache_dtype="auto"),
-        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(
+                qk_nope_head_dim=192,
+                qk_rope_head_dim=64,
+                v_head_dim=256,
+            ),
+        ),
     )
 
 
@@ -370,3 +377,73 @@ def test_fallback_success_idempotence_and_prefill_selection(monkeypatch):
         finally:
             tx.rollback()
     assert not getattr(indexer, "_hy4_flaggems_fallback", False)
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8"])
+def test_native_core_without_prefill_is_not_a_complete_native_plan(
+    monkeypatch, cache_dtype
+):
+    import vllm.model_executor.layers.attention.mla_attention as mla
+    from vllm import platforms
+    from vllm.v1.attention.ops import flashmla
+
+    monkeypatch.setattr(
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda: True)
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
+    monkeypatch.setattr(flashmla, "is_flashmla_sparse_supported", lambda: (True, None))
+    monkeypatch.setattr(
+        mla,
+        "get_mla_prefill_backend",
+        lambda cfg: SimpleNamespace(is_available=lambda: False),
+    )
+    config = _prefill_config()
+    config.cache_config.cache_dtype = cache_dtype
+    if cache_dtype == "fp8":
+        with pytest.raises(
+            ValueError, match="complete native path including MLA prefill"
+        ):
+            runtime.validate_hy4_runtime(config)
+    else:
+        plan = runtime.validate_hy4_runtime(config)
+        assert plan.provider == "flaggems"
+        assert callable(plan.query_quantizer)
+        assert plan.prefill_backend.is_available()
+        assert set(runtime._REQUIRED_GEMS) <= plan.operations.keys()
+
+
+def test_runtime_plan_rejects_a_missing_native_callable():
+    with pytest.raises(RuntimeError, match="flash_mla_sparse_fwd"):
+        runtime.HY4RuntimePlan(
+            "native", lambda: None, {"flash_mla_sparse_fwd": None}, object, ("auto",)
+        )
+
+
+@pytest.mark.parametrize("qk_width,v_width", [(576, 512), (192, 256)])
+def test_portable_prefill_rejects_unsupported_dimensions_before_install(
+    monkeypatch, qk_width, v_width
+):
+    import vllm.model_executor.layers.attention.mla_attention as mla
+    from vllm import platforms
+
+    monkeypatch.setattr(
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
+    monkeypatch.setattr(
+        mla,
+        "get_mla_prefill_backend",
+        lambda cfg: SimpleNamespace(is_available=lambda: False),
+    )
+    config = _prefill_config()
+    config.model_config.hf_text_config.qk_nope_head_dim = qk_width - 64
+    config.model_config.hf_text_config.v_head_dim = v_width
+    monkeypatch.setattr(
+        runtime,
+        "install_hy4_flaggems_fallback",
+        lambda *args: pytest.fail("invalid plan must not install"),
+    )
+    with pytest.raises(ValueError, match="qk_head_dim <= 256"):
+        runtime.prepare_hy4_runtime(config)

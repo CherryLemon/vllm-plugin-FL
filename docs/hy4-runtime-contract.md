@@ -39,7 +39,9 @@ are allocated, HY4 resolves a runtime plan containing the query quantizer,
 indexer/top-k, cache-update and sparse-attention implementations, MLA prefill
 backend, and supported KV dtypes. Required FlagGems implementations must be
 callable as well as permitted by policy. Native selection also requires a
-usable prefill implementation. Decoder layers consume the resolved plan;
+usable prefill implementation. The portable dense prefill path requires
+`0 < v_head_dim <= qk_head_dim <= 256`, matching the validated FlagGems API;
+compressed sparse-MLA dimensions are not dense prefill dimensions. Decoder layers consume the resolved plan;
 query quantization no longer imports/probes a provider on every forward.
 
 Explicit `mla_prefill_backend` selections preserve upstream errors. Only

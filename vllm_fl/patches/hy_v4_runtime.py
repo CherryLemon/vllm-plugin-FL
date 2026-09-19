@@ -73,6 +73,15 @@ class HY4RuntimePlan:
     prefill_backend: type
     kv_cache_dtypes: tuple[str, ...]
 
+    def __post_init__(self):
+        missing = [name for name, op in self.operations.items() if not callable(op)]
+        if not callable(self.query_quantizer):
+            missing.append("query_quantizer")
+        if missing:
+            raise RuntimeError(
+                "HY4 runtime implementations unavailable: " + ", ".join(missing)
+            )
+
 
 def _load_flaggems_implementations() -> dict[str, Callable]:
     require_flaggems_policy()
@@ -198,6 +207,13 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
             raise ValueError("HY4 FlagGems auto KV requires bfloat16 model dtype")
         implementations = _load_flaggems_implementations()
         if prefill_backend is None:
+            config = vllm_config.model_config.hf_text_config
+            qk_width = config.qk_nope_head_dim + config.qk_rope_head_dim
+            if not (0 < config.v_head_dim <= qk_width <= 256):
+                raise ValueError(
+                    "HY4 FlagGems MLA prefill requires 0 < v_head_dim <= "
+                    f"qk_head_dim <= 256; got v={config.v_head_dim}, qk={qk_width}"
+                )
             prefill_backend = _make_hy4_flaggems_mla_prefill_backend(
                 implementations["flash_attn_varlen_func"]
             )
@@ -333,9 +349,9 @@ def _make_hy4_flaggems_mla_prefill_backend(flash_attn_varlen_func=None) -> type:
             return_softmax_lse: bool,
             out: torch.Tensor | None = None,
         ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            # MLA has q/k head dim 576 and value dim 512.  FlagGems accepts
-            # different head dimensions through padding, matching vLLM's
-            # FlashAttention prefill adapter.
+            # Dense prefill uses the expanded attention heads (HY4: q/k=256,
+            # v=256), not the 576/512 compressed sparse-MLA representation.
+            # Pad a smaller value head to match q/k for the FlagGems API.
             maybe_padded_v = v
             if v.shape[-1] != q.shape[-1]:
                 maybe_padded_v = torch.nn.functional.pad(

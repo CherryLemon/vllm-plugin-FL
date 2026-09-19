@@ -19,10 +19,11 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("causal", [False, True])
-def test_portable_prefill_matches_torch_at_mla_dimensions(causal):
+@pytest.mark.parametrize("qk_width,v_width", [(256, 256), (192, 128)])
+def test_portable_prefill_matches_torch_at_mla_dimensions(causal, qk_width, v_width):
     torch.manual_seed(23)
     cls = runtime._make_hy4_flaggems_mla_prefill_backend()
-    backend = cls(2, 576**-0.5, 512, 512, 64, 512, None)
+    backend = cls(2, qk_width**-0.5, 512, qk_width - 64, 64, v_width, None)
     offsets = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
     backend.prepare_metadata(
         SimpleNamespace(
@@ -32,9 +33,10 @@ def test_portable_prefill_matches_torch_at_mla_dimensions(causal):
         )
     )
     q, k = [
-        torch.randn(5, 2, 576, dtype=torch.bfloat16, device="cuda") for _ in range(2)
+        torch.randn(5, 2, qk_width, dtype=torch.bfloat16, device="cuda")
+        for _ in range(2)
     ]
-    v = torch.randn(5, 2, 512, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(5, 2, v_width, dtype=torch.bfloat16, device="cuda")
     expected, expected_lse = [], []
     for start, end in ((0, 3), (3, 5)):
         # CPU FP64 reference is independent of the FlagGems provider/dispatch.
