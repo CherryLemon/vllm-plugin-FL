@@ -23,7 +23,14 @@ def get_vision_binding():
 
             return flash_attn_varlen_func(*args, **kwargs)
 
-        flag._is_available = lambda: use_flaggems_op("flash_attn_varlen_func")
+        def available():
+            if not use_flaggems_op("flash_attn_varlen_func"):
+                return False
+            import flag_gems
+
+            return callable(getattr(flag_gems, "flash_attn_varlen_func", None))
+
+        flag._is_available = available
         manager = OpManager()
         manager.registry.register_impl(
             OpImpl(

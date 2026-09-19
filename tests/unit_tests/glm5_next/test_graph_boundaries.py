@@ -46,6 +46,7 @@ def test_flagos_cuda_runner_honors_breakable_graph() -> None:
 
 def test_kpool_custom_op_is_a_piecewise_split() -> None:
     from vllm.config.compilation import CompilationConfig
+
     from vllm_fl.activation import patch_inventory
     from vllm_fl.patches.glm5_next_v024 import apply_glm5_next_v024_patches
 

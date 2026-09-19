@@ -38,9 +38,10 @@ def _other_config():
 
 def _probe_state():
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
-    from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
+
     from vllm_fl.activation import get_active_plan
     from vllm_fl.dispatch.policy import PolicyManager
+    from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
     from vllm_fl.patches import glm5_next_kpool_v024 as kpool
 
     active = get_active_plan()

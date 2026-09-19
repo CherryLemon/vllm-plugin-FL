@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
@@ -82,9 +83,10 @@ def test_glm_padded_pages_are_views_with_shared_descriptor(
 
 
 def test_metadata_builder_delegates_non_glm_and_uses_same_glm_layout(monkeypatch):
-    from vllm_fl.patches import glm5_next_kpool_v024 as hooks
-    from vllm.v1.worker.utils import AttentionGroup
     from vllm.platforms import current_platform
+    from vllm.v1.worker.utils import AttentionGroup
+
+    from vllm_fl.patches import glm5_next_kpool_v024 as hooks
 
     monkeypatch.setattr(
         current_platform, "get_device_capability", lambda: SimpleNamespace(major=9)

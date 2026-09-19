@@ -59,11 +59,8 @@ def test_gpu_failures_are_not_masked_by_fallback(backend, error):
     def fail():
         raise error
 
-    with policy_context(SelectionPolicy()):
-        with pytest.raises(type(error)) as caught:
-            backend._call_flag(
-                "fp8_fp4_mqa_logits", fail, lambda: pytest.fail("fallback")
-            )
+    with policy_context(SelectionPolicy()), pytest.raises(type(error)) as caught:
+        backend._call_flag("fp8_fp4_mqa_logits", fail, lambda: pytest.fail("fallback"))
     assert caught.value is error
 
 
@@ -115,22 +112,24 @@ def test_vision_blacklist_and_explicit_wrong_provider_fail_preflight(monkeypatch
 
     monkeypatch.setattr(vision, "_BINDING", None)
     monkeypatch.setenv("VLLM_FL_FLAGOS_BLACKLIST", "flash_attn_varlen_func")
-    with policy_context(SelectionPolicy()):
-        with pytest.raises(RuntimeError):
-            vision.Glm5VisionAttention(2, 8, 0.5)
+    with policy_context(SelectionPolicy()), pytest.raises(RuntimeError):
+        vision.Glm5VisionAttention(2, 8, 0.5)
     monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST")
-    with policy_context(
-        SelectionPolicy.from_dict(
-            per_op_order={"flash_attn_varlen_func": ["reference"]}
-        )
+    with (
+        policy_context(
+            SelectionPolicy.from_dict(
+                per_op_order={"flash_attn_varlen_func": ["reference"]}
+            )
+        ),
+        pytest.raises(RuntimeError),
     ):
-        with pytest.raises(RuntimeError):
-            vision.Glm5VisionAttention(2, 8, 0.5)
+        vision.Glm5VisionAttention(2, 8, 0.5)
 
 
 @pytest.mark.parametrize("strict", [False, True])
 def test_real_vision_adapter_preserves_unsupported_error(monkeypatch, strict):
     import flag_gems
+
     from vllm_fl.kernels.glm5_next import vision_attention as vision
 
     monkeypatch.setattr(vision, "_BINDING", None)
@@ -139,15 +138,17 @@ def test_real_vision_adapter_preserves_unsupported_error(monkeypatch, strict):
         raise NotImplementedError("FA2 unsupported shape")
 
     monkeypatch.setattr(flag_gems, "flash_attn_varlen_func", unsupported)
-    with policy_context(SelectionPolicy(strict=strict)):
-        with pytest.raises(NotImplementedError, match="FA2 unsupported"):
-            vision._vision_attention(
-                torch.zeros(1, 2, 2, 8),
-                torch.zeros(1, 2, 2, 8),
-                torch.zeros(1, 2, 2, 8),
-                None,
-                0.5,
-            )
+    with (
+        policy_context(SelectionPolicy(strict=strict)),
+        pytest.raises(NotImplementedError, match="FA2 unsupported"),
+    ):
+        vision._vision_attention(
+            torch.zeros(1, 2, 2, 8),
+            torch.zeros(1, 2, 2, 8),
+            torch.zeros(1, 2, 2, 8),
+            None,
+            0.5,
+        )
 
 
 @pytest.mark.parametrize("provider", ["invalid", "nvidia"])
@@ -174,3 +175,39 @@ print("non-GLM registration passed")
         env={**os.environ, "VLLM_FL_GLM5_PROVIDER": provider},
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_binding_tracks_context_policy_and_manager_epoch(backend):
+    import contextvars
+
+    contexts = [contextvars.copy_context(), contextvars.copy_context()]
+    managers = [
+        policy_context(SelectionPolicy(prefer="flagos")),
+        policy_context(SelectionPolicy(prefer="reference")),
+    ]
+    for context, manager in zip(contexts, managers):
+        context.run(manager.__enter__)
+
+    supported = [True]
+
+    def flag():
+        if not supported[0]:
+            raise NotImplementedError("unsupported")
+        return "flag"
+
+    def call():
+        return backend._call_flag("fp8_fp4_mqa_logits", flag, lambda: "torch")
+
+    try:
+        assert contexts[0].run(call) == "flag"
+        assert contexts[1].run(call) == "torch"
+        assert contexts[0].run(call) == "flag"
+        supported[0] = False
+        assert contexts[0].run(call) == "torch"
+        supported[0] = True
+        assert contexts[0].run(call) == "torch"  # do not retry rejected kernels
+        backend._manager._reset_after_fork()
+        assert contexts[0].run(call) == "flag"  # fork reset clears failures
+    finally:
+        for context, manager in zip(contexts, managers):
+            context.run(manager.__exit__, None, None, None)

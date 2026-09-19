@@ -266,8 +266,10 @@ def test_actual_vllm_context_merge_keeps_request_ceiling(
     deployment, overrides, expected
 ):
     import torch
+
     from vllm.config.multimodal import MultiModalConfig
     from vllm.multimodal.processing import InputProcessingContext
+
     from vllm_fl.models.glm5_next_multimodal import Glm5NextMultiModalProcessor
 
     processor, info = make_processor(deployment)

@@ -377,8 +377,7 @@ def test_plain_model_then_plan_model_is_rejected():
 
 def test_activate_preserves_explicit_policy(monkeypatch):
     """Finding 2: activation must not discard an explicit global policy."""
-    from vllm_fl.dispatch.policy import PolicyManager
-    from vllm_fl.dispatch.policy import SelectionPolicy
+    from vllm_fl.dispatch.policy import PolicyManager, SelectionPolicy
 
     manager = PolicyManager.get_instance()
     manager.reset_global_policy()
@@ -421,13 +420,15 @@ def test_constructor_patch_transaction_restores_on_failure():
         fingerprint="glm-test",
         phase="construction",
     )
-    with pytest.raises(RuntimeError, match="constructor failed"):
-        with temporary_patches([patch]):
-            assert owner.capability() is True
-            assert any(
-                p["target"] == patch.target and p["phase"] == "construction"
-                for p in patch_inventory()
-            )
-            raise RuntimeError("constructor failed")
+    with (
+        pytest.raises(RuntimeError, match="constructor failed"),
+        temporary_patches([patch]),
+    ):
+        assert owner.capability() is True
+        assert any(
+            p["target"] == patch.target and p["phase"] == "construction"
+            for p in patch_inventory()
+        )
+        raise RuntimeError("constructor failed")
     assert owner.capability is original
     assert not any(p["target"] == patch.target for p in patch_inventory())

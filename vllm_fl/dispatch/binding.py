@@ -16,51 +16,54 @@ class OperatorBinding:
         self.manager = manager
         self.op_name = op_name
         self.graph_capabilities = graph_capabilities or {}
-        self._epoch = None
-        self._candidates = []
+        self._cache = None
         self.selected_impl = None
 
     def preflight(self):
-        epoch = get_policy_epoch()
-        if epoch != self._epoch:
-            self._candidates = self.manager.resolve_candidates(self.op_name)
-            self._strict = get_policy().strict
+        policy = get_policy()
+        epoch = (get_policy_epoch(), self.manager.policy_epoch, policy)
+        cached = self._cache
+        if cached is None or epoch != cached[0]:
+            candidates = self.manager.resolve_candidates(self.op_name)
             failed = self.manager.get_failed_impls(self.op_name).get(
                 self.op_name, set()
             )
-            self._candidates = [
-                impl for impl in self._candidates if impl.impl_id not in failed
-            ]
+            candidates = [impl for impl in candidates if impl.impl_id not in failed]
             self.selected_impl = None
-            self._epoch = epoch
-        if not self._candidates:
+            epoch = (get_policy_epoch(), self.manager.policy_epoch, policy)
+            self._cache = (epoch, candidates)
+        else:
+            candidates = cached[1]
+        if not candidates:
             raise RuntimeError(
                 f"No permitted implementation remains for {self.op_name}"
             )
-        return self._candidates
+        return candidates
 
     def describe(self):
         candidates = self.preflight()
+        strict = get_policy().strict
         return dict(
             op=self.op_name,
             selected=self.selected_impl or candidates[0].impl_id,
             candidates=[impl.impl_id for impl in candidates],
-            strict=self._strict,
-            fallback_on="NotImplementedError only" if not self._strict else "never",
+            strict=strict,
+            fallback_on="NotImplementedError only" if not strict else "never",
             graph_capabilities=self.graph_capabilities,
         )
 
     def __call__(self, *args, **kwargs):
         candidates = self.preflight()
+        strict = get_policy().strict
         for impl in candidates:
             self.manager._record_first_use(self.op_name, impl)
             try:
                 result = impl.fn(*args, **kwargs)
             except NotImplementedError:
-                if self._strict:
+                if strict:
                     raise
                 self.manager._mark_failed_impl(self.op_name, impl.impl_id)
-                self._candidates = [c for c in self._candidates if c is not impl]
+                self._cache = None
                 if impl is candidates[-1]:
                     raise
             else:
