@@ -251,6 +251,7 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm_fl.worker.ple_token_history import PLETokenHistory
 from vllm.utils.torch_utils import PIN_MEMORY
 
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -506,10 +507,9 @@ class ExecuteModelState(NamedTuple):
 class ModelRunnerFL(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
-    # ``_prepare_ngram_context`` assembles the PLE token history on the CPU and
-    # only then copies it to the GPU, so asynchronous scheduling could read a
-    # history that misses the newest committed tokens.
-    ple_ngram_context_source = "cpu"
+    # PLE history is updated from resolved GPU input_ids, including async
+    # sampled tokens, rather than InputBatch's CPU output placeholders.
+    ple_ngram_context_source = "gpu"
 
     def __init__(
         self,
@@ -874,6 +874,15 @@ class ModelRunnerFL(
                 self.max_num_reqs,
                 self.ngram_context_len,
                 dtype=torch.int32,
+            )
+            self.ple_token_history = PLETokenHistory(
+                self.max_num_reqs,
+                self.max_model_len,
+                self.max_num_tokens,
+                self.ngram_context_len,
+                self.ngram_eos_token_id,
+                self.device,
+                self.pin_memory,
             )
         self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
         self.discard_request_mask = self._make_buffer(
@@ -1256,6 +1265,9 @@ class ModelRunnerFL(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Invalidate even when a finished id is re-submitted in this step.
+        if self.uses_ngram_embedding:
+            self.ple_token_history.forget(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1560,6 +1572,10 @@ class ModelRunnerFL(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            if self.uses_ngram_embedding:
+                # Resumes and streaming prompt replacements have authoritative
+                # CPU history restored above, and may reuse the same request id.
+                self.ple_token_history.forget((request.req_id,))
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -3640,33 +3656,20 @@ class ModelRunnerFL(
         """Build the left context for every real or CUDA-graph padding row."""
         if not self.uses_ngram_embedding:
             raise RuntimeError("N-gram context requested for non-ngram model.")
-        eos_token_id = int(self.ngram_eos_token_id)
-        if num_reqs_padded == 0 or self.ngram_context_len == 0:
-            return self.ngram_context.gpu[:num_reqs_padded]
-
-        context_cpu = self.ngram_context.np[:num_reqs_padded]
-        context_cpu.fill(eos_token_id)
-        num_computed = self.input_batch.num_computed_tokens_cpu
-        token_ids = self.input_batch.token_ids_cpu
-        is_token_ids = self.input_batch.is_token_ids
-
-        for req_idx in range(num_reqs):
-            end = int(num_computed[req_idx])
-            if end <= 0:
-                continue
-            start = max(0, end - self.ngram_context_len)
-            context_tokens = token_ids[req_idx, start:end]
-            if context_tokens.size == 0:
-                continue
-            if self.enable_prompt_embeds and not is_token_ids[
-                req_idx, start:end
-            ].all():
-                context_tokens = context_tokens.copy()
-                context_tokens[~is_token_ids[req_idx, start:end]] = eos_token_id
-            context_cpu[req_idx, -context_tokens.size :] = context_tokens
-
-        self.ngram_context.copy_to_gpu(num_reqs_padded)
-        return self.ngram_context.gpu[:num_reqs_padded]
+        num_tokens = int(self.query_start_loc.np[num_reqs])
+        return self.ple_token_history.prepare(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
+            num_scheduled_tokens=self.num_scheduled_tokens.np[:num_reqs],
+            token_ids_cpu=self.input_batch.token_ids_cpu_tensor,
+            is_token_ids=(
+                self.input_batch.is_token_ids if self.enable_prompt_embeds else None
+            ),
+            req_indices=self.req_indices.np[:num_tokens],
+            query_positions=self.query_pos.np[:num_tokens],
+            input_ids=self.input_ids.gpu[:num_tokens],
+            context=self.ngram_context.gpu[:num_reqs_padded],
+        )
 
     def _maybe_add_ngram_kwargs(
         self,

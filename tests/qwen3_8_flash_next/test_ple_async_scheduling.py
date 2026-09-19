@@ -1,7 +1,7 @@
 """CPU checks for the PLE asynchronous-scheduling contract.
 
-vLLM resolves ``async_scheduling=None`` later than the model config hook, so
-the hook must pin the default when the runner only has a CPU token history.
+The selected runner supplies GPU history. Retain fail-closed behavior for a
+runner that only supplies CPU history, including vLLM's deferred default.
 """
 
 from __future__ import annotations
@@ -42,11 +42,29 @@ def _vllm_config(*, ple_layer_ids, async_scheduling):
     )
 
 
-def test_runner_declares_cpu_token_history():
-    assert ple_ngram_context_uses_cpu_history() is True
+def test_selected_runner_declares_gpu_token_history():
+    assert ple_ngram_context_uses_cpu_history() is False
 
 
-def test_unset_async_scheduling_is_pinned_to_synchronous(caplog):
+@pytest.mark.parametrize("async_scheduling", [None, False, True])
+@pytest.mark.parametrize(
+    "config_cls",
+    [Qwen3_8FlashNextForCausalLMConfig, Qwen3_8FlashNextForConditionalGenerationConfig],
+)
+def test_gpu_history_preserves_async_choice(config_cls, async_scheduling):
+    config = _vllm_config(ple_layer_ids=[1], async_scheduling=async_scheduling)
+    config_cls.verify_and_update_config(config)
+    assert config.scheduler_config.async_scheduling is async_scheduling
+
+
+@pytest.fixture
+def cpu_history(monkeypatch):
+    from vllm_fl.worker.model_runner import ModelRunnerFL
+
+    monkeypatch.setattr(ModelRunnerFL, "ple_ngram_context_source", "cpu")
+
+
+def test_unset_async_scheduling_is_pinned_to_synchronous(caplog, cpu_history):
     config = _vllm_config(ple_layer_ids=[1], async_scheduling=None)
     with caplog.at_level(logging.INFO):
         Qwen3_8FlashNextForCausalLMConfig.verify_and_update_config(config)
@@ -75,7 +93,7 @@ def test_explicit_synchronous_scheduling_is_untouched(caplog):
         Qwen3_8FlashNextForConditionalGenerationConfig,
     ],
 )
-def test_explicit_asynchronous_scheduling_is_rejected(config_cls):
+def test_explicit_asynchronous_scheduling_is_rejected(config_cls, cpu_history):
     config = _vllm_config(ple_layer_ids=[1], async_scheduling=True)
     with pytest.raises(NotImplementedError, match="--no-async-scheduling"):
         config_cls.verify_and_update_config(config)
