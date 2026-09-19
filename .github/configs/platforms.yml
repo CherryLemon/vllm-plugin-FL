@@ -25,12 +25,16 @@ platforms:
   ascend:
     enabled: false
   hygon:
-    enabled: false
+    enabled: true
   metax:
-    enabled: false
+    enabled: true
   musa:
     enabled: false
   enflame:
-    enabled: false
+    enabled: true
   kunlunxin:
+    enabled: false
+  thead:
+    enabled: true
+  iluvatar:
     enabled: false
