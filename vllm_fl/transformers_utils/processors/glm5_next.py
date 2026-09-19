@@ -171,7 +171,10 @@ def glm_sample_frame_indices_legacy(
     """Frame sampling used by the earlier size-budget config."""
     effective_duration = min(duration, 2400)
     extract_t = min(
-        int(effective_duration * target_fps * temporal_patch_size),
+        max(
+            temporal_patch_size,
+            int(effective_duration * target_fps * temporal_patch_size),
+        ),
         max_frame_count,
     )
     timestamps = [index / source_fps for index in range(total_frames)]

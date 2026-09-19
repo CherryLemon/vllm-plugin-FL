@@ -286,6 +286,7 @@ def test_actual_vllm_context_merge_keeps_request_ceiling(
     assert int(output["image_grid_thw"].prod()) // 4 <= expected
 
 
+@pytest.mark.parametrize("sampling_policy", ["fps_interval", "legacy_dynamic"])
 @pytest.mark.parametrize(
     "deployment,overrides,expected_frames",
     [
@@ -295,7 +296,7 @@ def test_actual_vllm_context_merge_keeps_request_ceiling(
     ],
 )
 def test_actual_vllm_presampled_video_honors_request_and_deployment(
-    deployment, overrides, expected_frames
+    deployment, overrides, expected_frames, sampling_policy
 ):
     import copy
 
@@ -307,6 +308,9 @@ def test_actual_vllm_presampled_video_honors_request_and_deployment(
     from vllm_fl.models.glm5_next_multimodal import Glm5NextMultiModalProcessor
 
     processor, info = make_processor(deployment)
+    processor.video_processor.sampling_policy = sampling_policy
+    if sampling_policy == "legacy_dynamic" and expected_frames == 4:
+        expected_frames = 6
     original_context = info.ctx
     info.ctx = InputProcessingContext(
         SimpleNamespace(
@@ -343,6 +347,29 @@ def test_actual_vllm_presampled_video_honors_request_and_deployment(
             0,
             29,
         ]
+    elif expected_frames == 6:
+        assert info._get_video_second_idx_glm46v(metadata, len(video), overrides) == [
+            0,
+            10,
+            19,
+        ]
+
+
+@pytest.mark.parametrize("sampling_policy", ["fps_interval", "legacy_dynamic"])
+def test_presampled_short_video_remains_nonempty_at_low_requested_fps(sampling_policy):
+    from vllm_fl.transformers_utils.processors.glm5_next import (
+        glm_select_decoded_frames,
+    )
+
+    processor, _ = make_processor({})
+    processor.video_processor.sampling_policy = sampling_policy
+    metadata = SimpleNamespace(
+        total_num_frames=1, fps=2.0, duration=0.4, frames_indices=[0]
+    )
+    rows, source = glm_select_decoded_frames(
+        processor.video_processor, metadata, 1, fps=0.01, target_fps=0.01, max_frames=8
+    )
+    assert rows == source == [0, 0]
 
 
 def test_profile_inputs_keep_maximal_frames_despite_low_deployment_fps():
