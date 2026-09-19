@@ -125,8 +125,10 @@ def test_hy4_hc_n8_explicit_disable_falls_back(monkeypatch: pytest.MonkeyPatch):
     assert torch.equal(actual, expected)
 
 
-def test_hy4_hc_n8_default_is_enabled(monkeypatch: pytest.MonkeyPatch):
+def test_hy4_hc_n8_default_is_disabled(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv(HC_N8_ENABLE_ENV, raising=False)
     flat = torch.randn((8, K), device="cuda", dtype=torch.float32)
     weight = torch.randn((N, K), device="cuda", dtype=torch.float32)
+    assert not _is_candidate(flat, weight)
+    monkeypatch.setenv(HC_N8_ENABLE_ENV, "1")
     assert _is_candidate(flat, weight)
