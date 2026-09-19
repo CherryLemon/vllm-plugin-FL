@@ -284,3 +284,93 @@ def test_actual_vllm_context_merge_keeps_request_ceiling(
         "<|image|>", {"images": [Image.new("RGB", (600, 900))]}, overrides, {}
     )
     assert int(output["image_grid_thw"].prod()) // 4 <= expected
+
+
+@pytest.mark.parametrize(
+    "deployment,overrides,expected_frames",
+    [
+        ({}, {"target_fps": 0.1, "max_frames": 8}, 4),
+        ({}, {"videos_kwargs": {"fps": 0.1, "max_frames": 8}}, 4),
+        ({"videos_kwargs": {"max_frames": 8}}, {}, 8),
+    ],
+)
+def test_actual_vllm_presampled_video_honors_request_and_deployment(
+    deployment, overrides, expected_frames
+):
+    import copy
+
+    import torch
+
+    from vllm.config.multimodal import MultiModalConfig
+    from vllm.multimodal.processing import InputProcessingContext
+
+    from vllm_fl.models.glm5_next_multimodal import Glm5NextMultiModalProcessor
+
+    processor, info = make_processor(deployment)
+    original_context = info.ctx
+    info.ctx = InputProcessingContext(
+        SimpleNamespace(
+            get_multimodal_config=lambda: MultiModalConfig(
+                mm_processor_kwargs=deployment
+            ),
+            dtype=torch.float32,
+        ),
+        processor.tokenizer,
+    )
+    mm = object.__new__(Glm5NextMultiModalProcessor)
+    mm.info = info
+    # Match vLLM's 32-frame decode of a 30-second, 2-fps video.
+    video = np.zeros((32, 112, 112, 3), dtype=np.uint8)
+    metadata = dict(
+        total_num_frames=60,
+        fps=2.0,
+        duration=30.0,
+        frames_indices=np.linspace(0, 59, 32, dtype=int).tolist(),
+        do_sample_frames=False,
+    )
+    original_metadata = copy.deepcopy(metadata)
+    output = mm._call_hf_processor(
+        "<|video|>", {"videos": [(video, metadata)]}, overrides, {}
+    )
+    grid = output["video_grid_thw"][0]
+    assert int(grid[0]) == expected_frames // 2
+    assert metadata == original_metadata
+    info.ctx = original_context
+    prompt = info._construct_glm5_video_placeholder(video, metadata, grid, overrides)
+    assert prompt.count(processor.image_token_id) == int(grid.prod()) // 4
+    if expected_frames == 4:
+        assert info._get_video_second_idx_glm46v(metadata, len(video), overrides) == [
+            0,
+            29,
+        ]
+
+
+def test_profile_inputs_keep_maximal_frames_despite_low_deployment_fps():
+    from vllm_fl.models.glm5_next_multimodal import (
+        Glm5NextDummyInputsBuilder,
+        Glm5NextMultiModalProcessor,
+    )
+
+    processor, info = make_processor({"max_frames": 32, "target_fps": 0.01})
+    info.ctx.model_config = SimpleNamespace(
+        get_multimodal_config=lambda: SimpleNamespace(enable_mm_embeds=False)
+    )
+    builder = Glm5NextDummyInputsBuilder(info)
+    inputs = builder.get_dummy_processor_inputs(34816, {"video": 1}, {})
+    assert inputs.hf_processor_mm_kwargs == {
+        "videos_kwargs": {"do_sample_frames": False}
+    }
+    video, metadata = inputs.mm_data_items["video"][0]
+    assert len(video) == 32
+    options = processor.resolve_serving_kwargs(inputs.hf_processor_mm_kwargs)
+    data, kwargs = Glm5NextMultiModalProcessor._get_direct_path_inputs(
+        {"videos": [(video, metadata)]}, options
+    )
+    output = processor(text="<|video|>", **data, **kwargs, return_tensors="pt")
+    grid = output["video_grid_thw"][0]
+    assert int(grid[0]) == 16
+    assert int(grid.prod()) // 4 == 16384
+    prompt = info._construct_glm5_video_placeholder(
+        video, metadata, grid, inputs.hf_processor_mm_kwargs
+    )
+    assert prompt.count(processor.image_token_id) == 16384

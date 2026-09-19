@@ -838,6 +838,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         from types import SimpleNamespace
 
         from vllm_fl.transformers_utils.processors.glm5_next import (
+            glm_select_decoded_frames,
             glm_video_timestamp_seconds,
         )
 
@@ -849,6 +850,13 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             do_sample_frames=metadata.get("do_sample_frames", True),
         )
         options = self.get_hf_processor().resolve_serving_kwargs(mm_kwargs or {})
+        if not video_metadata.do_sample_frames:
+            _, video_metadata.frames_indices = glm_select_decoded_frames(
+                self.get_video_processor(),
+                video_metadata,
+                total_frames,
+                **options["videos_kwargs"],
+            )
         return glm_video_timestamp_seconds(
             self.get_video_processor(), video_metadata, **options["videos_kwargs"]
         )
@@ -881,9 +889,42 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
     def _call_hf_processor(self, prompt, mm_data, mm_kwargs, tok_kwargs):
         if not mm_data:
             return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        from types import SimpleNamespace
+
         from vllm.multimodal.processing import BaseMultiModalProcessor
 
+        from vllm_fl.transformers_utils.processors.glm5_next import (
+            glm_select_decoded_frames,
+        )
+
         processor = self.info.get_hf_processor(**mm_kwargs)
+        options = processor.resolve_serving_kwargs(mm_kwargs)["videos_kwargs"]
+        # vLLM may have already sampled a video to its media-loader cap. Apply
+        # deployment/request sampling to that available subset before HF sees
+        # do_sample_frames=False, retaining the source timeline for prompts.
+        videos = mm_data.get("videos")
+        if isinstance(videos, list):
+            prepared = []
+            for item in videos:
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[1], Mapping)
+                    and item[1].get("do_sample_frames") is False
+                ):
+                    video, metadata = item
+                    rows, source_indices = glm_select_decoded_frames(
+                        processor.video_processor,
+                        SimpleNamespace(**metadata),
+                        len(video),
+                        **options,
+                    )
+                    item = (
+                        video[rows],
+                        dict(metadata, frames_indices=source_indices),
+                    )
+                prepared.append(item)
+            mm_data = dict(mm_data, videos=prepared)
         data, kwargs = self._get_direct_path_inputs(mm_data, mm_kwargs)
         # Resolve request precedence before InputProcessingContext re-merges
         # deployment kwargs. Otherwise a nested deployment default can mask a
@@ -930,6 +971,19 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
 
 
 class Glm5NextDummyInputsBuilder(Glm4vDummyInputsBuilder):
+    def get_dummy_processor_inputs(self, seq_len, mm_counts, mm_options):
+        from dataclasses import replace
+
+        inputs = super().get_dummy_processor_inputs(seq_len, mm_counts, mm_options)
+        # The dummy already has the maximal reserved frame count. Profiling
+        # must not shrink it according to a deployment's sampling rate.
+        kwargs = dict(inputs.hf_processor_mm_kwargs)
+        kwargs["videos_kwargs"] = {
+            **kwargs.get("videos_kwargs", {}),
+            "do_sample_frames": False,
+        }
+        return replace(inputs, hf_processor_mm_kwargs=kwargs)
+
     def get_dummy_mm_data(self, seq_len, mm_counts, mm_options):
         # Build video directly at its effective canvas. Repeating the maximal
         # still-image canvas hundreds of times wastes host memory before resize.

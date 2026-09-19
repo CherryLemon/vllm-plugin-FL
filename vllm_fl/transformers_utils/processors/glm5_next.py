@@ -19,6 +19,7 @@ are derived from the token bounds; there is no ``size``-edge budget.
 import json
 import math
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -199,6 +200,50 @@ def glm_sample_frame_indices_legacy(
     if len(unique) & 1:
         unique.append(unique[-1])
     return unique
+
+
+def glm_select_decoded_frames(video_processor, metadata, num_frames, **kwargs):
+    """Map the GLM sampler onto frames already decoded by vLLM's media loader.
+
+    Decoder frame IDs remain in the source video's timeline. Select nearest
+    available frames, deduplicate, and pad the last temporal group. Both pixel
+    preparation and prompt timestamps consume this mapping without mutating
+    the decoder's cached metadata.
+    """
+    source = getattr(metadata, "frames_indices", None)
+    if source is None:
+        if getattr(metadata, "total_num_frames", num_frames) != num_frames:
+            raise ValueError("Pre-sampled video requires source frame indices")
+        source = range(num_frames)
+    source = np.asarray(source, dtype=np.int64)
+    if (
+        source.ndim != 1
+        or len(source) != num_frames
+        or num_frames == 0
+        or np.any(source < 0)
+        or np.any(source[1:] < source[:-1])
+    ):
+        raise ValueError("Invalid pre-sampled video frame indices")
+    if kwargs.get("do_sample_frames") is False:
+        return list(range(num_frames)), source.tolist()
+
+    timeline = SimpleNamespace(
+        fps=getattr(metadata, "fps", None) or 24.0,
+        duration=getattr(metadata, "duration", None),
+        total_num_frames=getattr(metadata, "total_num_frames", None)
+        or int(source[-1]) + 1,
+    )
+    desired = video_processor.sample_frames(timeline, **kwargs)
+    right = np.searchsorted(source, desired).clip(0, num_frames - 1)
+    left = (right - 1).clip(0, num_frames - 1)
+    nearest = np.where(
+        np.abs(source[left] - desired) <= np.abs(source[right] - desired),
+        left,
+        right,
+    )
+    rows = list(dict.fromkeys(int(index) for index in nearest))
+    rows += [rows[-1]] * (-len(rows) % video_processor.temporal_patch_size)
+    return rows, source[rows].tolist()
 
 
 def glm_video_timestamp_seconds(
