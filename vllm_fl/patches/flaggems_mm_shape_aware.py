@@ -24,6 +24,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
 from typing import Any
 
@@ -259,6 +260,26 @@ def _registration_fingerprint() -> tuple[str, ...]:
     )
 
 
+def _flaggems_source(fn: Any) -> str | None:
+    """Verify code provenance, including vendor modules loaded as hopper.*.
+
+    FlagGems architecture loaders need not preserve the flag_gems module-name
+    prefix. Follow Python wrappers to the registered implementation's source
+    and require that it belongs to the loaded FlagGems package instead.
+    """
+    import flag_gems
+
+    try:
+        source = inspect.getsourcefile(inspect.unwrap(fn))
+        if source is None:
+            return None
+        path = Path(source).resolve()
+        root = Path(flag_gems.__file__).resolve().parent
+        return str(path) if path.is_relative_to(root) else None
+    except (TypeError, ValueError):
+        return None
+
+
 class _ObservedFlagGemsLibrary(torch.library.Library):
     """Observe successful registration, after FlagGems' own filtering.
 
@@ -361,9 +382,10 @@ def configure_flaggems_mm(
             enable_flaggems(gems_lib)
             gems = gems_lib.mm
             fn = gems_lib.mm_callable
+            source = _flaggems_source(fn)
             if (
                 gems is None
-                or not getattr(fn, "__module__", "").startswith("flag_gems.")
+                or source is None
                 or gems_lib.mm_registration != _registration_fingerprint()
                 or repr(gems) == repr(native)
             ):
@@ -386,7 +408,7 @@ def configure_flaggems_mm(
                 "installed",
                 f"native CUDA for M <= {config.threshold}; FlagGems otherwise",
                 repr(native),
-                f"{fn.__module__}.{fn.__name__}: {gems!r}",
+                f"{fn.__module__}.{fn.__name__} ({source}): {gems!r}",
             )
             _STATE = ShapeAwareMMState(
                 config, result, native, gems, gems_lib, library, registration

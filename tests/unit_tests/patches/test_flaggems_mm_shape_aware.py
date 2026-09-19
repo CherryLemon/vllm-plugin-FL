@@ -158,6 +158,10 @@ def test_real_dispatcher_process_lifetime(monkeypatch, scenario):
             calls.append('large')
             return a + 7
         fake_mm.__module__ = 'flag_gems.test_backend'
+        # Controlled provider for this dispatcher-lifecycle test. The real
+        # FlagGems source check is exercised separately and on GPU.
+        m._flaggems_source = lambda fn: ('flag_gems/test_backend.py'
+            if getattr(fn, '__module__', '') == 'flag_gems.test_backend' else None)
         def enable(lib):
             calls.append('enable')
             if scenario == 'filtered':
@@ -223,3 +227,24 @@ def test_apply_fails_without_safe_override_api():
 
     with pytest.raises(RuntimeError, match="with_keyset|allow_override"):
         shape_aware._register_override(OldLibrary(), lambda *args: None)
+
+
+def test_vendor_callable_identity_uses_source_not_module_prefix(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    def mm(a, b):
+        return a
+
+    mm.__module__ = "hopper.ops.mm"
+    root = Path(__file__).resolve().parent
+    monkeypatch.setitem(
+        sys.modules, "flag_gems", SimpleNamespace(__file__=str(root / "__init__.py"))
+    )
+    assert shape_aware._flaggems_source(mm) == str(Path(__file__).resolve())
+    monkeypatch.setitem(
+        sys.modules,
+        "flag_gems",
+        SimpleNamespace(__file__=str(root / "unrelated" / "__init__.py")),
+    )
+    assert shape_aware._flaggems_source(mm) is None

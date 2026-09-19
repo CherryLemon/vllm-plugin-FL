@@ -39,7 +39,7 @@ def test_flaggems_mm_identity_and_cuda_graph():
             flag_gems.only_enable(lib=lib, include=['mm'])
         status = m.configure_flaggems_mm(enable, whitelist=['mm'])
         assert status.status == 'installed'
-        assert 'flag_gems.' in status.flaggems
+        assert 'flag_gems/' in status.flaggems
         assert 'RegisterCUDA' in status.native
         state = m._STATE
         # Numerical output is checked against the captured native handle.
