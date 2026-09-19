@@ -26,3 +26,8 @@ The new kernel uses uint64 device pointer tables. Exposing a graph API alone
 does not establish support for that kernel on a different compiler or device.
 MUSA PIECEWISE and other vendor hardware require their own device validation;
 CUDA tests cannot establish their numerical or runtime compatibility.
+
+The producer's functional GPU tests follow the same enable policy. On other
+vendors, explicitly set `VLLM_FL_COMMON_ATTENTION_METADATA=1` to run those
+tests while validating the new kernel; the default suite retains the original
+producer's platform contract.

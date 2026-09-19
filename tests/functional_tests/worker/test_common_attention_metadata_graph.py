@@ -10,11 +10,21 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 from vllm_fl.worker.common_attention_metadata import (
     CommonAttentionMetadataGraphRunner,
+    common_attention_metadata_enabled,
     compute_common_attention_metadata,
     supports_accelerator_graph,
 )
 
-pytestmark = pytest.mark.gpu
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        not common_attention_metadata_enabled(),
+        reason=(
+            "The metadata producer is disabled on this platform; set "
+            "VLLM_FL_COMMON_ATTENTION_METADATA=1 for explicit kernel validation"
+        ),
+    ),
+]
 
 
 def _make_block_table(device: torch.device) -> MultiGroupBlockTable:
