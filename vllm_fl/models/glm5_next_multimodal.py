@@ -878,6 +878,21 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
 class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
     """Let vLLM, rather than the feature-only HF processor, update prompts."""
 
+    def _call_hf_processor(self, prompt, mm_data, mm_kwargs, tok_kwargs):
+        if not mm_data:
+            return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        from vllm.multimodal.processing import BaseMultiModalProcessor
+
+        processor = self.info.get_hf_processor(**mm_kwargs)
+        data, kwargs = self._get_direct_path_inputs(mm_data, mm_kwargs)
+        # Resolve request precedence before InputProcessingContext re-merges
+        # deployment kwargs. Otherwise a nested deployment default can mask a
+        # flat request override in Transformers' modality merge.
+        kwargs = processor.resolve_serving_kwargs(kwargs)
+        return BaseMultiModalProcessor._call_hf_processor(
+            self, prompt, data, kwargs, tok_kwargs
+        )
+
     def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
         from dataclasses import replace
         from vllm.multimodal.processing import PromptUpdateDetails

@@ -245,3 +245,40 @@ def test_checkpoint_sampling_rate_survives_hf_default_fps():
     assert int(grid[0]) == 2
     prompt = info._construct_glm5_video_placeholder(video, metadata, grid, {})
     assert prompt.count(processor.image_token_id) == int(grid.prod()) // 4
+
+
+@pytest.mark.parametrize(
+    "deployment,overrides,expected",
+    [
+        (
+            {"images_kwargs": {"max_image_tokens": 16000}},
+            {"max_image_tokens": 128},
+            128,
+        ),
+        (
+            {"max_image_tokens": 16000},
+            {"images_kwargs": {"max_image_tokens": 128}},
+            128,
+        ),
+    ],
+)
+def test_actual_vllm_context_merge_keeps_request_ceiling(
+    deployment, overrides, expected
+):
+    import torch
+    from vllm.config.multimodal import MultiModalConfig
+    from vllm.multimodal.processing import InputProcessingContext
+    from vllm_fl.models.glm5_next_multimodal import Glm5NextMultiModalProcessor
+
+    processor, info = make_processor(deployment)
+    config = MultiModalConfig(mm_processor_kwargs=deployment)
+    info.ctx = InputProcessingContext(
+        SimpleNamespace(get_multimodal_config=lambda: config, dtype=torch.float32),
+        processor.tokenizer,
+    )
+    mm = object.__new__(Glm5NextMultiModalProcessor)
+    mm.info = info
+    output = mm._call_hf_processor(
+        "<|image|>", {"images": [Image.new("RGB", (600, 900))]}, overrides, {}
+    )
+    assert int(output["image_grid_thw"].prod()) // 4 <= expected

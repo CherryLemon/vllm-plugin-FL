@@ -45,8 +45,17 @@ def test_flagos_cuda_runner_honors_breakable_graph() -> None:
 
 
 def test_kpool_custom_op_is_a_piecewise_split() -> None:
-    patch_source = (ROOT / "vllm_fl/patches/glm5_next_v024.py").read_text()
-    assert '"vllm::sparse_attn_indexer_kpool"' in patch_source
+    from vllm.config.compilation import CompilationConfig
+    from vllm_fl.activation import patch_inventory
+    from vllm_fl.patches.glm5_next_v024 import apply_glm5_next_v024_patches
+
+    apply_glm5_next_v024_patches()
+    assert "vllm::sparse_attn_indexer_kpool" in CompilationConfig._attention_ops
+    assert any(
+        p["target"].endswith("CompilationConfig._attention_ops")
+        and p["phase"] == "engine/config"
+        for p in patch_inventory()
+    )
 
 
 def test_indexer_translated_block_table_keeps_a_stable_base_address() -> None:
