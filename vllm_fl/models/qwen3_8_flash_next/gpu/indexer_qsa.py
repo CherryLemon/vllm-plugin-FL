@@ -24,9 +24,7 @@ from ..common.qsa_cache import (
 )
 from .nvidia_fast_paths import fast_gemma_rmsnorm, fast_qsa_rope
 
-_QSA_FUSED_COMPRESS_ENABLED = os.environ.get(
-    "QWEN4_QSA_FUSED_COMPRESS", "1"
-) != "0"
+_QSA_FUSED_COMPRESS_ENABLED = os.environ.get("QWEN4_QSA_FUSED_COMPRESS", "1") != "0"
 
 
 def apply_qsa_rope(
@@ -213,6 +211,29 @@ class QSAIndexer(nn.Module):
                 raise RuntimeError("QSA side-cache metadata positions disagree")
         return raw, compressed
 
+    def _compression_impl(self):
+        """The selected callable is shared by execution and identity reporting."""
+        from .ops import qsa as ops
+
+        rotary_dim = int(self.rotary_emb.rotary_dim)
+        section = getattr(self.rotary_emb, "mrope_section", None)
+        section = (rotary_dim // 2, 0, 0) if section is None else tuple(section)
+        if (
+            _QSA_FUSED_COMPRESS_ENABLED
+            and self.index_head_dim == 128
+            and rotary_dim == 64
+            and bool(getattr(self.rotary_emb, "is_neox_style", False))
+            and len(section) == 3
+            and sum(section) == rotary_dim // 2
+        ):
+            return ops.qsa_compress_norm_mrope_store_groups
+        return ops.qsa_compress_groups_with_ratio
+
+    def runtime_status(self) -> dict[str, Any]:
+        from ..vendor.vllm024.dispatch import qsa_runtime_status
+
+        return qsa_runtime_status(compression_impl=self._compression_impl())
+
     def _update_and_compress(
         self,
         token_k: torch.Tensor,
@@ -223,11 +244,9 @@ class QSAIndexer(nn.Module):
         num_tokens = raw_metadata.num_actual_tokens
         raw_key_cache = self.raw_key_cache.key_cache
         rope_position_cache = self.raw_key_cache.rope_position_cache
-        from .ops.qsa import (
-            qsa_compress_groups_with_ratio,
-            qsa_compress_norm_mrope_store_groups,
-            qsa_store_cache_rows,
-        )
+        from .ops.qsa import qsa_compress_norm_mrope_store_groups, qsa_store_cache_rows
+
+        compress = self._compression_impl()
 
         qsa_store_cache_rows(
             raw_key_cache,
@@ -249,18 +268,11 @@ class QSAIndexer(nn.Module):
             mrope_section = (rotary_dim // 2, 0, 0)
         else:
             mrope_section = tuple(int(section) for section in mrope_section)
-        if (
-            _QSA_FUSED_COMPRESS_ENABLED
-            and self.index_head_dim == 128
-            and rotary_dim == 64
-            and bool(getattr(self.rotary_emb, "is_neox_style", False))
-            and len(mrope_section) == 3
-            and sum(mrope_section) == rotary_dim // 2
-        ):
+        if compress is qsa_compress_norm_mrope_store_groups:
             cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(  # noqa: SLF001
                 token_k
             )
-            qsa_compress_norm_mrope_store_groups(
+            compress(
                 raw_key_cache,
                 raw_metadata.block_table,
                 compressed_metadata.token_to_req,
@@ -277,7 +289,7 @@ class QSAIndexer(nn.Module):
                 rope_position_cache,
             )
             return
-        pooled, first_positions = qsa_compress_groups_with_ratio(
+        pooled, first_positions = compress(
             raw_key_cache,
             raw_metadata.block_table,
             compressed_metadata.token_to_req,

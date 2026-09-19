@@ -8,14 +8,17 @@ keeps the already validated FlagOS implementation.  Setting
 runtime proves it is an NVIDIA CUDA/Triton path.  There is no silent second
 dispatch path.
 
-QSA uses the official image's fused pre-indexer and QSA math kernels. Only the
-model-side vLLM 0.24 metadata/cache ABI glue remains local; there is no second
-self-developed QSA implementation selected by this dispatch module.
+QSA runs the local gpu/ops/qsa.py composition. The vendored official QSA
+modules are reference sources, not selected runtime implementations. Identity
+reports resolve the actual local entry points and selected compression callable.
 """
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import os
+from pathlib import Path
 from typing import Any, Callable
 
 import torch
@@ -37,9 +40,7 @@ def _is_nvidia_cuda_triton_path() -> bool:
         from vllm.triton_utils import HAS_TRITON
 
         return bool(
-            HAS_TRITON
-            and current_platform.is_cuda()
-            and not current_platform.is_rocm()
+            HAS_TRITON and current_platform.is_cuda() and not current_platform.is_rocm()
         )
     except (AttributeError, ImportError, RuntimeError):
         return False
@@ -63,15 +64,62 @@ def use_official_hc() -> bool:
     return qwen4_hc_backend() == "official"
 
 
-def qwen4_qsa_pre_indexer_status() -> dict[str, Any]:
-    """Describe the official QSA pre-indexer selected by the vLLM 0.24 adapter."""
-
+def _callable_identity(fn: Callable[..., Any]) -> dict[str, Any]:
+    source = inspect.getsourcefile(fn)
     return {
-        "backend": "official_qsa_pre_indexer",
+        "callable": f"{fn.__module__}.{fn.__qualname__}",
+        "source": source,
+        "source_sha256": hashlib.sha256(Path(source).read_bytes()).hexdigest()
+        if source is not None
+        else None,
+    }
+
+
+def qsa_runtime_status(
+    *,
+    compression_impl: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Describe executable entry points; this is selection, not a launch trace.
+
+    An indexer instance supplies its shape-selected compression callable. Without
+    an instance, list both candidates without claiming which branch ran. Device,
+    shape and capture gates inside these entry points still require trace evidence.
+    """
+    from ...gpu.ops import qsa
+
+    stages = {
+        "metadata": qsa.build_qsa_forward_metadata,
+        "mqa": qsa.qsa_mqa_paged,
+        "topk": qsa._qsa_deterministic_block_topk,
+        "selection": qsa.qsa_select_paged_tokens,
+        "attention": qsa.qsa_sparse_paged_attention,
+        "cache_store": qsa.qsa_store_cache_rows,
+    }
+    if compression_impl is not None:
+        stages["compression"] = compression_impl
+    return {
+        "backend": "local_qsa_composition",
+        "evidence": "selected_callables_not_launch_trace",
+        "stages": {name: _callable_identity(fn) for name, fn in stages.items()},
+        "compression_candidates": []
+        if compression_impl is not None
+        else [
+            _callable_identity(qsa.qsa_compress_norm_mrope_store_groups),
+            _callable_identity(qsa.qsa_compress_groups_with_ratio),
+        ],
+        "official_pre_indexer_enabled": False,
+    }
+
+
+def qwen4_qsa_pre_indexer_status() -> dict[str, Any]:
+    """Compatibility status API: the vendored pre-indexer is not dispatched."""
+    return {
+        "backend": "local_qsa_composition",
         "official_kernel_vendored": True,
-        "enabled": True,
-        "reason": "official kernel called through the vLLM 0.24 metadata/cache adapter",
-        "metadata_graph": "vllm024_compat",
+        "enabled": False,
+        "reason": "local QSA composition is selected; vendor pre-indexer is reference-only",
+        "metadata_graph": "vllm024_local",
+        "runtime": qsa_runtime_status(),
     }
 
 
@@ -90,5 +138,6 @@ __all__ = [
     "dispatch_hc_math",
     "qwen4_hc_backend",
     "qwen4_qsa_pre_indexer_status",
+    "qsa_runtime_status",
     "use_official_hc",
 ]
