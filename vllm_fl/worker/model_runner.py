@@ -292,6 +292,11 @@ from vllm_fl.worker.common_slot_mapping import (
     compute_common_slot_mapping,
 )
 from vllm_fl.worker.packed_block_table import PackedBlockTableArena
+from vllm_fl.worker.async_output import (
+    _enqueue_native_completion,
+    _shutdown_native_completion_pool,
+    _wait_for_async_output_event,
+)
 GraphWrapper = GraphWrapper
 
 if TYPE_CHECKING:
@@ -304,181 +309,6 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
-
-
-# Waiting on a CUDA event from the async-output thread introduces a second
-# stream of CUDA runtime calls into the output-rank process. Under a busy
-# CUDA-graph serving loop, those calls contend with the model thread's launch
-# path and turn rank-arrival skew into apparent first-collective time.
-#
-# A Python cudaLaunchHostFunc callback is not safe here: the callback needs the
-# GIL, while a CUDA API running on the model thread may hold the GIL and wait
-# for the callback's stream (cudaProfilerStop is one concrete example). The
-# plugin C++ extension instead enqueues a native callback which only writes to
-# a Linux eventfd. The output thread blocks in os.read(), which releases the
-# GIL and does not enter the accelerator runtime. Unsupported platforms,
-# extension/driver ABI failures, and pool exhaustion retain vLLM's Event
-# synchronization fallback.
-_ASYNC_OUTPUT_COMPLETION_POOL_SIZE = 64
-
-
-class _NativeEventfdCompletionPool:
-    """Process-local pool of native stream-callback completion events."""
-
-    def __init__(self, capacity: int = _ASYNC_OUTPUT_COMPLETION_POOL_SIZE):
-        if capacity <= 0:
-            raise ValueError("Native completion pool capacity must be positive.")
-        if not hasattr(os, "eventfd"):
-            raise RuntimeError("Linux eventfd is unavailable.")
-
-        # Import lazily because non-NVIDIA platforms may intentionally ship no
-        # plugin extension. The op itself dynamically resolves libcuda.
-        import importlib
-
-        importlib.import_module("vllm_fl._C")
-        namespace = getattr(torch.ops, "vllm_fl", None)
-        enqueue_op = (
-            getattr(namespace, "enqueue_cuda_eventfd_completion", None)
-            if namespace is not None
-            else None
-        )
-        if enqueue_op is None:
-            raise RuntimeError(
-                "vllm_fl native eventfd completion op is unavailable."
-            )
-
-        event_fds: list[int] = []
-        try:
-            for _ in range(capacity):
-                event_fds.append(os.eventfd(0, os.EFD_CLOEXEC))
-        except Exception:
-            for event_fd in event_fds:
-                os.close(event_fd)
-            raise
-
-        self._enqueue_op = enqueue_op
-        self._event_fds = event_fds
-        self._available = list(range(capacity - 1, -1, -1))
-        self._lock = threading.Lock()
-        self._supported = True
-
-    def acquire(self) -> int | None:
-        with self._lock:
-            if not self._supported or not self._available:
-                return None
-            return self._available.pop()
-
-    def enqueue(self, stream: Any) -> "_NativeEventfdCompletion | None":
-        slot = self.acquire()
-        if slot is None:
-            return None
-        try:
-            status = int(
-                self._enqueue_op(
-                    int(stream.cuda_stream), self._event_fds[slot]
-                )
-            )
-            if status != 0:
-                raise RuntimeError(
-                    "native CUDA host callback enqueue failed with status "
-                    f"{status}"
-                )
-        except Exception as exc:
-            with self._lock:
-                self._supported = False
-                self._available.append(slot)
-            logger.warning_once(
-                "Native async-output completion is unavailable; using "
-                "accelerator Event synchronization instead: %s",
-                exc,
-            )
-            return None
-        return _NativeEventfdCompletion(self, slot)
-
-    def wait(self, slot: int) -> None:
-        # CPython releases the GIL around the blocking read. The native CUDA
-        # callback writes one uint64 after all preceding copy-stream work.
-        payload = os.read(self._event_fds[slot], 8)
-        if len(payload) != 8 or int.from_bytes(payload, "little") == 0:
-            raise RuntimeError("Invalid native completion eventfd payload.")
-
-    def release(self, slot: int) -> None:
-        with self._lock:
-            self._available.append(slot)
-
-
-class _NativeEventfdCompletion(NamedTuple):
-    pool: _NativeEventfdCompletionPool
-    slot: int
-
-
-_native_completion_pool: _NativeEventfdCompletionPool | bool | None = None
-_native_completion_pool_lock = threading.Lock()
-
-
-def _get_native_completion_pool() -> _NativeEventfdCompletionPool | None:
-    global _native_completion_pool
-    if not current_platform.is_cuda() or _native_completion_pool is False:
-        return None
-    if _native_completion_pool is None:
-        with _native_completion_pool_lock:
-            if _native_completion_pool is None:
-                try:
-                    _native_completion_pool = _NativeEventfdCompletionPool()
-                except (
-                    ImportError,
-                    AttributeError,
-                    OSError,
-                    RuntimeError,
-                    TypeError,
-                    ValueError,
-                ) as exc:
-                    _native_completion_pool = False
-                    logger.warning_once(
-                        "Native async-output completion initialization "
-                        "failed; using accelerator Event synchronization: %s",
-                        exc,
-                    )
-    return (
-        _native_completion_pool
-        if isinstance(_native_completion_pool, _NativeEventfdCompletionPool)
-        else None
-    )
-
-
-def _enqueue_native_completion(
-    stream: Any,
-) -> _NativeEventfdCompletion | None:
-    pool = _get_native_completion_pool()
-    if pool is None:
-        return None
-    completion = pool.enqueue(stream)
-    if completion is None and pool._supported:
-        logger.warning_once(
-            "Native async-output completion pool exhausted; using "
-            "accelerator Event synchronization for this output."
-        )
-    return completion
-
-
-def _wait_for_async_output_event(
-    event: Any, completion: _NativeEventfdCompletion | None
-) -> None:
-    """Wait until async D2H copies are safe to consume on the CPU."""
-    if completion is None:
-        event.synchronize()
-        return
-    try:
-        completion.pool.wait(completion.slot)
-    except (OSError, RuntimeError) as exc:
-        logger.warning_once(
-            "Native async-output completion wait failed; synchronizing the "
-            "accelerator Event instead: %s",
-            exc,
-        )
-        event.synchronize()
-    finally:
-        completion.pool.release(completion.slot)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -6895,6 +6725,7 @@ class ModelRunnerFL(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
+        _shutdown_native_completion_pool()
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
         # The cleanup above synchronizes and destroys slot-mapping graphs
