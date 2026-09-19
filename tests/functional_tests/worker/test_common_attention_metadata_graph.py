@@ -472,6 +472,8 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
 
 
 def test_graph_rebind_requires_invalidation_and_receipt_expires(device):
+    if not supports_accelerator_graph():
+        pytest.skip("Accelerator graph capture is unavailable")
     table = _make_block_table(device)
     runner = CommonAttentionMetadataGraphRunner(debug=True)
     query = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32, device=device)
@@ -504,6 +506,8 @@ def test_graph_rebind_requires_invalidation_and_receipt_expires(device):
 
 @pytest.mark.parametrize("mode", ["stock", "eager", "graph"])
 def test_metadata_modes_with_prefix_positions_and_request_reorder(device, mode):
+    if mode == "graph" and not supports_accelerator_graph():
+        pytest.skip("Accelerator graph capture is unavailable")
     table = _make_block_table(device)
     runner = CommonAttentionMetadataGraphRunner(debug=True)
     query = torch.tensor([0, 2, 4, 4, 4], dtype=torch.int32, device=device)
