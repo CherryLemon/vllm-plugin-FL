@@ -23,10 +23,20 @@ storage is distinct from the FP8 indexer KV cache; the latter remains supported.
 
 Validation uses vLLM 0.24.0, Torch 2.11.0+cu129, Transformers 5.12.1 and
 FlagGems 5.3.3.dev15+gf471641e5.pkgfix1. The CPU suite passed 718 tests (7 GPU
-cases deselected). Installed-wheel H100 operator tests passed six cases,
+cases deselected). Installed-wheel validation passed 52 tests, including six H100 operator cases,
 including updated block-table/context replay, padded page strides, and
 FP16/BF16 variable-length vision attention. These checks do not by themselves
 establish end-to-end multimodal quality or full-model graph support.
+
+A wheel built from `d83b7f978338e495a475c441c510593c9377c697` also passed
+BF16 TP16/EP startup with all 47 checkpoint shards and 23 targeted serving
+requests: short arithmetic, mixed 12,122/14,322/18,722/23,122-token retrieval,
+16 concurrent independent codes, one image and a 0.4-second video. Every
+response finished with `stop` and matched its expected content; isolation
+responses contained only their own request code. Both service installations
+matched all 212 wheel source hashes, and neither node logged an inference
+error. These are smoke checks, not a full quality or maximum-capacity test;
+startup used `--skip-mm-profiling`, and full GPQA was not rerun.
 
 The sparse MLA graph opt-in remains off. Historical GPQA and throughput
 measurements belong to their original source snapshots; they are not reruns of
