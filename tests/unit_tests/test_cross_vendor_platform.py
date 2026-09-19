@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 _PLATFORM_PROBE = textwrap.dedent(
-    r'''
+    r"""
     import enum
     import importlib.util
     import json
@@ -170,7 +170,7 @@ _PLATFORM_PROBE = textwrap.dedent(
         payload["uuid"] = cls.get_device_uuid()
         payload["fully_connected"] = cls.is_fully_connected([0, 1])
     print(json.dumps(payload, sort_keys=True))
-    '''
+    """
 )
 
 
@@ -201,11 +201,14 @@ def test_vendor_probe_isolated_from_accelerator_runtime(
 
     assert payload["vendor"] == vendor
     assert payload["map_type"] == "cuda"
-    assert payload["map_name"] == {
-        "amd": "cuda",
-        "nvidia": "nvidia",
-        "hygon": "cuda",
-    }[vendor]
+    assert (
+        payload["map_name"]
+        == {
+            "amd": "cuda",
+            "nvidia": "nvidia",
+            "hygon": "cuda",
+        }[vendor]
+    )
     assert payload["is_rocm"] is is_rocm
     assert payload["is_cuda"] is is_cuda
     assert payload["is_cuda_alike"] is is_cuda_alike
@@ -244,8 +247,7 @@ def test_rocm_moe_priority_includes_aiter_and_triton(monkeypatch):
         pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
 
     monkeypatch.setattr(
-        fused_moe_utils,
-        "current_platform",
+        "vllm.platforms.current_platform",
         SimpleNamespace(
             is_rocm=lambda: True,
             is_cuda=lambda: False,
@@ -269,8 +271,7 @@ def test_unknown_oot_moe_priority_falls_back_to_triton(monkeypatch):
         pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
 
     monkeypatch.setattr(
-        fused_moe_utils,
-        "current_platform",
+        "vllm.platforms.current_platform",
         SimpleNamespace(
             is_rocm=lambda: False,
             is_cuda=lambda: False,
