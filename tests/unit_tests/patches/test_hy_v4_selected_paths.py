@@ -142,6 +142,17 @@ def test_topk_128_resolves_native_without_any_flaggems_dependency(monkeypatch):
     assert plan.prefill_backend is backend
 
 
+@pytest.mark.parametrize("topk,available", [(128, False), (2048, True)])
+def test_native_generic_decode_callable_is_required_only_when_used(
+    monkeypatch, topk, available
+):
+    import vllm._custom_ops as ops
+
+    _native_capabilities(monkeypatch, set())
+    monkeypatch.setattr(ops, "top_k_per_row_decode", None)
+    assert runtime.native_hy4_available(topk) is available
+
+
 @pytest.mark.parametrize("error_type", [TypeError, AttributeError])
 @pytest.mark.parametrize("during_iteration", [False, True])
 def test_expert_mapping_helper_errors_propagate(

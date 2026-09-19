@@ -248,6 +248,14 @@ def native_hy4_available(index_topk: int) -> bool:
         "_C_cache_ops::cp_gather_indexer_k_quant_cache",
         "_C::top_k_per_row_prefill",
     ]
+    implementations = [
+        indexer.fp8_fp4_mqa_logits,
+        indexer.fp8_fp4_paged_mqa_logits,
+        flash_mla_sparse_fwd,
+        ops.indexer_k_quant_and_cache,
+        ops.cp_gather_indexer_k_quant_cache,
+        ops.top_k_per_row_prefill,
+    ]
     if index_topk in (512, 1024, 2048):
         kernels.append("_C::persistent_topk")
         # Dynamic H100 batches can reach either persistent or cooperative top-k.
@@ -255,16 +263,9 @@ def native_hy4_available(index_topk: int) -> bool:
             kernels.append("_C::cooperative_topk")
     else:
         kernels.append("_C::top_k_per_row_decode")
+        implementations.append(ops.top_k_per_row_decode)
     return all(has_device_kernel(name, "cuda") for name in kernels) and all(
-        callable(implementation)
-        for implementation in (
-            indexer.fp8_fp4_mqa_logits,
-            indexer.fp8_fp4_paged_mqa_logits,
-            flash_mla_sparse_fwd,
-            ops.indexer_k_quant_and_cache,
-            ops.cp_gather_indexer_k_quant_cache,
-            ops.top_k_per_row_prefill,
-        )
+        callable(implementation) for implementation in implementations
     )
 
 
