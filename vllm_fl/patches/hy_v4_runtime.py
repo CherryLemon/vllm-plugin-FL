@@ -7,9 +7,13 @@ It is not an instance-local provider and must not be used to hot-swap models
 in an already initialized worker.
 """
 
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import wraps
 from threading import RLock
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -61,7 +65,97 @@ def require_flaggems_policy() -> None:
         )
 
 
-def validate_hy4_runtime(vllm_config) -> None:
+@dataclass(frozen=True)
+class HY4RuntimePlan:
+    provider: str
+    query_quantizer: Callable
+    operations: Mapping[str, Callable]
+    prefill_backend: type
+    kv_cache_dtypes: tuple[str, ...]
+
+
+def _load_flaggems_implementations() -> dict[str, Callable]:
+    require_flaggems_policy()
+    import flag_gems
+    import flag_gems.fused as fused
+
+    implementations = {
+        name: getattr(
+            flag_gems
+            if name in ("per_token_group_quant_fp8", "flash_attn_varlen_func")
+            else fused,
+            name,
+            None,
+        )
+        for name in _REQUIRED_GEMS
+    }
+    missing = [
+        name
+        for name, implementation in implementations.items()
+        if not callable(implementation)
+    ]
+    if missing:
+        raise RuntimeError(
+            "HY4 required FlagGems implementations unavailable: " + ", ".join(missing)
+        )
+    return implementations
+
+
+def _prefill_is_available(backend) -> bool:
+    if not backend.is_available():
+        return False
+    if backend.get_name() == "FLASH_ATTN":
+        # Validate the captured global actually invoked by this backend.
+        from vllm.v1.attention.backends.mla.prefill import flash_attn
+
+        return callable(getattr(flash_attn, "flash_attn_varlen_func", None))
+    return True
+
+
+def select_hy4_prefill_backend(vllm_config, native_selector, fallback_backend=None):
+    """Only automatic absence of an implementation permits a fallback."""
+    explicit = vllm_config.attention_config.mla_prefill_backend is not None
+    try:
+        backend = native_selector(vllm_config)
+        if _prefill_is_available(backend):
+            return backend
+        if explicit:
+            raise RuntimeError(
+                "Explicit HY4 MLA prefill backend has no callable implementation"
+            )
+    except (ImportError, OSError):
+        if explicit:
+            raise
+    except ValueError as exc:
+        # vLLM 0.24 signals exhausted automatic candidates with this message.
+        # Other configuration errors (and AssertionError) must remain visible.
+        if explicit or not str(exc).startswith("No valid MLA prefill backend found"):
+            raise
+    return fallback_backend
+
+
+def _flaggems_query_quantizer(implementation):
+    @wraps(implementation)
+    def quantize(x, group_size, *, use_ue8m0):
+        return implementation(x, group_size, scale_ue8m0=use_ue8m0)
+
+    return quantize
+
+
+def prepare_hy4_runtime(vllm_config) -> HY4RuntimePlan:
+    plan = validate_hy4_runtime(vllm_config)
+    install_hy4_flaggems_fallback(plan)
+    logger.info_once(
+        "HY4 runtime: provider=%s, query_quantizer=%s, prefill=%s, KV=%s",
+        plan.provider,
+        f"{plan.query_quantizer.__module__}.{plan.query_quantizer.__name__}",
+        plan.prefill_backend.get_name(),
+        vllm_config.cache_config.cache_dtype,
+    )
+    return plan
+
+
+def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     """Reject unsupported combinations before allocating/loading model weights."""
     from vllm.platforms import current_platform
 
@@ -70,6 +164,8 @@ def validate_hy4_runtime(vllm_config) -> None:
     from vllm.v1.attention.ops import flashmla
 
     cache_dtype = vllm_config.cache_config.cache_dtype
+    if cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+        raise ValueError(f"Unsupported HY4 KV cache dtype: {cache_dtype}")
     # The portable sparse MLA implementation handles BF16 KV only. FP8 KV
     # additionally requires native metadata and decode extensions.
     if str(cache_dtype).startswith("fp8"):
@@ -82,8 +178,72 @@ def validate_hy4_runtime(vllm_config) -> None:
             raise ValueError(
                 "HY4 FlagGems empty-build provider supports only auto/bfloat16 KV; FP8 KV is unsupported"
             )
-    if not native_hy4_available():
-        require_flaggems_policy()
+    import vllm.model_executor.layers.attention.mla_attention as mla_attention
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    selector = mla_attention.get_mla_prefill_backend
+    selector = getattr(selector, "_hy4_native_selector", selector)
+    prefill_backend = select_hy4_prefill_backend(vllm_config, selector)
+    native = native_hy4_available() and prefill_backend is not None
+    if getattr(indexer, "_hy4_flaggems_fallback", False):
+        native = False
+    if not native:
+        if str(cache_dtype).startswith("fp8"):
+            raise ValueError(
+                "HY4 FP8 KV requires a complete native path including MLA prefill"
+            )
+        if cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError("HY4 FlagGems provider supports only auto/bfloat16 KV")
+        if cache_dtype == "auto" and vllm_config.model_config.dtype != torch.bfloat16:
+            raise ValueError("HY4 FlagGems auto KV requires bfloat16 model dtype")
+        implementations = _load_flaggems_implementations()
+        if prefill_backend is None:
+            prefill_backend = _make_hy4_flaggems_mla_prefill_backend(
+                implementations["flash_attn_varlen_func"]
+            )
+        return HY4RuntimePlan(
+            "flaggems",
+            _flaggems_query_quantizer(implementations["per_token_group_quant_fp8"]),
+            MappingProxyType(implementations),
+            prefill_backend,
+            ("auto", "bfloat16"),
+        )
+
+    import vllm._custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    query_quantizer = per_token_group_quant_fp8
+    if use_flaggems_op("per_token_group_quant_fp8"):
+        try:
+            from flag_gems import per_token_group_quant_fp8 as gems_quantizer
+        except ImportError:
+            pass
+        else:
+            if callable(gems_quantizer):
+                query_quantizer = _flaggems_query_quantizer(gems_quantizer)
+    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+    return HY4RuntimePlan(
+        "native",
+        query_quantizer,
+        MappingProxyType(
+            {
+                "fp8_fp4_mqa_logits": indexer.fp8_fp4_mqa_logits,
+                "fp8_fp4_paged_mqa_logits": indexer.fp8_fp4_paged_mqa_logits,
+                "indexer_k_quant_and_cache": ops.indexer_k_quant_and_cache,
+                "cp_gather_indexer_k_quant_cache": ops.cp_gather_indexer_k_quant_cache,
+                "top_k_per_row_prefill": ops.top_k_per_row_prefill,
+                "persistent_topk": torch.ops._C.persistent_topk,
+                "cooperative_topk": torch.ops._C.cooperative_topk,
+                "concat_and_cache_mla": ops.concat_and_cache_mla,
+                "flash_mla_sparse_fwd": flash_mla_sparse_fwd,
+            }
+        ),
+        prefill_backend,
+        ("auto", "bfloat16", "fp8", "fp8_e4m3"),
+    )
 
 
 def native_hy4_available() -> bool:
@@ -99,6 +259,11 @@ def native_hy4_available() -> bool:
                 "_C::per_token_group_fp8_quant",
                 "_C_cache_ops::concat_and_cache_mla",
                 "_C_cache_ops::concat_mla_q",
+                "_C_cache_ops::indexer_k_quant_and_cache",
+                "_C_cache_ops::cp_gather_indexer_k_quant_cache",
+                "_C::top_k_per_row_prefill",
+                "_C::persistent_topk",
+                "_C::cooperative_topk",
             )
         )
     )
@@ -131,14 +296,19 @@ def patch_transaction():
             raise
 
 
-def install_hy4_flaggems_fallback() -> bool:
+def install_hy4_flaggems_fallback(plan: HY4RuntimePlan | None = None) -> bool:
     with patch_transaction() as tx:
-        return _install_fallback(tx)
+        return _install_fallback(tx, plan)
 
 
-def _make_hy4_flaggems_mla_prefill_backend() -> type:
+def _make_hy4_flaggems_mla_prefill_backend(flash_attn_varlen_func=None) -> type:
     """Build the MLA prefill adapter without importing FA extensions."""
     from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+
+    if flash_attn_varlen_func is None:
+        from flag_gems import flash_attn_varlen_func
+    if not callable(flash_attn_varlen_func):
+        raise RuntimeError("HY4 FlagGems flash_attn_varlen_func is unavailable")
 
     class FlagGemsMLAPrefillBackend(MLAPrefillBackend):
         @staticmethod
@@ -147,12 +317,7 @@ def _make_hy4_flaggems_mla_prefill_backend() -> type:
 
         @classmethod
         def is_available(cls) -> bool:
-            try:
-                from flag_gems import flash_attn_varlen_func  # noqa: F401
-
-                return True
-            except ImportError:
-                return False
+            return callable(flash_attn_varlen_func)
 
         def _flash_attn_varlen(
             self,
@@ -168,8 +333,6 @@ def _make_hy4_flaggems_mla_prefill_backend() -> type:
             return_softmax_lse: bool,
             out: torch.Tensor | None = None,
         ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            from flag_gems import flash_attn_varlen_func
-
             # MLA has q/k head dim 576 and value dim 512.  FlagGems accepts
             # different head dimensions through padding, matching vLLM's
             # FlashAttention prefill adapter.
@@ -261,15 +424,20 @@ def _make_hy4_flaggems_mla_prefill_backend() -> type:
     return FlagGemsMLAPrefillBackend
 
 
-def _install_fallback(tx) -> bool:
+def _install_fallback(tx, plan: HY4RuntimePlan | None = None) -> bool:
     """Install process-wide compatibility for a dedicated HY4 worker."""
     import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 
     if getattr(sparse_indexer, "_hy4_flaggems_fallback", False):
         require_flaggems_policy()
         return True
-    if native_hy4_available():
+    if (plan is not None and plan.provider == "native") or (
+        plan is None and native_hy4_available()
+    ):
         return False
+    implementations = (
+        dict(plan.operations) if plan is not None else _load_flaggems_implementations()
+    )
     require_flaggems_policy()
 
     try:
@@ -312,16 +480,16 @@ def _install_fallback(tx) -> bool:
         )
         tx.set(flashmla_sparse_module, "HAS_TLE_FLASHMLA_SPARSE", False)
 
-        from flag_gems.fused import (
-            concat_and_cache_mla as flaggems_concat_and_cache_mla,
-            cp_gather_indexer_k_quant_cache,
-            flash_mla_sparse_fwd,
-            fp8_fp4_mqa_logits,
-            fp8_fp4_paged_mqa_logits,
-            indexer_k_quant_and_cache,
-            top_k_per_row_decode,
-            top_k_per_row_prefill,
-        )
+        flaggems_concat_and_cache_mla = implementations["concat_and_cache_mla"]
+        cp_gather_indexer_k_quant_cache = implementations[
+            "cp_gather_indexer_k_quant_cache"
+        ]
+        flash_mla_sparse_fwd = implementations["flash_mla_sparse_fwd"]
+        fp8_fp4_mqa_logits = implementations["fp8_fp4_mqa_logits"]
+        fp8_fp4_paged_mqa_logits = implementations["fp8_fp4_paged_mqa_logits"]
+        indexer_k_quant_and_cache = implementations["indexer_k_quant_and_cache"]
+        top_k_per_row_decode = implementations["top_k_per_row_decode"]
+        top_k_per_row_prefill = implementations["top_k_per_row_prefill"]
     except (ImportError, OSError) as exc:
         raise RuntimeError(
             "HY4 empty-build runtime has no DeepGEMM and FlagGems DSA kernels "
@@ -414,43 +582,20 @@ def _install_fallback(tx) -> bool:
     import vllm.v1.attention.backends.mla.prefill as prefill
     import vllm.v1.attention.backends.mla.prefill.selector as prefill_selector
 
-    def has_callable_flash_attn_varlen() -> bool:
-        """Check the function the FlashAttention backend will actually call.
-
-        The empty-build vLLM wheel keeps the extension module importable and
-        makes its availability probe return true on CUDA, but the exported
-        function is ``None``.  Checking the backend's captured global catches
-        that ABI stub before its constructor asserts.
-        """
-        try:
-            from vllm.v1.attention.backends.mla.prefill import flash_attn
-
-            if callable(getattr(flash_attn, "flash_attn_varlen_func", None)):
-                return True
-        except (ImportError, OSError):
-            pass
-        try:
-            import vllm.vllm_flash_attn as vllm_flash_attn
-
-            return callable(getattr(vllm_flash_attn, "flash_attn_varlen_func", None))
-        except (ImportError, OSError):
-            return False
-
     if not getattr(mla_attention, "_hy4_flaggems_prefill_fallback", False):
         native_get_prefill_backend = mla_attention.get_mla_prefill_backend
-        flaggems_prefill_backend = _make_hy4_flaggems_mla_prefill_backend()
+        flaggems_prefill_backend = (
+            plan.prefill_backend
+            if plan is not None
+            else _make_hy4_flaggems_mla_prefill_backend()
+        )
 
         def get_hy4_prefill_backend(vllm_config):
-            try:
-                backend = native_get_prefill_backend(vllm_config)
-                if backend.is_available() and (
-                    backend.get_name() != "FLASH_ATTN"
-                    or has_callable_flash_attn_varlen()
-                ):
-                    return backend
-            except (ImportError, OSError, AssertionError, ValueError):
-                pass
-            return flaggems_prefill_backend
+            return select_hy4_prefill_backend(
+                vllm_config, native_get_prefill_backend, flaggems_prefill_backend
+            )
+
+        get_hy4_prefill_backend._hy4_native_selector = native_get_prefill_backend
 
         tx.set(mla_attention, "get_mla_prefill_backend", get_hy4_prefill_backend)
         tx.set(prefill, "get_mla_prefill_backend", get_hy4_prefill_backend)

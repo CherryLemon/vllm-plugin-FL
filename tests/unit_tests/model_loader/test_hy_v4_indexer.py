@@ -709,3 +709,87 @@ def test_split_expert_component_coverage(monkeypatch, omitted):
     else:
         with pytest.raises(ValueError, match="component coverage.*expert=1 shard=w3"):
             HYV4ForCausalLM.load_weights(model, weights)
+
+
+@pytest.mark.parametrize(
+    "projection,sizes,sources",
+    [
+        ("mlp.gate_up_proj", [4, 4], ("gate_proj", "up_proj")),
+        ("self_attn.indexer.wk_weights_proj", [4, 2], ("wk", "weights_proj")),
+    ],
+)
+def test_complete_fused_safetensors_equals_split_loading(
+    monkeypatch, tmp_path, projection, sizes, sources
+):
+    from safetensors.torch import load_file, save_file
+
+    import vllm.model_executor.parameter as parameters
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    _patch_cpu_parallelism(monkeypatch)
+    # Actual vLLM parameter/loader, with the indexer's replicated TP contract.
+    monkeypatch.setattr(parameters, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameters, "get_tensor_model_parallel_world_size", lambda: 1)
+    name = f"model.layers.0.{projection}.weight"
+    fused = torch.arange(sum(sizes) * 8, dtype=torch.float32).reshape(sum(sizes), 8)
+    loaded = []
+    for full in (False, True):
+        with torch.device("cpu"):
+            layer = MergedColumnParallelLinear(
+                8, sizes, bias=False, disable_tp=True, params_dtype=torch.float32
+            )
+        param = layer.weight
+        model = _make_integration_model({name: param})
+        if full:
+            # The enclosing model's TP can differ from this replicated layer.
+            monkeypatch.setattr(
+                hy_v4, "get_tensor_model_parallel_world_size", lambda: 2
+            )
+            tensors = {name: fused}
+        else:
+            tensors = {
+                name.replace(projection.split(".")[-1], source): part.contiguous()
+                for source, part in zip(sources, fused.split(sizes))
+            }
+        path = tmp_path / f"{full}.safetensors"
+        save_file(tensors, path)
+        assert HYV4ForCausalLM.load_weights(model, load_file(path).items()) == {name}
+        loaded.append(param.detach().clone())
+    torch.testing.assert_close(loaded[0], fused, rtol=0, atol=0)
+    torch.testing.assert_close(loaded[1], fused, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [4, 9])
+def test_complete_fused_bad_shape_rejected_before_write(monkeypatch, rows):
+    _patch_cpu_parallelism(monkeypatch)
+    name = "model.layers.0.mlp.gate_up_proj.weight"
+    param = torch.nn.Parameter(torch.full((8, 4), -12345.0))
+    param.weight_loader = lambda *args: pytest.fail(
+        "shape must be checked before writing"
+    )
+    with pytest.raises(ValueError, match="complete fused tensor shape mismatch"):
+        HYV4ForCausalLM.load_weights(
+            _make_integration_model({name: param}), [(name, torch.ones(rows, 4))]
+        )
+    assert torch.all(param == -12345)
+
+
+def test_complete_fused_global_tensor_shards_to_local_tp_rank(monkeypatch):
+    import vllm.model_executor.layers.linear as linear
+    import vllm.model_executor.parameter as parameters
+
+    for module in (hy_v4, linear, parameters):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+    with torch.device("cpu"):
+        layer = linear.MergedColumnParallelLinear(
+            4, [8, 8], bias=False, params_dtype=torch.float32
+        )
+    name = "model.layers.0.mlp.gate_up_proj.weight"
+    fused = torch.arange(64, dtype=torch.float32).reshape(16, 4)
+    assert HYV4ForCausalLM.load_weights(
+        _make_integration_model({name: layer.weight}), [(name, fused)]
+    ) == {name}
+    torch.testing.assert_close(
+        layer.weight, torch.cat([fused[4:8], fused[12:16]]), rtol=0, atol=0
+    )

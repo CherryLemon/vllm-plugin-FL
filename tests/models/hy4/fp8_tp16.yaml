@@ -21,15 +21,19 @@ llm:
 
 generate:
   prompts:
-    - 'Finish the sentence: The capital of France is'
+    - text: 'Finish the sentence: The capital of France is'
+      expected: 'Paris'
   sampling:
     temperature: 0.0
     max_tokens: 512
 serve:
   endpoints: [chat]
-  chat_messages:
-    - role: user
-      content: 'What color do you get when you mix blue and yellow paint? Answer briefly.'
+  chat_cases:
+    - name: color_semantics
+      messages:
+        - role: user
+          content: 'What color do you get when you mix blue and yellow paint? Answer briefly.'
+      expected: green
   max_tokens: 512
   sampling:
     temperature: 0.0

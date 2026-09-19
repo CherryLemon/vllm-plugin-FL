@@ -42,8 +42,12 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
 
+from vllm_fl.patches.hy_v4_runtime import (
+    HY4RuntimePlan,
+    has_device_kernel,
+    prepare_hy4_runtime,
+)
 from vllm_fl.utils import use_flaggems_op
-from vllm_fl.patches.hy_v4_runtime import has_device_kernel
 
 logger = init_logger(__name__)
 
@@ -79,11 +83,6 @@ def _hy4_per_token_group_quant_fp8(
         f"device={x.device}, dtype={x.dtype}; FlagGems is disabled/unavailable "
         "or blacklisted and vLLM _C has no device/composite kernel."
     )
-
-
-def _install_hy4_flaggems_fallback() -> bool:
-    from vllm_fl.patches.hy_v4_runtime import install_hy4_flaggems_fallback
-    return install_hy4_flaggems_fallback()
 
 
 def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
@@ -194,8 +193,10 @@ class Indexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
         prefix: str = "",
+        runtime_plan: HY4RuntimePlan | None = None,
     ):
         super().__init__()
+        self.runtime_plan = runtime_plan or prepare_hy4_runtime(vllm_config)
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
@@ -245,7 +246,7 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
-        use_flaggems_indexer = _install_hy4_flaggems_fallback()
+        use_flaggems_indexer = self.runtime_plan.provider == "flaggems"
         self.indexer_op = SparseAttnIndexer(
             self.k_cache,
             self.quant_block_size,
@@ -314,7 +315,7 @@ class Indexer(nn.Module):
 
         # Only q is quantized here; k quantization is fused with cache insertion.
         q = q.view(-1, self.head_dim)
-        q_fp8, q_scale = _hy4_per_token_group_quant_fp8(
+        q_fp8, q_scale = self.runtime_plan.query_quantizer(
             q,
             self.quant_block_size,
             use_ue8m0=self.scale_fmt is not None,
@@ -338,8 +339,8 @@ class HYV4MLAAttention(nn.Module):
     gate (``gated_mla``) and a per-head learnable attention sink.
 
     The sink is applied by binding the sink-capable backend from
-    `.flashmla_sparse`; if no backend on this platform can consume sinks, the
-    weight is still loaded but the bias is disabled with a warning.
+    `.flashmla_sparse`. Construction fails if the selected backend cannot
+    consume sinks; the checkpoint's sink semantics are never disabled.
     """
 
     def __init__(
@@ -359,12 +360,14 @@ class HYV4MLAAttention(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         layer_idx: int = 0,
+        runtime_plan: HY4RuntimePlan | None = None,
     ) -> None:
         # Install before MLAAttention's constructor selects/instantiates its
         # prefill backend.  Indexer construction happens later for some
         # layers, which is too late for the empty-build FlashAttention stub.
-        _install_hy4_flaggems_fallback()
+        runtime_plan = runtime_plan or prepare_hy4_runtime(vllm_config)
         super().__init__()
+        self.runtime_plan = runtime_plan
         self.config = config
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -522,6 +525,7 @@ class HYV4MLAAttention(nn.Module):
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
+                runtime_plan=runtime_plan,
             )
         else:
             self.indexer_rope_emb = None

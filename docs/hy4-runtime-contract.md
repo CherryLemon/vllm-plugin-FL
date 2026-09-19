@@ -16,7 +16,13 @@ is `hy_v4`.
   this does not constitute new distributed PP validation.
 - Weight coverage checks both parameter names and fused components. Gate/up,
   WK/weights-projection, and each local expert's weight/scale shards must all
-  be supplied. Remote PP/EP components are not required on the current rank.
+  be supplied. Complete fused gate/up and WK/weights-projection tensors are
+  also accepted: their full shape is checked before loading, respecting the
+  destination parameter's TP layout, then all components are recorded.
+  Direct routed-expert destination tensors remain unsupported; use the split
+  expert names or packed gate_up_proj/down_proj layout. FP8 values requiring
+  dequantization must retain split weight/scale names. Remote PP/EP components
+  are not required on the current rank.
 - The portable FlagGems provider supports BF16 KV, including `auto` when model
   dtype is BF16. FP8 KV requires a complete native FlashMLA metadata/decode
   path. Weight quantization does not imply support for quantized KV.
@@ -28,7 +34,19 @@ is `hy_v4`.
 ## Compatibility and optimization scope
 
 The fallback installer in `patches/hy_v4_runtime.py` modifies process-global
-vLLM and FlagGems attributes in a dedicated HY4 worker. Installation is locked,
+vLLM and FlagGems attributes in a dedicated HY4 worker. Before weight buffers
+are allocated, HY4 resolves a runtime plan containing the query quantizer,
+indexer/top-k, cache-update and sparse-attention implementations, MLA prefill
+backend, and supported KV dtypes. Required FlagGems implementations must be
+callable as well as permitted by policy. Native selection also requires a
+usable prefill implementation. Decoder layers consume the resolved plan;
+query quantization no longer imports/probes a provider on every forward.
+
+Explicit `mla_prefill_backend` selections preserve upstream errors. Only
+missing automatic candidates may select the portable backend; arbitrary
+configuration ValueError and AssertionError are propagated.
+
+Installation is locked,
 failed attempts roll back, and the completion marker is set last. It no
 longer changes the `has_deep_gemm` capability fact. This is still a compatibility
 adapter, not an instance-isolated provider: hot-swapping unrelated models in
@@ -36,7 +54,7 @@ the same initialized process remains unsupported. Replacing these patches
 with explicit provider injection is follow-up work.
 
 The common attention metadata producer optimization is excluded from this
-model change. `ModelRunnerFL` retains the main branch's BlockTable producer,
+model change and is tracked separately in #442. `ModelRunnerFL` retains the main branch's BlockTable producer,
 including eager, padding, and speculative-decoding behavior.
 
 HC projection, HC pointwise fusion, and shape-aware MM are opt-in pending a
@@ -59,7 +77,8 @@ The real checkpoint case `hy4/fp8_tp16` is discoverable for CUDA/H100 through
 It requires the checkpoint mounted at `/data/models/Hy4-preview-FP8-Testing`
 and a dedicated `gpu-16` runner. Discovery is not proof that such a runner
 has been provisioned or that CI has executed the case. The standard case is
-a real-weight smoke test, not a logits-parity or accuracy benchmark.
+a real-weight semantic smoke test with expected Paris/green answers, not a
+logits-parity or accuracy benchmark.
 
 The separate `tests/e2e_tests/inference/test_hy_v4.py` is a manually invoked
 single-GPU dummy-weight smoke and must not be reported as checkpoint validation.

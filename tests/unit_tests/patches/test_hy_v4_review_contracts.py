@@ -250,3 +250,123 @@ def test_fp8_kv_requires_native_metadata(monkeypatch):
         runtime.validate_hy4_runtime(
             SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="fp8"))
         )
+
+
+def _prefill_config(explicit=None):
+    return SimpleNamespace(
+        attention_config=SimpleNamespace(mla_prefill_backend=explicit),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+
+
+def test_explicit_valid_prefill_is_preserved():
+    backend = SimpleNamespace(is_available=lambda: True, get_name=lambda: "CUSTOM")
+    assert (
+        runtime.select_hy4_prefill_backend(
+            _prefill_config("CUSTOM"), lambda cfg: backend, object()
+        )
+        is backend
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("invalid explicit selection"),
+        ImportError("missing extension"),
+        AssertionError("invalid dimensions"),
+    ],
+)
+def test_explicit_prefill_errors_are_not_swallowed(error):
+    def selector(cfg):
+        raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        runtime.select_hy4_prefill_backend(
+            _prefill_config("EXPLICIT"), selector, object()
+        )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("No valid MLA prefill backend found with test"),
+        ImportError("missing extension"),
+        OSError("missing library"),
+    ],
+)
+def test_automatic_prefill_absence_uses_fallback(error):
+    fallback = object()
+
+    def selector(cfg):
+        raise error
+
+    assert (
+        runtime.select_hy4_prefill_backend(_prefill_config(), selector, fallback)
+        is fallback
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("invalid model dimensions"), AssertionError("invalid dimensions")],
+)
+def test_automatic_prefill_does_not_hide_configuration_errors(error):
+    def selector(cfg):
+        raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        runtime.select_hy4_prefill_backend(_prefill_config(), selector, object())
+
+
+@pytest.mark.parametrize(
+    "name", ["per_token_group_quant_fp8", "flash_attn_varlen_func"]
+)
+def test_preflight_requires_callable_implementations(monkeypatch, name):
+    import flag_gems
+
+    import vllm.model_executor.layers.attention.mla_attention as mla
+    from vllm import platforms
+
+    monkeypatch.setattr(
+        platforms, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
+    monkeypatch.setattr(
+        mla,
+        "get_mla_prefill_backend",
+        lambda cfg: SimpleNamespace(is_available=lambda: False),
+    )
+    monkeypatch.setattr(flag_gems, name, None)
+    with pytest.raises(RuntimeError, match=name):
+        runtime.validate_hy4_runtime(_prefill_config())
+
+
+def test_fallback_success_idempotence_and_prefill_selection(monkeypatch):
+    import vllm.model_executor.layers.attention.mla_attention as mla
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+
+    monkeypatch.delattr(indexer, "_hy4_flaggems_fallback", raising=False)
+    monkeypatch.delattr(mla, "_hy4_flaggems_prefill_fallback", raising=False)
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda: False)
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
+
+    def no_backend(cfg):
+        raise ValueError("No valid MLA prefill backend found with test")
+
+    monkeypatch.setattr(mla, "get_mla_prefill_backend", no_backend)
+    # Exercise successful real module rebinding; restore all globals afterward.
+    with runtime.patch_transaction() as tx:
+        try:
+            assert runtime._install_fallback(tx)
+            installed = indexer.ops
+            assert runtime._install_fallback(tx)
+            assert indexer.ops is installed
+            assert mla.get_mla_prefill_backend(_prefill_config()).is_available()
+            with pytest.raises(ValueError, match="No valid MLA prefill"):
+                mla.get_mla_prefill_backend(_prefill_config("EXPLICIT"))
+        finally:
+            tx.rollback()
+    assert not getattr(indexer, "_hy4_flaggems_fallback", False)

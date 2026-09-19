@@ -73,6 +73,7 @@ from vllm_fl.ops.hy_v4_hc import (
     read_post_linear as _hyv4_hc_read_post_linear,
     writeback as _hyv4_hc_writeback,
 )
+from vllm_fl.patches.hy_v4_runtime import HY4RuntimePlan, prepare_hy4_runtime
 
 logger = init_logger(__name__)
 
@@ -540,6 +541,7 @@ class HYV4Attention(HYV4MLAAttention):
         layer_idx: int,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None,
+        runtime_plan: HY4RuntimePlan,
     ) -> None:
         super().__init__(
             vllm_config=vllm_config,
@@ -557,6 +559,7 @@ class HYV4Attention(HYV4MLAAttention):
             prefix=prefix,
             topk_indices_buffer=topk_indices_buffer,
             layer_idx=layer_idx,
+            runtime_plan=runtime_plan,
         )
 
 
@@ -568,6 +571,7 @@ class HYV4DecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         prefix: str,
         topk_indices_buffer: torch.Tensor | None,
+        runtime_plan: HY4RuntimePlan,
     ) -> None:
         super().__init__()
         config = typing.cast(HYV4Config, vllm_config.model_config.hf_config)
@@ -579,6 +583,7 @@ class HYV4DecoderLayer(nn.Module):
             layer_idx,
             f"{prefix}.self_attn",
             topk_indices_buffer,
+            runtime_plan,
         )
         self.hc_mlp_layer = HYV4HyperLayer(config)
         if config.mlp_layer_types[layer_idx] == "sparse":
@@ -635,8 +640,7 @@ class HYV4Model(nn.Module):
         config = typing.cast(HYV4Config, vllm_config.model_config.hf_config)
         self.config = config
         validate_hy4_parallel_config(config, vllm_config.parallel_config.pipeline_parallel_size)
-        from vllm_fl.patches.hy_v4_runtime import validate_hy4_runtime
-        validate_hy4_runtime(vllm_config)
+        self.runtime_plan = prepare_hy4_runtime(vllm_config)
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
@@ -659,6 +663,7 @@ class HYV4Model(nn.Module):
                 vllm_config,
                 prefix,
                 self.topk_indices_buffer,
+                self.runtime_plan,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1081,8 +1086,12 @@ class HYV4ForCausalLM(
             if name not in params_dict:
                 raise ValueError(f"Unexpected HY4 checkpoint parameter: {name}")
             param = params_dict[name]
+            full_components = coverage.full_tensor_components(
+                name, param, loaded_weight, tp_size
+            )
             loader = getattr(param, "weight_loader", default_weight_loader)
             loader(param, loaded_weight)
+            coverage.loaded.update(full_components)
             loaded_params.add(name)
 
         wk_loaded = indexer_wk_loader.finish()
