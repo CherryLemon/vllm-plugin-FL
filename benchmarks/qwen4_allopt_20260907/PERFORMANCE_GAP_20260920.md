@@ -1,5 +1,9 @@
 # Qwen throughput gap investigation (2026-09-20)
 
+The subsequent [GPU-history and QSA experiment](PERFORMANCE_ASYNC_20260920.md)
+restores short-context throughput to 3376.54 tokens/s. This document preserves
+the earlier sorting diagnosis and its 1803.55 tokens/s result.
+
 The measured QSA sorting bottleneck is addressed by keeping `sort` and
 `sort_stable` native in the existing NVIDIA-only model dispatch policy.
 Stable score ties, canonical logical-index order, the corrected request map

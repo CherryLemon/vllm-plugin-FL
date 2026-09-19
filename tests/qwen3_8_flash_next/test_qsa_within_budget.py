@@ -98,7 +98,7 @@ def test_all_visible_rejects_context_outside_budget(limit):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16, 33, 64, 128])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16, 24, 32, 33, 40, 48, 56, 64, 128])
 def test_graph_indices_and_attention_equal_scored_path(rows):
     if not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
