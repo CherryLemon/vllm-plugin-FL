@@ -30,7 +30,7 @@ class _ImageProcessorStub:
         return {"pixel_values": "pixels", "image_grid_thw": "grid"}
 
 
-class _ProcessorCallHarness:
+class _ProcessorCallHarness(Glm5NextProcessor):
     def __init__(self) -> None:
         self.tokenizer = _TokenizerStub()
         self.image_processor = _ImageProcessorStub()

@@ -58,7 +58,12 @@ from transformers.video_utils import (
     reorder_videos,
 )
 
-from .glm5_next_budget import resolve_serving_kwargs, resolve_vision_budget
+from .glm5_next_budget import (
+    NORMALIZED_SERVING_KEYS,
+    modality_kwargs,
+    resolve_serving_kwargs,
+    resolve_vision_budget,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -1104,12 +1109,21 @@ class Glm5NextProcessor(ProcessorMixin):
         from copy import deepcopy
 
         self._serving_mm_kwargs = deepcopy(deployment_kwargs)
-        # Resolve once now so unsupported deployment options fail before profiling.
-        resolve_serving_kwargs(self, self._serving_mm_kwargs, {})
+        self.serving_budgets = {
+            modality: resolve_vision_budget(
+                getattr(self, modality + "_processor"),
+                modality_kwargs(self._serving_mm_kwargs, modality),
+            )
+            for modality in ("image", "video")
+        }
+        self.serving_options = self.resolve_serving_kwargs({})
 
     def resolve_serving_kwargs(self, request_kwargs):
         return resolve_serving_kwargs(
-            self, getattr(self, "_serving_mm_kwargs", {}), request_kwargs
+            self,
+            getattr(self, "_serving_mm_kwargs", {}),
+            request_kwargs,
+            ceilings=getattr(self, "serving_budgets", None),
         )
 
     def __call__(
@@ -1124,6 +1138,15 @@ class Glm5NextProcessor(ProcessorMixin):
     ) -> BatchFeature:
         if hasattr(self, "_serving_mm_kwargs"):
             kwargs = self.resolve_serving_kwargs(kwargs)
+        return self._call_with_resolved_kwargs(
+            images=images, text=text, videos=videos, **kwargs
+        )
+
+    def _call_with_resolved_kwargs(self, images=None, text=None, videos=None, **kwargs):
+        """Internal entry after serving validation; direct callers use __call__."""
+        if hasattr(self, "_serving_mm_kwargs"):
+            for key in NORMALIZED_SERVING_KEYS:
+                kwargs.pop(key, None)
         output_kwargs = self._merge_kwargs(
             Glm5NextProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,

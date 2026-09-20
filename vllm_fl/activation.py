@@ -15,7 +15,7 @@ Rules enforced by this module:
   raises before any side effect.  Activation invalidates the cached dispatch
   policy so plan defaults take effect.
 * Class-level patches are preflighted before any of them is applied, validated
-  against the replacement signature, recorded with the original implementation
+  with a basic parameter-name check, recorded with the original implementation
   / vLLM version / signature, and rolled back if a later install in the same
   activation fails.
 * Plan-provided FlagOS defaults never override an explicit user selection.  A
@@ -176,7 +176,7 @@ def _signature_text(value: Any) -> str:
 
 
 def _check_signature(patch: PendingPatch) -> None:
-    """Verify the replacement accepts the parameters the call site passes."""
+    """Check expected parameter names, not full Python calling-convention compatibility."""
     if not patch.expected_params:
         return
     if not callable(patch.replacement):
@@ -187,10 +187,8 @@ def _check_signature(patch: PendingPatch) -> None:
         parameters = inspect.signature(patch.replacement).parameters
     except (TypeError, ValueError):
         return
-    kinds = {p.kind for p in parameters.values()}
-    accepts_kwargs = inspect.Parameter.VAR_KEYWORD in kinds
     for name in patch.expected_params:
-        if name not in parameters and not accepts_kwargs:
+        if name not in parameters:
             raise ActivationConflict(
                 f"Patch {patch.target!r} replacement {_signature_text(patch.replacement)} "
                 f"does not accept required parameter {name!r}"
@@ -203,7 +201,7 @@ def preflight_patches(patches: Iterable[PendingPatch]) -> list[PendingPatch]:
     Returns the subset that still needs installing.  Raises
     :class:`ActivationConflict` if any target is owned by another fingerprint or
     was already modified away from its pristine value, or if a replacement
-    signature cannot accept the required parameters.
+    omits an expected parameter name.
     """
     to_apply: list[PendingPatch] = []
     targets: set[str] = set()
@@ -310,46 +308,6 @@ def temporary_patches(patches: Iterable[PendingPatch]):
                 _patch_records.pop(patch.target, None)
 
 
-# Backwards-compatible single-patch helper.
-def install_patch(
-    target: str,
-    fingerprint: str,
-    *,
-    get_current: Callable[[], Any],
-    pristine: Any,
-    expected_signature: str,
-    apply: Callable[[], None],
-) -> bool:
-    """Install one patch.  Prefer :func:`bind_patches` for grouped installs."""
-    with _patch_lock:
-        record = _patch_records.get(target)
-        if record is not None:
-            if record.fingerprint == fingerprint:
-                if get_current() is not record.installed:
-                    raise ActivationConflict(
-                        f"Patch {target!r} was modified after installation"
-                    )
-                return False
-            raise ActivationConflict(
-                f"Conflicting activation for {target!r}: already owned by "
-                f"{record.fingerprint!r}"
-            )
-        if get_current() is not pristine:
-            raise ActivationConflict(
-                f"Refusing to patch {target!r}: current value is not pristine"
-            )
-        apply()
-        _patch_records[target] = _PatchRecord(
-            target=target,
-            fingerprint=fingerprint,
-            original=pristine,
-            installed=get_current(),
-            version=_vllm_version(),
-            signature=expected_signature,
-        )
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Single active plan guard
 # ---------------------------------------------------------------------------
@@ -401,12 +359,9 @@ def _invalidate_dispatch_policy() -> None:
     Explicitly configured policies (``set_global_policy``) are preserved and
     re-merged; only the environment-derived cache is dropped.
     """
-    try:
-        from vllm_fl.dispatch.policy import PolicyManager
+    from vllm_fl.dispatch.policy import PolicyManager
 
-        PolicyManager.get_instance().invalidate_policy_cache()
-    except Exception:  # pragma: no cover - policy subsystem may be unavailable
-        logger.debug("Could not invalidate dispatch policy", exc_info=True)
+    PolicyManager.get_instance().invalidate_policy_cache()
 
 
 def activate(plan: ActivationPlan) -> bool:
@@ -427,10 +382,10 @@ def activate(plan: ActivationPlan) -> bool:
                 f"activate {plan.name!r} ({plan.fingerprint}) in the same process"
             )
         plan.apply()
-        _active_plan = plan
-        # Publish the plan's dispatch defaults to any already-built policy and
-        # invalidate cached dispatch decisions.
+        # Cache invalidation is required for the new defaults. A failure must
+        # abort startup before the plan can be reported as active/idempotent.
         _invalidate_dispatch_policy()
+        _active_plan = plan
         logger.info("Activated model plan %s (%s)", plan.name, plan.fingerprint)
         return True
 
@@ -444,10 +399,6 @@ def resolve_model_plan(vllm_config: Any) -> ActivationPlan | None:
         if plan is not None:
             return plan
     return None
-
-
-def _resolve_plan(vllm_config: Any) -> ActivationPlan | None:
-    return resolve_model_plan(vllm_config)
 
 
 def preflight_activation_config(
@@ -475,25 +426,9 @@ def activate_for_model(vllm_config: Any) -> ActivationPlan | None:
     including a change from a plain model (bound to the explicit empty plan) to
     a model that needs global patches.
     """
-    global _active_plan
     requested = resolve_model_plan(vllm_config)
-    plan = requested if requested is not None else _EMPTY_PLAN
-    with _plan_lock:
-        if _active_plan is not None:
-            if _active_plan.fingerprint == plan.fingerprint:
-                return requested
-            raise ActivationConflict(
-                f"Process already initialized for {_active_plan.name!r} "
-                f"({_active_plan.fingerprint}); refusing to initialize "
-                f"{plan.name!r} ({plan.fingerprint}) for a different model in "
-                f"the same process"
-            )
-        plan.apply()
-        _active_plan = plan
-        if requested is not None:
-            _invalidate_dispatch_policy()
-        logger.info("Bound process to model plan %s (%s)", plan.name, plan.fingerprint)
-        return requested
+    activate(requested if requested is not None else _EMPTY_PLAN)
+    return requested
 
 
 def _impl_token(impl: Any) -> str:

@@ -14,7 +14,6 @@ from vllm_fl.activation import (
     activate_for_model,
     bind_patches,
     get_active_plan,
-    install_patch,
     merge_per_op_defaults,
     preflight_activation_config,
     preflight_patches,
@@ -112,56 +111,21 @@ def test_activate_invalidates_cached_policy(monkeypatch):
     ]
 
 
-def test_install_patch_idempotent_then_conflict():
-    class Target:
-        attr = "original"
+@pytest.mark.parametrize("through_model", [False, True])
+def test_policy_refresh_failure_aborts_activation(monkeypatch, through_model):
+    from vllm_fl.dispatch.policy import PolicyManager
 
-    def get_current():
-        return Target.attr
+    def fail():
+        raise RuntimeError("policy refresh failed")
 
-    assert install_patch(
-        "Target.attr",
-        "owner-a",
-        get_current=get_current,
-        pristine="original",
-        expected_signature="attr()",
-        apply=lambda: setattr(Target, "attr", "a"),
-    )
-    assert not install_patch(
-        "Target.attr",
-        "owner-a",
-        get_current=get_current,
-        pristine="original",
-        expected_signature="attr()",
-        apply=lambda: setattr(Target, "attr", "a"),
-    )
-    with pytest.raises(ActivationConflict):
-        install_patch(
-            "Target.attr",
-            "owner-b",
-            get_current=get_current,
-            pristine="original",
-            expected_signature="attr()",
-            apply=lambda: setattr(Target, "attr", "b"),
-        )
-    assert Target.attr == "a"
-
-
-def test_install_patch_refuses_foreign_modification():
-    class Target:
-        attr = "original"
-
-    Target.attr = "foreign"
-    with pytest.raises(ActivationConflict):
-        install_patch(
-            "Target.attr",
-            "owner-a",
-            get_current=lambda: Target.attr,
-            pristine="original",
-            expected_signature="attr()",
-            apply=lambda: setattr(Target, "attr", "a"),
-        )
-    assert Target.attr == "foreign"
+    monkeypatch.setattr(PolicyManager.get_instance(), "invalidate_policy_cache", fail)
+    calls = []
+    plan = _plan("glm", "glm@1", calls)
+    register_plan_provider(lambda cfg: plan)
+    with pytest.raises(RuntimeError, match="policy refresh failed"):
+        activate_for_model("glm") if through_model else activate(plan)
+    assert calls == ["glm@1"]
+    assert get_active_plan() is None
 
 
 def test_bind_patches_preflight_aborts_without_side_effect():

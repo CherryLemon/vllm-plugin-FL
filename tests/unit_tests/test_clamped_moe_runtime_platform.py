@@ -4,8 +4,29 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm_fl.ops.fused_moe import fused_moe_utils as moe
+
+
+@pytest.mark.parametrize("error", [RuntimeError, torch.OutOfMemoryError])
+def test_clamped_activation_propagates_execution_failure(monkeypatch, error):
+    import importlib
+
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    from vllm_fl.ops.fused_moe.activation import apply_moe_activation
+
+    kernel = importlib.import_module("flag_gems.fused.silu_and_mul_with_clamp")
+
+    def fail(*args):
+        raise error("clamp launch failed")
+
+    monkeypatch.setattr(kernel, "silu_and_mul_with_clamp_out", fail)
+    with pytest.raises(error, match="clamp launch failed"):
+        apply_moe_activation(
+            MoEActivation.SILU, torch.empty(2, 3), torch.ones(2, 6), 7.0
+        )
 
 
 def test_clamped_moe_resolves_platform_at_apply_time(monkeypatch):

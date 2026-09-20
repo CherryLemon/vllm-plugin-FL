@@ -180,3 +180,32 @@ A synchronous diagnostic reproduced the failure inside graph replay; the
 specific kernel has not been identified. That broader operator configuration
 is not validated by the restricted-deployment checks. The control also includes
 the tail capability fix, so it does not isolate a single causal change.
+
+## Simplification review of 0f79b7d
+
+Portable mHC and shared-expert clamp now reuse the existing policy binding:
+dependency availability is resolved when binding, unsupported workloads follow
+the fallback policy, and execution errors propagate. The portable model clamp
+delegates to that same implementation. Generic MoE clamp also stops swallowing
+RuntimeError/OOM. Activation publishes its plan only after required policy-cache
+invalidation succeeds; unknown patch baselines fail explicitly. The unused
+single-patch API and duplicate activation path are removed. Signature checking
+is documented as a limited parameter-name check.
+
+Deployment vision budgets are cached, and each preprocessing entry resolves
+request options once. Direct processor validation, request ceilings and video
+timestamp handling remain covered. Ordinary decode retains graph padding and
+mixed prefill handling while dropping unsupported speculative compatibility.
+Persistent top-k is now a candidate inside the common top-k binding, so explicit
+reference selection and CUDA vendor exclusion also govern that fast path.
+
+Source-string/AST assertions and copied old-error demonstrations are removed;
+clamp arithmetic and translated-table storage checks execute production code.
+Production code shrinks by 164 lines and tests by 116 lines. The CPU suite passes
+820 tests (4 skipped, 7 GPU cases deselected, 4 subtests). Changed-file lint and
+diff checks pass. No GPU, installed-wheel or serving run was repeated for this
+refactor; the earlier accelerator results remain tied to their recorded commits.
+
+FULL-graph compatibility checks for reference/fallback bindings remain follow-up
+work. The restricted deployment above still does not qualify the broader default
+FlagGems configuration or portable whole-model execution.

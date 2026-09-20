@@ -41,7 +41,7 @@ def apply_moe_activation(
                 silu_and_mul_with_clamp_out(
                     input[..., :dim], input[..., dim:], output, clamp_limit
                 )
-            except (ImportError, OSError, NotImplementedError, RuntimeError):
+            except (ImportError, OSError, NotImplementedError):
                 gate = input[..., :dim].clamp(max=clamp_limit)
                 up = input[..., dim:].clamp(min=-clamp_limit, max=clamp_limit)
                 output.copy_(F.silu(gate) * up)

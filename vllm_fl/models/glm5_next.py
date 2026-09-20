@@ -25,6 +25,9 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import (
+    SiluAndMulWithClamp as VllmSiluAndMulWithClamp,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -110,11 +113,13 @@ else:
     )
 
 if use_nvidia_reference():
-    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    SiluAndMulWithClamp = VllmSiluAndMulWithClamp
 else:
 
     class SiluAndMulWithClamp(nn.Module):
         """Bounded SwiGLU without constructing vLLM's CUDA custom op."""
+
+        forward_native = VllmSiluAndMulWithClamp.forward_native
 
         def __init__(
             self,
@@ -130,21 +135,7 @@ else:
             self.beta = float(beta)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            dim = x.shape[-1] // 2
-            if self.alpha == 1.0 and self.beta == 0.0:
-                try:
-                    from flag_gems.fused.silu_and_mul_with_clamp import (
-                        silu_and_mul_with_clamp,
-                    )
-
-                    return silu_and_mul_with_clamp(
-                        x[..., :dim], x[..., dim:], self.swiglu_limit
-                    )
-                except (ImportError, OSError, NotImplementedError, RuntimeError):
-                    pass
-            gate = x[..., :dim].clamp(max=self.swiglu_limit)
-            up = x[..., dim:].clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-            return gate * torch.sigmoid(self.alpha * gate) * (up + self.beta)
+            return VllmSiluAndMulWithClamp.forward_oot(self, x)
 
 
 from vllm_fl.kernels.glm5_next.indexer_backend import INDEXER_BACKEND

@@ -25,11 +25,12 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
-from vllm_fl.kernels.glm5_next.indexer_backend import INDEXER_BACKEND
+from vllm_fl.kernels.glm5_next.indexer_backend import (
+    INDEXER_BACKEND,
+    RADIX_TOPK_WORKSPACE_SIZE,
+)
 
 logger = init_logger(__name__)
-
-RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -150,29 +151,12 @@ def _decode_write_layout(
     num_requests: int,
     num_decode_tokens: int,
 ) -> tuple[bool, torch.Tensor, int]:
-    """Resolve the request grouping used by the kpool decode writer.
-
-    GLM5-Next's extended indexer metadata carries the original per-request
-    decode lengths plus host-side uniformity metadata.  Stock vLLM 0.24's
-    ``DeepSeekV32IndexerDecodeMetadata`` does not have those extension fields,
-    so retain its legacy, host-static layout as a narrow compatibility path.
-    """
-    per_req_lens = getattr(decode_metadata, "per_req_decode_lens", None)
-    if per_req_lens is not None:
-        lmax = getattr(decode_metadata, "write_max_decode_len", 1)
-        use_uniform = (
-            getattr(decode_metadata, "decode_is_uniform", True)
-            and num_decode_tokens == num_requests * lmax
-        )
-        return use_uniform, per_req_lens, lmax
-
-    use_uniform = not decode_metadata.requires_padding
-    lmax = (
-        max(1, num_decode_tokens // max(1, num_requests))
-        if use_uniform
-        else max(1, num_decode_tokens)
-    )
-    return use_uniform, decode_metadata.decode_lens, lmax
+    """Ordinary decode has one token per request; graph padding may add empty rows."""
+    if num_decode_tokens > num_requests or (
+        not decode_metadata.requires_padding and num_decode_tokens != num_requests
+    ):
+        raise ValueError("GLM5-Next supports only one decode token per request")
+    return not decode_metadata.requires_padding, decode_metadata.decode_lens, 1
 
 
 def _decode_topk_seq_lens(
@@ -314,15 +298,7 @@ def sparse_attn_indexer_kpool(
         worst_decode_tokens = 0
         if cfg is not None:
             sched = cfg.scheduler_config
-            num_spec = (
-                cfg.speculative_config.num_speculative_tokens
-                if cfg.speculative_config is not None
-                else 0
-            )
-            worst_decode_tokens = min(
-                sched.max_num_seqs * (num_spec + 1),
-                sched.max_num_batched_tokens,
-            )
+            worst_decode_tokens = min(sched.max_num_seqs, sched.max_num_batched_tokens)
         # float32 logits -> 4 bytes/element; uint8 sentinel so elems == bytes.
         decode_logits_elems = worst_decode_tokens * max_model_len * 4
         prefill_cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
@@ -363,8 +339,8 @@ def sparse_attn_indexer_kpool(
     else:
         assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
 
-    # During speculative decoding, k may be padded to the CUDA graph batch
-    # size while slot_mapping only covers actual tokens. Truncate k to avoid
+    # k may be padded to the CUDA graph batch size while slot_mapping only
+    # covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
     num_tokens = slot_mapping.shape[0]
     if k is not None:
@@ -601,22 +577,8 @@ def sparse_attn_indexer_kpool(
         # token's k/gate to its REQUEST's tail ring; when a pool fills
         # (pos % kpool == kpool-1) compress + write at the pool slot that
         # compress_ratio hands us via slot_mapping.
-        #
-        # Spec verify batches next_n (>1) tokens per request. The per-request
-        # tail ring must accumulate a request's tokens IN POSITION ORDER, so we
-        # group tokens by request ([num_requests, next_n, ...]) and run the
-        # per-request kernel once per token-slot — sequential launches keep each
-        # request's tokens ordered (token t stashes before token t+1 reads it
-        # for pool completion). Mirrors sglang's _forward_cuda_target_verify
-        # (per-request kpool write plan, seqlen_per_q = write_start + k + 1).
-        # Plain decode (next_n == 1) collapses to a single launch.
-        #
-        # NOTE: positions must be TOKEN-granular (per-token position, not the
-        # pool-granular decode_metadata.seq_lens which is divided by
-        # compress_ratio). The kernel derives the pool phase and tail-ring index
-        # from pos % kpool, so a pool-granular pos misaligns every pool; a
-        # per-request pos under spec is also too short (B entries for B*next_n
-        # tokens) and reads out of bounds.
+        # Positions are token-granular; compressed seq_lens cannot locate the
+        # token's phase in its request's tail ring.
         if (
             index_kpool > 1
             and gate_score is not None
@@ -626,24 +588,12 @@ def sparse_attn_indexer_kpool(
             and os.environ.get("VLLM_KPOOL_SKIP_DECODE_WRITE") != "1"
         ):
             num_requests = attn_metadata_narrowed.num_decodes
-            # The indexer's flatten decode path rewrites decode_lens to all-1s
-            # and reports requires_padding=False even for a variable MTP-verify
-            # batch (e.g. one request verifies 3 tokens while the rest verify
-            # 4). The logits read is fine with that, but the kpool WRITE must
-            # group tokens by their original request. Uniformity and the scatter
-            # lmax are precomputed on the host in build()
-            # (decode_is_uniform / write_max_decode_len), so this branch needs
-            # no runtime .item() -- a .item() under cudagraph capture forces a
-            # host sync and invalidates the stream.
             use_uniform, group_lens, lmax = _decode_write_layout(
                 decode_metadata, num_requests, num_decode_tokens
             )
             if not use_uniform:
-                # Non-uniform decode_lens (mixed plain-decode + spec-verify, or
-                # a variable MTP-verify batch): scatter actual tokens into a
-                # padded [B, lmax] layout. int32 tensors can't go through
-                # pack_seq_triton (float/uint8 only). The scatter indices are
-                # shared by all five scatters below (and the tail slot one).
+                # Graph padding can leave empty request rows. Share the scatter
+                # indices across keys, gates and both slot mappings.
                 scatter_idx = _build_decode_scatter_indices(
                     group_lens, num_requests, num_decode_tokens
                 )
@@ -726,10 +676,7 @@ def sparse_attn_indexer_kpool(
                 )
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
-            # pad in edge case where we have short chunked prefill length <
-            # decode_threshold since we unstrictly split
-            # prefill and decode by decode_threshold
-            # (currently set to 1 + speculative tokens).
+            # Preserve empty request rows introduced by graph padding.
             # FP8 Q is float8_e4m3fn (pack_seq_triton's fp32 pad path is OK —
             # downstream context_lens masks stale slots). MXFP4 Q is two
             # uint8 tensors (values + ue8m0 scales) — use the dedicated uint8
@@ -766,8 +713,8 @@ def sparse_attn_indexer_kpool(
         next_n = padded_q_quant_decode_tokens.shape[1]
         num_padded_tokens = batch_size * next_n
         seq_lens = decode_metadata.seq_lens[:batch_size]
-        # seq_lens is always 2D: (B, next_n) for native spec decode, (B, 1)
-        # otherwise. deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
+        # Ordinary decode uses (B, 1) sequence lengths.
+        # deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
         # the downstream topk kernels accept both 1D and 2D.
         padded_q_quant_cast = (
             padded_q_quant_decode_tokens.view(torch.int8)
@@ -796,34 +743,17 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if (
-            INDEXER_BACKEND.is_nvidia
-            and current_platform.is_cuda()
-            and select_k in (512, 1024, 2048)
-        ):
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_dst,
-                topk_workspace,
-                select_k,
-                attn_metadata_narrowed.max_seq_len,
-            )
-        else:
-            INDEXER_BACKEND.topk_decode(
-                logits,
-                next_n,
-                seq_lens,
-                topk_dst,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                select_k,
-            )
+        INDEXER_BACKEND.topk_decode(
+            logits,
+            next_n,
+            seq_lens,
+            topk_dst,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            select_k,
+            max_seq_len=attn_metadata_narrowed.max_seq_len,
+        )
 
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:

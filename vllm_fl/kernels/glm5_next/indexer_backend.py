@@ -22,6 +22,8 @@ from .provider import use_nvidia_reference
 
 logger = init_logger(__name__)
 
+RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
 
 def _graph_safe_flaggems_paged_mqa_logits(
     loaded,
@@ -696,9 +698,12 @@ class Glm5NextIndexerBackend:
         stride1,
         top_k,
         *,
+        max_seq_len=None,
         _preflight=False,
     ):
-        def fallback(logits, next_n, lengths, output, rows, s0, s1, k):
+        def fallback(
+            logits, next_n, lengths, output, rows, s0, s1, k, max_seq_len=None
+        ):
             ends = (
                 lengths.reshape(-1)
                 if lengths.ndim == 2
@@ -706,12 +711,33 @@ class Glm5NextIndexerBackend:
             )[:rows]
             output.copy_(_torch_topk(logits, torch.zeros_like(ends), ends, k, False))
 
-        return self._run(
+        flag_op = self._flag("top_k_per_row_decode", "top_k_per_row_decode")
+
+        def flag(*args, max_seq_len=None):
+            return flag_op(*args)
+
+        def native(logits, next_n, lengths, output, rows, s0, s1, k, max_seq_len=None):
+            if (
+                current_platform.is_cuda()
+                and k in (512, 1024, 2048)
+                and max_seq_len is not None
+            ):
+                from vllm.v1.worker.workspace import current_workspace_manager
+
+                (workspace,) = current_workspace_manager().get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                return torch.ops._C.persistent_topk(
+                    logits, lengths, output, workspace, k, max_seq_len
+                )
+            return torch.ops._C.top_k_per_row_decode(
+                logits, next_n, lengths, output, rows, s0, s1, k
+            )
+
+        return self._call_flag(
             "top_k_per_row_decode",
-            "top_k_per_row_decode",
+            flag if flag_op else None,
             fallback,
-            "torch.ops._C",
-            "top_k_per_row_decode",
             logits,
             next_n,
             seq_lens,
@@ -720,6 +746,8 @@ class Glm5NextIndexerBackend:
             stride0,
             stride1,
             top_k,
+            native=native,
+            max_seq_len=max_seq_len,
             _preflight=_preflight,
         )
 

@@ -180,3 +180,35 @@ def test_metadata_builder_delegates_non_glm_and_uses_same_glm_layout(monkeypatch
     builder = group.metadata_builders[0]
     assert builder.kv_cache_spec.storage_block_size == 64
     assert builder._glm5_physical_layout.pages_per_block == 2
+
+
+def test_translated_block_table_reuses_storage_across_batch_sizes(monkeypatch):
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+
+    from vllm_fl.patches import glm5_next_kpool_v024 as hooks
+
+    monkeypatch.setitem(
+        hooks._RUNTIME_BASELINES,
+        hooks._kpool_target(DeepseekV32IndexerMetadataBuilder, "build"),
+        lambda self, prefix, metadata, fast: metadata.block_table_tensor,
+    )
+    build = hooks._indexer_build_patch("stable-storage").replacement
+    builder = SimpleNamespace(
+        kv_cache_spec=SimpleNamespace(block_size=512),
+        kernel_block_size=64,
+        _glm5_physical_layout=object(),
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4)
+        ),
+    )
+    outputs = []
+    for rows in (1, 3, 2):
+        table = torch.arange(rows * 16, dtype=torch.int32).reshape(rows, 16) + rows * 8
+        metadata = SimpleNamespace(
+            block_table_tensor=table, replace=lambda **kw: SimpleNamespace(**kw)
+        )
+        out = build(builder, 0, metadata)
+        torch.testing.assert_close(out, table[:, ::8] // 8)
+        outputs.append(out)
+    assert len({out.data_ptr() for out in outputs}) == 1
+    assert [out.shape for out in outputs] == [(1, 2), (3, 2), (2, 2)]

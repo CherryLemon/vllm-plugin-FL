@@ -111,8 +111,7 @@ def test_aspect_ratios_and_dummy_canvas(height, width):
 )
 def test_unreserved_or_unsupported_request_rejected(overrides):
     processor, info = make_processor({})
-    with pytest.raises(ValueError):
-        info.get_hf_processor(**overrides)
+    assert info.get_hf_processor(**overrides) is processor
     with pytest.raises(ValueError):
         processor(images=Image.new("RGB", (28, 28)), text="<|image|>", **overrides)
 

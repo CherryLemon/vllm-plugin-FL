@@ -211,3 +211,187 @@ def test_binding_tracks_context_policy_and_manager_epoch(backend):
     finally:
         for context, manager in zip(contexts, managers):
             context.run(manager.__exit__, None, None, None)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, torch.OutOfMemoryError])
+@pytest.mark.parametrize(
+    "owner", ["MHCPreOp", "MHCPostOp", "MHCFusedPostPreOp", "SiluAndMulWithClamp"]
+)
+def test_portable_custom_ops_propagate_execution_failure(
+    monkeypatch, owner, error_type
+):
+    from types import SimpleNamespace
+
+    from vllm_fl.kernels.glm5_next import indexer_backend
+    from vllm_fl.patches import glm5_next_v024 as hooks
+
+    error = error_type("execution failed")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(hooks, "use_nvidia_reference", lambda: False)
+    monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *args: fail)
+    monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
+    monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)
+    patch = next(
+        p for p in hooks._mhc_patches("failure-test") if p.owner.__name__ == owner
+    )
+    x = torch.ones(1, 4)
+    pre_args = (x, x, x, 1e-5, 1e-5, 1e-5, 1.0, 2)
+    args = {
+        "MHCPreOp": (x, *pre_args),
+        "MHCPostOp": (x, x, x, x),
+        "MHCFusedPostPreOp": (x, x, x, x, *pre_args),
+        "SiluAndMulWithClamp": (x,),
+    }[owner]
+    op = SimpleNamespace(alpha=1.0, beta=0.0, swiglu_limit=2.0)
+    with policy_context(SelectionPolicy()), pytest.raises(error_type) as caught:
+        patch.replacement(op, *args)
+    assert caught.value is error
+
+
+def test_portable_model_clamp_uses_model_binding():
+    code = """
+import torch
+from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+from vllm_fl.kernels.glm5_next import indexer_backend
+from vllm_fl.models.glm5_next import SiluAndMulWithClamp
+from vllm_fl.patches import glm5_next_v024 as hooks
+calls = []
+def unsupported(*args, **kwargs):
+    calls.append(1)
+    raise NotImplementedError("unsupported clamp")
+indexer_backend._load_flaggems_op = lambda *args: unsupported
+patch = next(p for p in hooks._mhc_patches("test")
+             if p.owner.__name__ == "SiluAndMulWithClamp")
+patch.owner.forward_oot = patch.replacement
+op = SiluAndMulWithClamp(2.0)
+x = torch.tensor([[3., -4., 5., -6.]])
+with policy_context(SelectionPolicy()):
+    for _ in range(2):
+        torch.testing.assert_close(op(x), op.forward_native(x))
+assert calls == [1]
+print("portable model clamp passed")
+"""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"VLLM_FL_FLAGOS_WHITELIST", "VLLM_FL_FLAGOS_BLACKLIST"}
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**env, "VLLM_FL_GLM5_PROVIDER": "flaggems"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("top_k", [128, 512, 1024, 2048])
+def test_decode_topk_fast_path_obeys_binding(backend, monkeypatch, top_k):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker import workspace
+
+    from vllm_fl.kernels.glm5_next import indexer_backend
+
+    calls = []
+    monkeypatch.setattr(backend, "is_nvidia", True)
+    monkeypatch.setattr(backend, "_flag", lambda *args: None)
+    monkeypatch.setattr(indexer_backend.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        workspace,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(
+            get_simultaneous=lambda *args: (torch.empty(1, dtype=torch.uint8),)
+        ),
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "persistent_topk",
+        lambda *a: calls.append("persistent"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "top_k_per_row_decode",
+        lambda *a: calls.append("native"),
+        raising=False,
+    )
+    logits = torch.arange(2050, dtype=torch.float32).view(1, -1)
+    output = torch.empty(1, top_k, dtype=torch.int32)
+    lengths = torch.tensor([[2050]], dtype=torch.int32)
+    for order, denied, expected in [
+        (["reference"], set(), "glm5.torch"),
+        (["vendor:cuda", "reference"], {"cuda"}, "glm5.torch"),
+        (["vendor:cuda", "reference"], set(), "glm5.cuda"),
+    ]:
+        with policy_context(
+            SelectionPolicy.from_dict(
+                per_op_order={"top_k_per_row_decode": order},
+                deny_vendors=denied,
+            )
+        ):
+            assert (
+                backend.topk_decode(*([None] * 8), _preflight=True)["selected"]
+                == expected
+            )
+            backend.topk_decode(
+                logits, 1, lengths, output, 1, 2050, 1, top_k, max_seq_len=2050
+            )
+            binding = backend._bindings["top_k_per_row_decode"]
+            assert binding.describe()["selected"] == expected
+            assert backend._manager._called_ops["top_k_per_row_decode"] == expected
+            if expected == "glm5.torch":
+                assert not calls
+                assert set(output[0].tolist()) == set(range(2050 - top_k, 2050))
+    assert calls == ["native" if top_k == 128 else "persistent"]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_portable_mhc_fallback_preserves_norm_and_strict(monkeypatch, strict):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.mhc import MHCPreOp
+
+    from vllm_fl.kernels.glm5_next import indexer_backend
+    from vllm_fl.patches import glm5_next_v024 as hooks
+
+    calls = []
+    layer_input = torch.tensor([[3.0, 4.0]])
+    weight = torch.tensor([2.0, 3.0])
+
+    def unsupported(*args, **kwargs):
+        calls.append("flag")
+        raise NotImplementedError("unsupported shape")
+
+    monkeypatch.setattr(hooks, "use_nvidia_reference", lambda: False)
+    monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *a: unsupported)
+    monkeypatch.setattr(
+        MHCPreOp, "forward_native", lambda self, *a, **k: (None, None, layer_input)
+    )
+    monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
+    monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)
+    forward = next(
+        p.replacement for p in hooks._mhc_patches("norm-test") if p.owner is MHCPreOp
+    )
+    with policy_context(SelectionPolicy(strict=strict)):
+        if strict:
+            with pytest.raises(NotImplementedError, match="unsupported shape"):
+                forward(
+                    SimpleNamespace(), *([None] * 9), norm_weight=weight, norm_eps=0.1
+                )
+        else:
+            expected = (
+                layer_input
+                * torch.rsqrt(layer_input.square().mean(-1, keepdim=True) + 0.1)
+                * weight
+            )
+            for _ in range(2):
+                result = forward(
+                    SimpleNamespace(), *([None] * 9), norm_weight=weight, norm_eps=0.1
+                )
+                torch.testing.assert_close(result[-1], expected)
+    assert calls == ["flag"]

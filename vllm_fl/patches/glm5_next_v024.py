@@ -41,7 +41,6 @@ logger = init_logger(__name__)
 
 _CAUSAL_ARCH = "Glm5NextForCausalLM"
 _CONDITIONAL_ARCH = "Glm5NextForConditionalGeneration"
-_MHC_CUDA_MAX_TOKENS = 0
 
 # Empty-build vLLM wheels do not provide ``vllm._C``/``_moe_C``.  GLM5's
 # portable unquantized-MoE path still needs the dispatch-owned alignment and
@@ -279,19 +278,11 @@ def _install_mla_boundary_compat_ops(custom_ops: ModuleType | None = None) -> bo
     return bool(bind_patches(_mla_boundary_patches(custom_ops, _glm5_fingerprint())))
 
 
-def _silu_and_mul_with_clamp_oot(self, x: torch.Tensor) -> torch.Tensor:
-    """Use FlagGems for GLM's bounded SwiGLU when its exact op is present."""
+def _silu_and_mul_with_clamp_oot(op, self, x):
     if self.alpha != 1.0 or self.beta != 0.0:
-        return self.forward_native(x)
+        raise NotImplementedError("FlagGems clamp requires alpha=1 and beta=0")
     dim = x.shape[-1] // 2
-    try:
-        from flag_gems.fused.silu_and_mul_with_clamp import (
-            silu_and_mul_with_clamp,
-        )
-
-        return silu_and_mul_with_clamp(x[..., :dim], x[..., dim:], self.swiglu_limit)
-    except (ImportError, OSError, NotImplementedError, RuntimeError):
-        return self.forward_native(x)
+    return op(x[..., :dim], x[..., dim:], self.swiglu_limit)
 
 
 def _mhc_rms_norm(
@@ -310,6 +301,7 @@ def _mhc_rms_norm(
 
 
 def _mhc_pre_oot_with_norm(
+    op,
     self,
     residual,
     fn,
@@ -324,36 +316,19 @@ def _mhc_pre_oot_with_norm(
     norm_weight=None,
     norm_eps=0.0,
 ):
-    try:
-        from flag_gems.fused.mhc import mhc_pre
-
-        post_mix, comb_mix, layer_input = mhc_pre(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-        )
-    except (ImportError, OSError, NotImplementedError, RuntimeError):
-        post_mix, comb_mix, layer_input = self.forward_native(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            norm_weight,
-            norm_eps,
-        )
+    post_mix, comb_mix, layer_input = op(
+        self,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
     return (
         post_mix,
         comb_mix,
@@ -361,16 +336,8 @@ def _mhc_pre_oot_with_norm(
     )
 
 
-def _mhc_post_oot_flaggems(self, x, residual, post_layer_mix, comb_res_mix):
-    try:
-        from flag_gems.fused.mhc import mhc_post
-
-        return mhc_post(x, residual, post_layer_mix, comb_res_mix)
-    except (ImportError, OSError, NotImplementedError, RuntimeError):
-        return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
-
-
 def _mhc_fused_post_pre_oot_with_norm(
+    op,
     self,
     x,
     residual,
@@ -389,41 +356,23 @@ def _mhc_fused_post_pre_oot_with_norm(
     norm_weight=None,
     norm_eps=0.0,
 ):
-    try:
-        from flag_gems.fused.mhc import mhc_post, mhc_pre
-
-        residual_cur = mhc_post(x, residual, post_layer_mix, comb_res_mix)
-        post_mix, comb_mix, layer_input = mhc_pre(
-            residual_cur,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-        )
-    except (ImportError, OSError, NotImplementedError, RuntimeError):
-        residual_cur, post_mix, comb_mix, layer_input = self.forward_native(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            n_splits,
-            tile_n,
-            norm_weight,
-            norm_eps,
-        )
+    residual_cur, post_mix, comb_mix, layer_input = op(
+        self,
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        tile_n,
+    )
     return (
         residual_cur,
         post_mix,
@@ -432,22 +381,33 @@ def _mhc_fused_post_pre_oot_with_norm(
     )
 
 
-def _mhc_pre_oot_bounded_cuda(self, residual, *args, **kwargs):
-    if residual.shape[0] <= _MHC_CUDA_MAX_TOKENS:
-        return self.forward_cuda(residual, *args, **kwargs)
-    return _mhc_pre_oot_with_norm(self, residual, *args, **kwargs)
+def _bind_portable_forward(owner, name, flag, normalize=None, cuda_max_tokens=0):
+    """Use the existing policy binding for portable custom-op dispatch."""
+    from vllm_fl.dispatch.binding import OperatorBinding
+    from vllm_fl.dispatch.manager import OpManager
+    from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+    from vllm_fl.utils import use_flaggems_op
 
+    manager = OpManager()
+    if flag is not None:
+        flag._is_available = lambda: use_flaggems_op(name)
+        manager.registry.register_impl(
+            OpImpl(name, "glm5.flaggems", BackendImplKind.DEFAULT, flag)
+        )
+    manager.registry.register_impl(
+        OpImpl(name, "glm5.torch", BackendImplKind.REFERENCE, owner.forward_native)
+    )
+    binding = OperatorBinding(manager, name)
 
-def _mhc_post_oot_bounded_cuda(self, x, residual, *args, **kwargs):
-    if x.shape[0] <= _MHC_CUDA_MAX_TOKENS:
-        return self.forward_cuda(x, residual, *args, **kwargs)
-    return self.forward_native(x, residual, *args, **kwargs)
+    @wraps(owner.forward_native)
+    def forward(self, *args, **kwargs):
+        if cuda_max_tokens and args[0].shape[0] <= cuda_max_tokens:
+            return self.forward_cuda(*args, **kwargs)
+        if normalize is not None:
+            return normalize(binding, self, *args, **kwargs)
+        return binding(self, *args, **kwargs)
 
-
-def _mhc_fused_post_pre_oot_bounded_cuda(self, x, residual, *args, **kwargs):
-    if x.shape[0] <= _MHC_CUDA_MAX_TOKENS:
-        return self.forward_cuda(x, residual, *args, **kwargs)
-    return _mhc_fused_post_pre_oot_with_norm(self, x, residual, *args, **kwargs)
+    return forward
 
 
 class Glm5NextModelArchConfigConvertor(ModelArchConfigConvertorBase):
@@ -524,25 +484,13 @@ _BASELINES: dict[str, object] = {}
 
 
 def _capture_baselines() -> None:
-    try:
-        from vllm.model_executor.layers.mhc import (
-            MHCFusedPostPreOp,
-            MHCPostOp,
-            MHCPreOp,
-        )
+    if not is_vllm_024():
+        return
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
 
-        for cls in (MHCPreOp, MHCPostOp, MHCFusedPostPreOp):
-            _BASELINES[_attr_target(cls, "forward_oot")] = getattr(cls, "forward_oot")
-    except Exception:  # pragma: no cover - vLLM layout differences
-        logger.debug("Could not capture mHC baselines", exc_info=True)
-    try:
-        from vllm.model_executor.layers.activation import SiluAndMulWithClamp
-
-        _BASELINES[_attr_target(SiluAndMulWithClamp, "forward_oot")] = getattr(
-            SiluAndMulWithClamp, "forward_oot"
-        )
-    except Exception:  # pragma: no cover
-        logger.debug("Could not capture SiluAndMulWithClamp baseline", exc_info=True)
+    for cls in (MHCPreOp, MHCPostOp, MHCFusedPostPreOp, SiluAndMulWithClamp):
+        _BASELINES[_attr_target(cls, "forward_oot")] = cls.forward_oot
 
 
 def _attr_target(owner, attr: str) -> str:
@@ -560,13 +508,7 @@ def _pending_attr(
     expected_params: tuple[str, ...],
 ) -> PendingPatch:
     target = _attr_target(owner, attr)
-    pristine = _BASELINES.get(target)
-    if pristine is None:
-        pristine = getattr(owner, attr)
-        logger.warning(
-            "No import-time baseline for %s; capturing at activation time",
-            target,
-        )
+    pristine = _BASELINES[target]
     return PendingPatch(
         target=target,
         owner=owner,
@@ -690,68 +632,69 @@ def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
 
 
 def _mhc_patches(fingerprint: str) -> list[PendingPatch]:
-    from vllm.model_executor.layers.mhc import (
-        MHCFusedPostPreOp,
-        MHCPostOp,
-        MHCPreOp,
-    )
+    from functools import partial
 
-    if use_nvidia_reference():
-        global _MHC_CUDA_MAX_TOKENS
-        _MHC_CUDA_MAX_TOKENS = int(
-            os.environ.get("VLLM_FL_GLM5_MHC_CUDA_MAX_TOKENS", "0")
-        )
-        if _MHC_CUDA_MAX_TOKENS > 0:
-            specs = (
-                (MHCPreOp, _mhc_pre_oot_bounded_cuda, ("self", "residual")),
-                (MHCPostOp, _mhc_post_oot_bounded_cuda, ("self", "x", "residual")),
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
+
+    native = use_nvidia_reference()
+    limit = (
+        int(os.environ.get("VLLM_FL_GLM5_MHC_CUDA_MAX_TOKENS", "0")) if native else 0
+    )
+    owners = (MHCPreOp, MHCPostOp, MHCFusedPostPreOp)
+    if native and limit <= 0:
+        specs = [(owner, owner.forward_cuda) for owner in owners]
+    else:
+        from vllm_fl.kernels.glm5_next.indexer_backend import _load_flaggems_op
+
+        pre = _load_flaggems_op("mhc", "mhc_pre")
+        post = _load_flaggems_op("mhc", "mhc_post")
+
+        def fused(self, x, residual, post_mix, comb_mix, *pre_args):
+            residual = post(x, residual, post_mix, comb_mix)
+            # tile_n belongs only to the fused native kernel.
+            return (residual, *pre(residual, *pre_args[:-1]))
+
+        specs = [
+            (owner, _bind_portable_forward(owner, name, flag, normalize, limit))
+            for owner, name, flag, normalize in (
+                (
+                    MHCPreOp,
+                    "mhc_pre",
+                    (lambda self, *a, **kw: pre(*a, **kw)) if pre else None,
+                    _mhc_pre_oot_with_norm,
+                ),
+                (
+                    MHCPostOp,
+                    "mhc_post",
+                    (lambda self, *a, **kw: post(*a, **kw)) if post else None,
+                    None,
+                ),
                 (
                     MHCFusedPostPreOp,
-                    _mhc_fused_post_pre_oot_bounded_cuda,
-                    ("self", "x", "residual"),
+                    "mhc_fused_post_pre",
+                    fused if pre and post else None,
+                    _mhc_fused_post_pre_oot_with_norm,
                 ),
             )
-            logger.info(
-                "Bound GLM5-Next mHC OOT dispatch to CUDA/TileLang for <=%d "
-                "tokens and portable reference fallback above it",
-                _MHC_CUDA_MAX_TOKENS,
+        ]
+        if not native:
+            clamp = _load_flaggems_op(
+                "silu_and_mul_with_clamp", "silu_and_mul_with_clamp"
             )
-        else:
-            specs = tuple(
-                (op, op.forward_cuda, ("self",))
-                for op in (MHCPreOp, MHCPostOp, MHCFusedPostPreOp)
+            specs.append(
+                (
+                    SiluAndMulWithClamp,
+                    _bind_portable_forward(
+                        SiluAndMulWithClamp,
+                        "silu_and_mul_with_clamp",
+                        partial(_silu_and_mul_with_clamp_oot, clamp) if clamp else None,
+                    ),
+                )
             )
-            logger.info(
-                "Bound GLM5-Next mHC OOT dispatch to NVIDIA CUDA/TileLang kernels"
-            )
-    else:
-        from vllm.model_executor.layers.activation import SiluAndMulWithClamp
-
-        specs = (
-            (
-                MHCPreOp,
-                _mhc_pre_oot_with_norm,
-                ("self", "residual", "fn", "hc_scale", "hc_base", "rms_eps"),
-            ),
-            (
-                MHCPostOp,
-                _mhc_post_oot_flaggems,
-                ("self", "x", "residual", "post_layer_mix", "comb_res_mix"),
-            ),
-            (
-                MHCFusedPostPreOp,
-                _mhc_fused_post_pre_oot_with_norm,
-                ("self", "x", "residual", "post_layer_mix", "comb_res_mix"),
-            ),
-            (SiluAndMulWithClamp, _silu_and_mul_with_clamp_oot, ("self", "x")),
-        )
-        logger.info(
-            "Prepared GLM5-Next portable mHC OOT fallback with RMSNorm and "
-            "FlagGems bounded-SwiGLU dispatch"
-        )
     return [
-        _pending_attr(owner, "forward_oot", value, fingerprint, params)
-        for owner, value, params in specs
+        _pending_attr(owner, "forward_oot", value, fingerprint, ("self",))
+        for owner, value in specs
     ]
 
 
@@ -904,10 +847,9 @@ def _register_glm5_next_registrations() -> None:
 def apply_glm5_next_v024_patches() -> bool:
     """Register GLM5-Next config/model entries and its activation plan.
 
-    Registration only: no environment variable, FlagOS dispatch policy or
-    class-level patch is applied here.  Those run from the worker via
-    :func:`vllm_fl.activation.activate_for_model` when a GLM model is actually
-    loaded, before its modules are constructed.
+    Registers config/model entries and tracked early engine/config hooks.
+    Worker patches and dispatch defaults are installed by activate_for_model
+    only after GLM model matching, before its modules are constructed.
     """
     if not is_vllm_024():
         return False

@@ -116,16 +116,7 @@ def _capture_runtime_baseline(owner, attr: str) -> None:
 
 
 def _runtime_pristine(owner, attr: str):
-    target = _kpool_target(owner, attr)
-    value = _RUNTIME_BASELINES.get(target)
-    if value is None:  # pragma: no cover - core install captures these
-        value = getattr(owner, attr)
-        logger.warning(
-            "No import-time kpool runtime baseline for %s; capturing at "
-            "activation time",
-            target,
-        )
-    return value
+    return _RUNTIME_BASELINES[_kpool_target(owner, attr)]
 
 
 def _runtime_patch(

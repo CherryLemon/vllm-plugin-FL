@@ -6,6 +6,23 @@ from dataclasses import dataclass
 from math import isfinite, isqrt
 
 
+# These options are normalized into the modality dictionaries. vLLM's context
+# may reintroduce flat deployment defaults after request normalization.
+NORMALIZED_SERVING_KEYS = (
+    "min_pixels",
+    "max_pixels",
+    "min_image_tokens",
+    "max_image_tokens",
+    "max_frames",
+    "max_frame_count_dynamic",
+    "fps",
+    "target_fps",
+    "fps_interval",
+    "do_sample_frames",
+    "sampling_policy",
+)
+
+
 @dataclass(frozen=True)
 class VisionBudget:
     min_pixels: int
@@ -99,37 +116,24 @@ def resolve_vision_budget(processor, overrides=None) -> VisionBudget:
     )
 
 
-def resolve_serving_kwargs(processor, deployment, request):
+def resolve_serving_kwargs(processor, deployment, request, *, ceilings=None):
     """Resolve both modalities and reject requests exceeding reserved resources."""
     merged = deepcopy(deployment)
     merged.update(deepcopy(request))
     for nested in ("images_kwargs", "videos_kwargs"):
         merged[nested] = {**deployment.get(nested, {}), **request.get(nested, {})}
-    result = {
-        k: v
-        for k, v in merged.items()
-        if k
-        not in (
-            "min_pixels",
-            "max_pixels",
-            "min_image_tokens",
-            "max_image_tokens",
-            "max_frames",
-            "max_frame_count_dynamic",
-            "fps",
-            "target_fps",
-            "fps_interval",
-            "do_sample_frames",
-            "sampling_policy",
-        )
-    }
+    result = {k: v for k, v in merged.items() if k not in NORMALIZED_SERVING_KEYS}
     for modality, nested in (("image", "images_kwargs"), ("video", "videos_kwargs")):
         sub = getattr(processor, modality + "_processor")
         deploy_values = modality_kwargs(deployment, modality)
         values = dict(deploy_values)
         values.update(modality_kwargs(request, modality))
-        ceiling = resolve_vision_budget(sub, deploy_values)
-        budget = resolve_vision_budget(sub, values)
+        ceiling = (
+            ceilings[modality]
+            if ceilings is not None
+            else resolve_vision_budget(sub, deploy_values)
+        )
+        budget = resolve_vision_budget(sub, values) if request else ceiling
         if budget.max_pixels > ceiling.max_pixels:
             raise ValueError(
                 f"GLM5-Next {modality} request budget exceeds deployment limit "

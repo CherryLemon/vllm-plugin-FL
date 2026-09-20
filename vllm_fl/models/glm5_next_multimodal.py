@@ -662,20 +662,10 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
             processor = Glm5NextProcessor.from_pretrained(self.ctx.model_config.model)
             processor.configure_serving(self.ctx.get_merged_mm_kwargs({}))
             self._glm5_hf_processor = processor
-        processor.resolve_serving_kwargs(kwargs)
         return processor
 
     def _vision_budget(self, modality):
-        from vllm_fl.transformers_utils.processors.glm5_next_budget import (
-            modality_kwargs,
-            resolve_vision_budget,
-        )
-
-        processor = self.get_hf_processor()
-        return resolve_vision_budget(
-            getattr(processor, modality + "_processor"),
-            modality_kwargs(self.ctx.get_merged_mm_kwargs({}), modality),
-        )
+        return self.get_hf_processor().serving_budgets[modality]
 
     def _get_image_max_pixels(self) -> int:
         return self._vision_budget("image").max_pixels
@@ -711,7 +701,7 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
         )[1]
 
     def _video_frame_cap(self):
-        options = self.get_hf_processor().resolve_serving_kwargs({})["videos_kwargs"]
+        options = self.get_hf_processor().serving_options["videos_kwargs"]
         return options["max_frames"]
 
     def _get_max_video_frames(self, max_tokens):
@@ -891,14 +881,12 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
             return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
         from types import SimpleNamespace
 
-        from vllm.multimodal.processing import BaseMultiModalProcessor
-
         from vllm_fl.transformers_utils.processors.glm5_next import (
             glm_select_decoded_frames,
         )
 
-        processor = self.info.get_hf_processor(**mm_kwargs)
-        options = processor.resolve_serving_kwargs(mm_kwargs)["videos_kwargs"]
+        processor = self.info.get_hf_processor()
+        options = processor.resolve_serving_kwargs(mm_kwargs)
         # vLLM may have already sampled a video to its media-loader cap. Apply
         # deployment/request sampling to that available subset before HF sees
         # do_sample_frames=False, retaining the source timeline for prompts.
@@ -917,7 +905,7 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
                         processor.video_processor,
                         SimpleNamespace(**metadata),
                         len(video),
-                        **options,
+                        **options["videos_kwargs"],
                     )
                     item = (
                         video[rows],
@@ -925,13 +913,17 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
                     )
                 prepared.append(item)
             mm_data = dict(mm_data, videos=prepared)
-        data, kwargs = self._get_direct_path_inputs(mm_data, mm_kwargs)
-        # Resolve request precedence before InputProcessingContext re-merges
-        # deployment kwargs. Otherwise a nested deployment default can mask a
-        # flat request override in Transformers' modality merge.
-        kwargs = processor.resolve_serving_kwargs(kwargs)
-        return BaseMultiModalProcessor._call_hf_processor(
-            self, prompt, data, kwargs, tok_kwargs
+        data, kwargs = self._get_direct_path_inputs(mm_data, options)
+        if kwargs.pop("do_sample_frames", None) is False:
+            # The loader already supplied the selected frames. Avoid a second
+            # sampling pass after converting its tuple metadata for HF.
+            kwargs["videos_kwargs"] = dict(
+                kwargs["videos_kwargs"], do_sample_frames=False
+            )
+        return self.info.ctx.call_hf_processor(
+            processor._call_with_resolved_kwargs,
+            dict(text=prompt, **data),
+            dict(**kwargs, **tok_kwargs),
         )
 
     def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
