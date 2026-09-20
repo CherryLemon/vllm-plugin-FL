@@ -1,5 +1,10 @@
 # Common worker review validation
 
+The sections below record the earlier snapshot. The September 20 follow-up
+adds enforced installed-worker identity, cross-batch request reuse checks and
+combined FlagGems/MM/metadata execution. See `common_worker_review2.md` for the
+current results; historical numbers here are not new-code acceptance.
+
 The reviewed starting point was `4e6c15d`, based on `940480f`. Runtime fixes were
 tested at `fd21d86` on an H100 with vLLM 0.24.0+cu129 and PyTorch 2.11.0+cu129.
 The Python wheel was built with `VLLM_VENDOR` empty, installed into a separate
@@ -47,11 +52,22 @@ With the plugin wheel already installed, use fresh output directories:
 ```bash
 python tests/e2e_tests/inference/common_metadata_probe.py \
   --output-dir /tmp/common-metadata-decode \
+  --installed-root /opt/installed-common \
+  --expected-runtime-manifest /artifacts/common_runtime_manifest.json \
   --cudagraph-mode FULL_DECODE_ONLY
 python tests/e2e_tests/inference/common_metadata_probe.py \
   --output-dir /tmp/common-metadata-piecewise \
+  --installed-root /opt/installed-common \
+  --expected-runtime-manifest /artifacts/common_runtime_manifest.json \
   --cudagraph-mode PIECEWISE
 ```
+
+The manifest is a relative package path to SHA256 mapping generated from the
+wheel at build time. The script copies its probe to an isolated directory,
+replaces inherited PYTHONPATH with explicit paths, sets the child working
+directory, and checks module paths/hashes returned by actual workers. Optional
+`--dependency-path` entries locate pinned dependencies such as FlagGems;
+`--combination` enables the full worker FlagGems policy plus shape-aware MM.
 
 The script stores the generated checkpoint, per-process logs, exact token IDs,
 top-5 logprobs, and worker producer counters. Token IDs and top-5 identities must

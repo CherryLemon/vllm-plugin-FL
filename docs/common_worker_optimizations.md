@@ -21,6 +21,12 @@ and async speculative decode currently resolve to `stock`, with a logged reason,
 until their scheduling integration is validated. GPU execution failures propagate;
 there is no catch-and-continue fallback after an execution error.
 
+Mixed FULL model graphs are experimental and emit a startup warning after the
+model's graph policy is resolved. This does not warn for FULL_DECODE_ONLY,
+whose decode execution also uses the FULL runtime mode. The full-worker
+acceptance probe never reports mixed FULL as accepted; stock metadata does
+not fix the known model-graph reuse issue.
+
 FULL and PIECEWISE warmup/capture initialize the producer independently of model
 attention capture. PIECEWISE uses the fixed maximum request extent, since its
 model graph keys describe token counts rather than request counts. Updated
@@ -48,11 +54,19 @@ matrices with M at or below that threshold use the captured native CUDA kernel;
 other shapes use the captured FlagGems kernel. Existing whitelist/blacklist
 selection can exclude MM entirely.
 
-The policy is immutable for the process lifetime. Repeated worker initialization
+`flaggems_runtime.configure_flaggems` owns process initialization, configuration
+and failed-initialization state. The worker resolves platform, model and
+deployment operator policy before calling it; the MM module retains only its
+kernel handles and shape selector. When FlagGems or MM is disabled, or MM is
+excluded, the MM threshold is not parsed.
+
+The active policy is immutable for the process lifetime. Repeated worker initialization
 with identical settings checks the dispatcher registration and returns
 `already_active`, without running FlagGems registration again. Changing enable,
 threshold, USE_FLAGGEMS or backend selection requires a fresh process. External
-registration changes raise `conflicting_owner`. Worker shutdown intentionally
+registration changes raise `conflicting_owner` on the tested PyTorch 2.11
+adapter. Other Torch builds can use the public installation APIs but have no
+verified repeated-initialization ownership check. Worker shutdown intentionally
 does not uninstall a process-wide kernel; the retained handles remain alive.
 A failed registration cannot be retried in the same process.
 
@@ -60,9 +74,11 @@ The wrapper uses `SafeKernelFunction.call_boxed` handles captured before and aft
 FlagGems registration. FlagGems receives an observed `torch.library.Library`
 through its `lib=` argument. The observer records the callable and boxed handle
 only after successful CUDA MM registration, after vendor and condition filtering.
-Initialization checks the current registration stack, callable provider and a
-distinct native backend before installing the wrapper. Startup status records
-both backend identities and the routing threshold. Ownership checks happen at
+Successful registration through this library establishes which callable and
+boxed handle were installed. Kernel repr strings and source-package paths are
+diagnostic only and never gate initialization. The registration-stack check
+is restricted to the PyTorch 2.11 adapter. Startup status records the selected
+backends and routing threshold. Ownership checks happen at
 worker initialization, not on every MM invocation; external dispatcher mutation
 while a worker is running is unsupported.
 
@@ -73,3 +89,18 @@ do not imply that every model/platform/scheduling combination is validated.
 
 See [the recorded validation and reproduction commands](common_worker_validation.md)
 for the tested snapshot, installed-wheel checks, and scheduling limitations.
+
+## Integration owner
+
+PR544 owns the metadata policy, receipt and graph lifetime. PR455 uses that
+same owner for ordinary and packed block-table storage; there is no separate
+packed policy or graph cache. Padding clears a group's logical width, which
+can be smaller than its row stride in packed storage. Functional tests protect
+neighboring groups, real request rows and allocation guards during replay.
+
+PR442's fused multi-group producer is now upstream in main `71f6148` and is
+retained under this shared owner. The merge uses logical group widths and
+retires the producer's pointer tables with the InputBatch generation. One
+explicit stock/eager/graph parser and one graph owner serve both ordinary
+and packed storage. The historical local-fusion benchmark uses this same
+producer; publication inherits PR442 through main.
