@@ -431,6 +431,7 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
     runner.lora_config = None
     runner.speculative_config = None
     runner.prepare_inputs_event = None
+    runner.packed_block_table_arena = None
     runner.common_attention_metadata_graph = CommonAttentionMetadataGraphRunner()
     runner.input_batch = SimpleNamespace(block_table=_make_block_table(device))
     # Use actual fixed-address CPU/GPU buffers and the real cumsum helper.

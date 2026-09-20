@@ -2071,7 +2071,7 @@ class ModelRunnerFL(
         else:
             logger.info(
                 "Packed block-table arena enabled: groups=%d packed_width=%d "
-                "h2d_copies=1 slot_producer=2d",
+                "h2d_copies=1 metadata_owner=common",
                 self.packed_block_table_arena.group_count,
                 self.packed_block_table_arena.total_block_width,
             )
