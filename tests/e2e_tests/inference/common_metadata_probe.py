@@ -8,6 +8,10 @@ IDs/logprobs, producer counters and one log per policy.
 
 import argparse
 import json
+import hashlib
+import importlib
+from importlib.metadata import version, PackageNotFoundError
+import shutil
 import math
 import os
 import subprocess
@@ -21,13 +25,109 @@ class MetadataProbe:
     def metadata_state(self):
         runner = self.model_runner
         helper = runner.common_attention_metadata_graph
+        from vllm_fl import flaggems_runtime
+
+        identity = runtime_identity()
+        expected = json.loads(Path(os.environ["COMMON_PROBE_MANIFEST"]).read_text())
+        verify_identity(
+            identity, Path(os.environ["COMMON_PROBE_INSTALLED_ROOT"]), expected
+        )
+        state = flaggems_runtime._STATE
+        mm_state = state.mm_state if state else None
         return {
+            "identity": identity,
+            "shape_aware_mm": mm_state.result.status if mm_state else "disabled",
             "policy": runner.common_metadata_policy.mode,
             "async_scheduling": runner.use_async_scheduling,
             "captures": helper.captures if helper else 0,
             "replays": helper.replays if helper else 0,
             "eager_calls": helper.eager_calls if helper else 0,
         }
+
+
+RUNTIME_MODULES = (
+    "vllm_fl.worker.common_attention_metadata",
+    "vllm_fl.worker.model_runner",
+    "vllm_fl.worker.worker",
+    "vllm_fl.patches.flaggems_mm_shape_aware",
+    "vllm_fl.flaggems_runtime",
+)
+
+
+def runtime_identity():
+    import vllm_fl
+
+    files = {}
+    for name in RUNTIME_MODULES:
+        path = Path(importlib.import_module(name).__file__).resolve()
+        files[name] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    versions = {}
+    for package in ("vllm-plugin-FL", "vllm", "torch", "flag-gems", "triton"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    return {
+        "package_path": str(Path(vllm_fl.__file__).resolve()),
+        "files": files,
+        "versions": versions,
+    }
+
+
+def verify_identity(identity, installed_root, expected):
+    root = installed_root.resolve()
+    assert Path(identity["package_path"]).parent == root / "vllm_fl", identity
+    for module, record in identity["files"].items():
+        relative = module.replace(".", "/") + ".py"
+        assert Path(record["path"]) == root / relative, record
+        assert record["sha256"] == expected[relative], record
+
+
+def compare_outputs(actual, expected, *, label, atol):
+    assert actual["prompt"] == expected["prompt"], label
+    assert actual["tokens"] == expected["tokens"], label
+    maximum = 0.0
+    for step, reference in zip(actual["logprobs"], expected["logprobs"], strict=True):
+        assert step.keys() == reference.keys(), label
+        for token, value in step.items():
+            assert math.isfinite(value) and math.isfinite(reference[token]), label
+            delta = abs(value - reference[token])
+            assert delta <= atol, (label, token, delta, atol)
+            maximum = max(maximum, delta)
+    return maximum
+
+
+def compare_runs(runs, atol):
+    maximum = 0.0
+    for mode, run in runs.items():
+        first, second = run["results"]
+        by_prompt = {tuple(output["prompt"]): output for output in first}
+        assert len(by_prompt) == len(first) == len(second)
+        assert {tuple(x["prompt"]) for x in second} == by_prompt.keys()
+        for output in second:
+            maximum = max(
+                maximum,
+                compare_outputs(
+                    output,
+                    by_prompt[tuple(output["prompt"])],
+                    label=f"{mode}: request reuse",
+                    atol=atol,
+                ),
+            )
+        for batch, reference in zip(
+            run["results"], runs["stock"]["results"], strict=True
+        ):
+            for actual, expected in zip(batch, reference, strict=True):
+                maximum = max(
+                    maximum,
+                    compare_outputs(
+                        actual, expected, label=f"{mode}: policy parity", atol=atol
+                    ),
+                )
+    return maximum
 
 
 def make_model(path):
@@ -126,6 +226,8 @@ def run_worker(args):
             assert state["policy"] == args.worker_mode, state
             if args.worker_mode == "graph" and graph_mode != "NONE":
                 assert state["captures"] > 0 and state["replays"] > 0, state
+            if args.combination:
+                assert state["shape_aware_mm"] == "installed", state
             if args.worker_mode == "eager":
                 assert state["replays"] == 0 and state["eager_calls"] > 0, state
     finally:
@@ -141,6 +243,30 @@ def main():
         default="FULL_DECODE_ONLY",
     )
     parser.add_argument("--worker-mode", choices=["stock", "eager", "graph"])
+    parser.add_argument(
+        "--installed-root",
+        type=Path,
+        required=True,
+        help="Explicit installed site-packages directory (not a checkout)",
+    )
+    parser.add_argument(
+        "--expected-runtime-manifest",
+        type=Path,
+        required=True,
+        help="Build-time relative-path -> SHA256 JSON from the wheel",
+    )
+    parser.add_argument(
+        "--dependency-path",
+        type=Path,
+        action="append",
+        default=[],
+        help="Explicit dependency source path, e.g. validated FlagGems",
+    )
+    parser.add_argument(
+        "--combination",
+        action="store_true",
+        help="Enable real worker FlagGems policy and shape-aware MM",
+    )
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     if args.worker_mode:
@@ -152,10 +278,21 @@ def main():
     make_model(args.output_dir / "model")
     env = os.environ.copy()
     env["VLLM_PLUGINS"] = "fl"
-    env["USE_FLAGGEMS"] = "0"  # Isolate metadata from ATen MM registration.
+    env["USE_FLAGGEMS"] = "1" if args.combination else "0"
+    env["VLLM_FL_FLAGOS_MM_SHAPE_AWARE"] = "1" if args.combination else "0"
+    env["VLLM_FL_FLAGOS_MM_DECODE_MAX_M"] = "2"
+    isolated = args.output_dir / "probe"
+    isolated.mkdir()
+    script = isolated / "common_metadata_probe.py"
+    shutil.copy2(Path(__file__).resolve(), script)
+    installed = args.installed_root.resolve()
+    # Require wheel metadata, then independently verify each worker's imports.
+    assert any(installed.glob("vllm_plugin_fl-*.dist-info")), installed
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(Path(__file__).resolve().parent), env.get("PYTHONPATH", "")]
+        map(str, [isolated, installed] + [p.resolve() for p in args.dependency_path])
     )
+    env["COMMON_PROBE_INSTALLED_ROOT"] = str(installed)
+    env["COMMON_PROBE_MANIFEST"] = str(args.expected_runtime_manifest.resolve())
     runs = {}
     for mode in ("stock", "eager", "graph"):
         env["VLLM_FL_COMMON_ATTENTION_METADATA"] = mode
@@ -163,15 +300,21 @@ def main():
             subprocess.run(
                 [
                     sys.executable,
-                    str(Path(__file__).resolve()),
+                    str(script),
                     "--output-dir",
                     str(args.output_dir),
                     "--cudagraph-mode",
                     args.cudagraph_mode,
                     "--worker-mode",
                     mode,
-                ],
+                    "--installed-root",
+                    str(installed),
+                    "--expected-runtime-manifest",
+                    env["COMMON_PROBE_MANIFEST"],
+                ]
+                + (["--combination"] if args.combination else []),
                 env=env,
+                cwd=isolated,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
@@ -182,26 +325,14 @@ def main():
     # ULPs. Keep token IDs and top-k identities exact; only PIECEWISE permits
     # this small absolute logprob tolerance. Metadata tensor tests stay exact.
     atol = 1e-5 if args.cudagraph_mode == "PIECEWISE" else 0.0
-    max_delta = 0.0
-    for mode in ("eager", "graph"):
-        for batch, reference in zip(
-            runs[mode]["results"], runs["stock"]["results"], strict=True
-        ):
-            for actual, expected in zip(batch, reference, strict=True):
-                assert actual["prompt"] == expected["prompt"], mode
-                assert actual["tokens"] == expected["tokens"], mode
-                for step, ref_step in zip(
-                    actual["logprobs"], expected["logprobs"], strict=True
-                ):
-                    assert step.keys() == ref_step.keys(), mode
-                    for token, value in step.items():
-                        assert math.isfinite(value) and math.isfinite(ref_step[token])
-                        delta = abs(value - ref_step[token])
-                        assert delta <= atol, (mode, token, delta, atol)
-                        max_delta = max(max_delta, delta)
+    max_delta = compare_runs(runs, atol)
     summary = {
         "cudagraph_mode": args.cudagraph_mode,
         "requests_per_policy": 16,
+        "request_reuse_checked": True,
+        "installed_worker_identity_checked": True,
+        "combination": args.combination,
+        "accepted": args.cudagraph_mode != "FULL",
         "token_ids_and_top5_identities_exactly_equal": True,
         "logprob_atol": atol,
         "max_logprob_delta": max_delta,
@@ -209,6 +340,10 @@ def main():
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
+    if args.cudagraph_mode == "FULL":
+        raise SystemExit(
+            "Mixed FULL is experimental and cannot receive an acceptance PASS"
+        )
 
 
 if __name__ == "__main__":

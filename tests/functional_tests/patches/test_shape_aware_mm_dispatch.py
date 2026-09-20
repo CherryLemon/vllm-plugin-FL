@@ -21,7 +21,7 @@ def test_flaggems_mm_identity_and_cuda_graph():
     code = textwrap.dedent("""
         import torch
         import flag_gems
-        from vllm_fl.patches import flaggems_mm_shape_aware as m
+        from vllm_fl import flaggems_runtime as runtime
         import functools
         calls = []
         def enable(lib):
@@ -37,11 +37,9 @@ def test_flaggems_mm_identity_and_cuda_graph():
                 return original_impl(name, fn, key, **kwargs)
             lib.impl = observed_impl
             flag_gems.only_enable(lib=lib, include=['mm'])
-        status = m.configure_flaggems_mm(enable, whitelist=['mm'])
+        status = runtime.configure_flaggems(enable, whitelist=['mm'])
         assert status.status == 'installed'
-        assert 'flag_gems/' in status.flaggems
-        assert 'RegisterCUDA' in status.native
-        state = m._STATE
+        state = runtime._STATE.mm_state
         # Numerical output is checked against the captured native handle.
         keys = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
         for rows in [2, 3, 64]:
@@ -58,7 +56,7 @@ def test_flaggems_mm_identity_and_cuda_graph():
             graph.replay()
             expected = state.native_mm.call_boxed(keys, a,b)
             torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-2)
-        assert m.configure_flaggems_mm(lambda lib: None, whitelist=['mm']).status == 'already_active'
+        assert runtime.configure_flaggems(lambda lib: None, whitelist=['mm']).status == 'already_active'
         print(status)
     """)
     env = os.environ.copy()

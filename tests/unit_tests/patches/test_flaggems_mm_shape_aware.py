@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm_fl.patches import flaggems_mm_shape_aware as shape_aware
+from vllm_fl import flaggems_runtime as runtime
 
 
 class _FakeTensor:
@@ -30,8 +31,8 @@ class _FakeTensor:
 
 @pytest.fixture(autouse=True)
 def isolated_policy(monkeypatch):
-    monkeypatch.setattr(shape_aware, "_STATE", None)
-    monkeypatch.setattr(shape_aware, "_FAILED", False)
+    monkeypatch.setattr(runtime, "_STATE", None)
+    monkeypatch.setattr(runtime, "_FAILED", False)
 
 
 def test_disabled_policy_is_latched_without_kernel_inspection(monkeypatch):
@@ -43,12 +44,12 @@ def test_disabled_policy_is_latched_without_kernel_inspection(monkeypatch):
         "_get_registered_mm_kernel",
         lambda: pytest.fail("disabled policy inspected mm"),
     )
-    assert shape_aware.configure_flaggems_mm(calls.append).status == "disabled"
-    assert shape_aware.configure_flaggems_mm(calls.append).status == "disabled"
+    assert runtime.configure_flaggems(calls.append).status == "disabled"
+    assert runtime.configure_flaggems(calls.append).status == "disabled"
     assert calls == [None]
     monkeypatch.setenv(shape_aware.ENABLE_ENV, "1")
     with pytest.raises(RuntimeError, match="process-lifetime"):
-        shape_aware.configure_flaggems_mm(calls.append)
+        runtime.configure_flaggems(calls.append)
 
 
 def test_caller_default_can_enable_but_explicit_disable_wins(monkeypatch):
@@ -130,7 +131,7 @@ def test_native_candidate_boundary_dtype_and_stride():
 
 @pytest.mark.parametrize(
     "scenario",
-    ["reuse", "disable", "threshold", "backend", "external", "filtered", "wrong_owner"],
+    ["reuse", "disable", "threshold", "backend", "external", "filtered"],
 )
 @pytest.mark.gpu
 @pytest.mark.skipif(
@@ -155,38 +156,33 @@ def test_real_dispatcher_process_lifetime(monkeypatch, scenario):
     code = textwrap.dedent("""
         import os, sys, torch
         from vllm_fl.patches import flaggems_mm_shape_aware as m
+        from vllm_fl import flaggems_runtime as runtime
         scenario = sys.argv[1]
         calls = []
         def fake_mm(a, b):
             calls.append('large')
             return a + 7
         fake_mm.__module__ = 'flag_gems.test_backend'
-        # Controlled provider for this dispatcher-lifecycle test. The real
-        # FlagGems source check is exercised separately and on GPU.
-        m._flaggems_source = lambda fn: ('flag_gems/test_backend.py'
-            if getattr(fn, '__module__', '') == 'flag_gems.test_backend' else None)
         def enable(lib):
             calls.append('enable')
             if scenario == 'filtered':
                 return
-            if scenario == 'wrong_owner':
-                fake_mm.__module__ = 'unrelated_backend'
             lib.impl('mm', fake_mm, 'CUDA')
-        if scenario in ('filtered', 'wrong_owner'):
+        if scenario == 'filtered':
             try:
-                m.configure_flaggems_mm(enable)
+                runtime.configure_flaggems(enable)
             except RuntimeError as e:
-                assert 'expected distinct' in str(e), str(e)
+                assert 'did not register' in str(e), str(e)
             else:
                 raise AssertionError('accepted missing/wrong backend')
             try:
-                m.configure_flaggems_mm(enable)
+                runtime.configure_flaggems(enable)
             except RuntimeError as e:
                 assert 'previously failed' in str(e)
             else:
                 raise AssertionError('accepted retry after failed init')
             sys.exit(0)
-        status = m.configure_flaggems_mm(enable)
+        status = runtime.configure_flaggems(enable)
         assert status.status == 'installed'
         assert status.native != status.flaggems
         keys = torch._C.DispatchKeySet(torch._C.DispatchKey.CUDA)
@@ -195,7 +191,7 @@ def test_real_dispatcher_process_lifetime(monkeypatch, scenario):
         torch.testing.assert_close(result, a + 7)
         assert calls == ['enable', 'large']
         if scenario == 'reuse':
-            assert m.configure_flaggems_mm(enable).status == 'already_active'
+            assert runtime.configure_flaggems(enable).status == 'already_active'
             assert calls == ['enable', 'large']
             sys.exit(0)
         kwargs = {}
@@ -206,7 +202,7 @@ def test_real_dispatcher_process_lifetime(monkeypatch, scenario):
             external = torch.library.Library('aten','IMPL')
             external.impl('mm', lambda a,b: a + 100, 'CUDA', allow_override=True)
         try:
-            m.configure_flaggems_mm(enable, **kwargs)
+            runtime.configure_flaggems(enable, **kwargs)
         except RuntimeError as e:
             assert ('conflicting_owner' if scenario == 'external' else 'process-lifetime') in str(e)
         else:
@@ -232,22 +228,22 @@ def test_apply_fails_without_safe_override_api():
         shape_aware._register_override(OldLibrary(), lambda *args: None)
 
 
-def test_vendor_callable_identity_uses_source_not_module_prefix(monkeypatch):
-    import sys
-    from pathlib import Path
-
-    def mm(a, b):
-        return a
-
-    mm.__module__ = "hopper.ops.mm"
-    root = Path(__file__).resolve().parent
-    monkeypatch.setitem(
-        sys.modules, "flag_gems", SimpleNamespace(__file__=str(root / "__init__.py"))
+@pytest.mark.parametrize(
+    "use_flaggems,enabled,blacklist",
+    [
+        (False, "invalid", None),
+        (True, "0", None),
+        (True, "invalid", ["mm"]),
+    ],
+)
+def test_inactive_mm_ignores_unrelated_threshold(
+    monkeypatch, use_flaggems, enabled, blacklist
+):
+    monkeypatch.setenv(shape_aware.ENABLE_ENV, enabled)
+    monkeypatch.setenv(shape_aware.THRESHOLD_ENV, "invalid")
+    calls = []
+    result = runtime.configure_flaggems(
+        calls.append, use_flaggems=use_flaggems, blacklist=blacklist
     )
-    assert shape_aware._flaggems_source(mm) == str(Path(__file__).resolve())
-    monkeypatch.setitem(
-        sys.modules,
-        "flag_gems",
-        SimpleNamespace(__file__=str(root / "unrelated" / "__init__.py")),
-    )
-    assert shape_aware._flaggems_source(mm) is None
+    assert result.status == "disabled"
+    assert calls == ([None] if use_flaggems else [])

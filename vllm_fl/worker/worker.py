@@ -255,7 +255,7 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        from vllm_fl.patches.flaggems_mm_shape_aware import configure_flaggems_mm
+        from vllm_fl.flaggems_runtime import configure_flaggems
 
         whitelist, blacklist = get_flag_gems_whitelist_blacklist()
 
@@ -275,7 +275,7 @@ class WorkerFL(WorkerBase):
             else:
                 flag_gems.enable(**kwargs)
 
-        mm_status = configure_flaggems_mm(
+        mm_status = configure_flaggems(
             enable_flaggems,
             use_flaggems=fl_envs.USE_FLAGGEMS,
             whitelist=whitelist,

@@ -24,8 +24,6 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from threading import RLock
 from typing import Any
 
 import torch
@@ -38,15 +36,6 @@ DEFAULT_DECODE_MAX_M = 64
 
 
 @dataclass(frozen=True)
-class MMConfig:
-    use_flaggems: bool
-    enabled: bool
-    threshold: int
-    whitelist: tuple[str, ...] | None
-    blacklist: tuple[str, ...] | None
-
-
-@dataclass(frozen=True)
 class MMStatus:
     status: str
     reason: str
@@ -56,25 +45,14 @@ class MMStatus:
 
 @dataclass(frozen=True)
 class ShapeAwareMMState:
-    """One immutable worker policy and its retained dispatcher registrations.
+    """Retain the MM handles and Libraries for the process lifetime."""
 
-    Shutdown does not uninstall process-wide kernels. A subsequent worker
-    must use identical configuration and retain dispatcher ownership; changing
-    enable, threshold, or backend selection requires a new process.
-    """
-
-    config: MMConfig
     result: MMStatus
-    native_mm: Any = None
-    flaggems_mm: Any = None
-    flaggems_library: Any = None
-    library: Any = None
-    registration: tuple[str, ...] = ()
-
-
-_STATE: ShapeAwareMMState | None = None
-_FAILED = False
-_LOCK = RLock()
+    native_mm: Any
+    flaggems_mm: Any
+    flaggems_library: Any
+    library: Any
+    registration: tuple[str, ...] | None
 
 
 def _parse_bool_env(name: str, *, default: bool = False) -> bool:
@@ -250,34 +228,18 @@ def _register_override(library: Any, wrapper: Callable[..., Any]) -> None:
         ) from exc
 
 
-def _registration_fingerprint() -> tuple[str, ...]:
-    # Include active AND shadowed registrations: two Libraries constructed at
-    # the same source line still produce a different registration stack.
+def _registration_fingerprint() -> tuple[str, ...] | None:
+    # PyTorch 2.11 has no public kernel identity API. Restrict its diagnostic
+    # registration-stack adapter to the tested ABI; repr/source filenames are
+    # never implementation identity. Other builds can install through the
+    # public API, but repeated initialization cannot verify external ownership.
+    if torch.__version__.split("+", 1)[0].split(".")[:2] != ["2", "11"]:
+        return None
     return tuple(
         line
         for line in torch._C._dispatch_dump("aten::mm").splitlines()
         if line.startswith("CUDA:") or line.startswith("CUDA (inactive):")
     )
-
-
-def _flaggems_source(fn: Any) -> str | None:
-    """Verify code provenance, including vendor modules loaded as hopper.*.
-
-    FlagGems architecture loaders need not preserve the flag_gems module-name
-    prefix. Follow Python wrappers to the registered implementation's source
-    and require that it belongs to the loaded FlagGems package instead.
-    """
-    import flag_gems
-
-    try:
-        source = inspect.getsourcefile(inspect.unwrap(fn))
-        if source is None:
-            return None
-        path = Path(source).resolve()
-        root = Path(flag_gems.__file__).resolve().parent
-        return str(path) if path.is_relative_to(root) else None
-    except (TypeError, ValueError):
-        return None
 
 
 class _ObservedFlagGemsLibrary(torch.library.Library):
@@ -310,119 +272,34 @@ class _ObservedFlagGemsLibrary(torch.library.Library):
             self.mm_registration = _registration_fingerprint()
 
 
-def configure_flaggems_mm(
-    enable_flaggems: Callable[[Any], None],
-    *,
-    use_flaggems: bool = True,
-    whitelist: list[str] | None = None,
-    blacklist: list[str] | None = None,
-    default_enabled: bool = False,
-) -> MMStatus:
-    """Initialize FlagGems once and optionally install shape-aware CUDA mm.
+def apply_shape_aware_mm(
+    native: Any, gems_lib: _ObservedFlagGemsLibrary, threshold: int
+) -> ShapeAwareMMState:
+    """Install only the MM selector after observed FlagGems registration."""
+    gems = gems_lib.mm
+    if gems is None:
+        raise RuntimeError("FlagGems did not register CUDA mm through lib=")
+    if (
+        gems_lib.mm_registration is not None
+        and gems_lib.mm_registration != _registration_fingerprint()
+    ):
+        raise RuntimeError("CUDA mm changed after the observed FlagGems registration")
 
-    Repeated worker initialization checks configuration and ownership BEFORE
-    invoking FlagGems again. This prevents capturing our wrapper as the native
-    backend or letting a second enable() overwrite it. No per-mm-call checks,
-    tensor reads, or synchronization are added to inference/capture.
-    """
-    global _STATE, _FAILED
-    config = MMConfig(
-        use_flaggems,
-        is_shape_aware_mm_enabled(default=default_enabled),
-        _parse_threshold_env(),
-        tuple(sorted(whitelist)) if whitelist is not None else None,
-        tuple(sorted(blacklist)) if blacklist is not None else None,
+    def shape_aware_mm(dispatch_keys, a, b):
+        target = native if _is_native_candidate(a, b, threshold) else gems
+        return target.call_boxed(dispatch_keys, a, b)
+
+    library = torch.library.Library("aten", "IMPL")
+    _register_override(library, shape_aware_mm)
+    fn = gems_lib.mm_callable
+    # Names and source locations are diagnostic only: vendor loaders and
+    # packaged distributions need not retain the flag_gems module/path prefix.
+    result = MMStatus(
+        "installed",
+        f"native CUDA for M <= {threshold}; FlagGems otherwise",
+        repr(native),
+        f"{getattr(fn, '__module__', '')}.{getattr(fn, '__name__', '')}",
     )
-    with _LOCK:
-        if _FAILED:
-            raise RuntimeError(
-                "FlagGems initialization previously failed; restart the process"
-            )
-        if _STATE is not None:
-            if config != _STATE.config:
-                raise RuntimeError(
-                    "FlagGems/MM configuration is process-lifetime; restart to change it"
-                )
-            if _STATE.library is not None:
-                if _registration_fingerprint() != _STATE.registration:
-                    raise RuntimeError(
-                        "conflicting_owner: aten::mm/CUDA registration changed; restart the process"
-                    )
-                return MMStatus(
-                    "already_active",
-                    _STATE.result.reason,
-                    _STATE.result.native,
-                    _STATE.result.flaggems,
-                )
-            return _STATE.result
-
-        active = (
-            config.use_flaggems
-            and config.enabled
-            and is_mm_dispatch_enabled(whitelist, blacklist)
-        )
-        if not active:
-            if config.use_flaggems:
-                try:
-                    enable_flaggems(None)
-                except Exception:
-                    _FAILED = True
-                    raise
-            result = MMStatus("disabled", "policy disabled or mm excluded")
-            _STATE = ShapeAwareMMState(config, result)
-            return result
-
-        try:
-            native = capture_native_mm_kernel()
-            if "RegisterCUDA" not in repr(native):
-                raise RuntimeError(
-                    "Expected native CUDA mm before FlagGems initialization"
-                )
-            gems_lib = _ObservedFlagGemsLibrary()
-            enable_flaggems(gems_lib)
-            gems = gems_lib.mm
-            fn = gems_lib.mm_callable
-            source = _flaggems_source(fn)
-            if (
-                gems is None
-                or source is None
-                or gems_lib.mm_registration != _registration_fingerprint()
-                or repr(gems) == repr(native)
-            ):
-                raise RuntimeError(
-                    "FlagGems did not install the expected distinct CUDA mm kernel"
-                )
-
-            def shape_aware_mm(dispatch_keys, a, b):
-                target = (
-                    native if _is_native_candidate(a, b, config.threshold) else gems
-                )
-                return target.call_boxed(dispatch_keys, a, b)
-
-            library = torch.library.Library("aten", "IMPL")
-            _register_override(library, shape_aware_mm)
-            registration = _registration_fingerprint()
-            if registration == gems_lib.mm_registration:
-                raise RuntimeError("Shape-aware mm override was not installed")
-            result = MMStatus(
-                "installed",
-                f"native CUDA for M <= {config.threshold}; FlagGems otherwise",
-                repr(native),
-                f"{fn.__module__}.{fn.__name__} ({source}): {gems!r}",
-            )
-            _STATE = ShapeAwareMMState(
-                config, result, native, gems, gems_lib, library, registration
-            )
-            logger.info(
-                "Shape-aware MM status=%s policy=%s native=%s flaggems=%s",
-                result.status,
-                result.reason,
-                result.native,
-                result.flaggems,
-            )
-            return result
-        except Exception:
-            # Registration can have side effects; retries in this process must
-            # never reinterpret a partially initialized backend as native.
-            _FAILED = True
-            raise
+    return ShapeAwareMMState(
+        result, native, gems, gems_lib, library, _registration_fingerprint()
+    )

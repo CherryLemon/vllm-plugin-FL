@@ -7110,6 +7110,17 @@ class ModelRunnerFL(
             is_profiling=is_profiling,
         )
 
+        if (
+            self.common_metadata_policy.mode != "stock"
+            and cudagraph_mode == CUDAGraphMode.FULL
+        ):
+            logger.warning_once(
+                "Common metadata with mixed FULL model graphs is experimental: "
+                "request-reuse numerical acceptance has not passed. "
+                "Validated modes are FULL_DECODE_ONLY and PIECEWISE. "
+                "Stock metadata does not repair the mixed FULL model-graph issue."
+            )
+
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
