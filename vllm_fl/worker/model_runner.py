@@ -293,11 +293,7 @@ from vllm_fl.worker.common_slot_mapping import (
     compute_common_slot_mapping,
 )
 from vllm_fl.worker.packed_block_table import PackedBlockTableArena
-from vllm_fl.worker.async_output import (
-    _enqueue_native_completion,
-    _shutdown_native_completion_pool,
-    _wait_for_async_output_event,
-)
+
 GraphWrapper = GraphWrapper
 
 if TYPE_CHECKING:
@@ -354,9 +350,6 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 if self._routed_experts is not None
                 else None
             )
-            self._async_copy_completion = _enqueue_native_completion(
-                async_output_copy_stream
-            )
             self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
@@ -365,10 +358,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        _wait_for_async_output_event(
-            self.async_copy_ready_event, self._async_copy_completion
-        )
-        self._async_copy_completion = None
+        self.async_copy_ready_event.synchronize()
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -469,19 +459,13 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
                 raw_pooler_output=self._raw_pooler_output,
                 finished_mask=finished_mask,
             )
-            self._async_copy_completion = _enqueue_native_completion(
-                async_output_copy_stream
-            )
             self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        _wait_for_async_output_event(
-            self.async_copy_ready_event, self._async_copy_completion
-        )
-        self._async_copy_completion = None
+        self.async_copy_ready_event.synchronize()
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
@@ -6728,7 +6712,6 @@ class ModelRunnerFL(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
-        _shutdown_native_completion_pool()
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
         # The cleanup above synchronizes and destroys slot-mapping graphs
