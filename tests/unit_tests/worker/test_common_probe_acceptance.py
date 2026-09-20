@@ -40,3 +40,13 @@ def test_worker_identity_rejects_checkout_and_changed_runtime(tmp_path):
     identity["package_path"] = str(installed / "vllm_fl/__init__.py")
     with pytest.raises(AssertionError):
         probe.verify_identity(identity, installed, {relative: "different wheel"})
+
+
+def test_fp16_combination_still_rejects_shared_logprob_drift():
+    output = {"prompt": [1, 2], "tokens": [11], "logprobs": [{"11": -0.1}]}
+    run = {"results": [[output], [copy.deepcopy(output)]]}
+    runs = {mode: copy.deepcopy(run) for mode in ("stock", "eager", "graph")}
+    for result in runs.values():
+        result["results"][1][0]["logprobs"][0]["11"] += 0.002
+    with pytest.raises(AssertionError, match="request reuse"):
+        probe.compare_runs(runs, 2**-10)

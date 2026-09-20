@@ -43,10 +43,36 @@ decode runtime, and does not imply that stock metadata fixes mixed FULL.
 The earlier per-group common wheel at runtime commit `de99118` passed 87
 selected checks on H100 without skips, errors or failures. After reconciling
 upstream PR442, acceptance rebuilds the fused common wheel and reruns those
-checks plus the four adapted upstream policy/capture tests. It also exercises
+checks plus the four adapted upstream policy/capture tests. A further
+probe-acceptance check rejects shared numerical drift with mixed-backend FP16
+tolerance. It also exercises
 full workers from the installed wheel, with RPC path/hash verification.
 
-Pending final full-worker probe results. This working draft is not acceptance.
+The rebuilt common wheel at `78786cebce23a3de6b62f69a7ee27c14698860a8` passes **91 selected checks**, with all 248 packaged file hashes verified. No failures, errors or skips. A further three probe-acceptance checks pass, including one new shared-drift negative case (92 unique checks in total).
+
+| Model graph / FlagGems + MM | Requests per policy | Max logprob delta | Captures / replays |
+|---|---:|---:|---|
+| FULL_DECODE_ONLY / disabled | 16 | 0 | 5 / 43 |
+| PIECEWISE / disabled | 16 | 0 | 2 / 44 |
+| FULL_DECODE_ONLY / enabled | 16 | 0.000253200531 | 5 / 43 |
+
+All three policies (`stock`, `eager`, `graph`) pass within-policy reordered
+request comparisons and cross-policy comparisons in every row. Token IDs and
+top-5 identities match exactly. Without MM routing, FULL_DECODE_ONLY requires
+exact logprobs and PIECEWISE allows 1e-5 absolute error; both observed zero.
+The FP16 mixed-backend combination uses an absolute bound of `2**-10`
+(0.0009765625), one FP16 epsilon. Its initial zero-tolerance run is retained:
+all tokens/top-5 identities agreed, while logprobs differed by at most
+0.000253201 as batch shapes and GEMM backends changed. The bound applies to
+within-policy reuse and cross-policy comparisons; a negative test rejects
+shared 0.002 drift even when all policies agree. Worker RPC
+verifies all five runtime-module paths and hashes, records dependency versions,
+and confirms metadata replay. The combined row uses normal worker FlagGems
+initialization and reports installed MM handles with threshold 2. Backend
+strings remain diagnostics rather than string-based acceptance gates.
+
+The 4K model-specific repetition investigation in PR455 is separate from these
+tiny-Llama common-worker checks; it is not certified by this report.
 
 ## Reproduction
 
