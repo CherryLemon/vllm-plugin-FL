@@ -2,8 +2,8 @@
 """C6: vLLM 0.24 KV binding must call the cache-owner hook exactly once, after
 the upstream bind, and identify owners by registration rather than module name."""
 
-import torch
 import pytest
+import torch
 
 import vllm_fl.worker.model_runner as mr
 from vllm_fl.compat.vllm024 import kv_cache as kv_bind

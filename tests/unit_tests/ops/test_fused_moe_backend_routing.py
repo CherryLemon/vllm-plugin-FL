@@ -1,8 +1,8 @@
 """Routing tests for the FlagOS unquantized MoE provider."""
 
-from types import SimpleNamespace
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -51,8 +51,11 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, ven
     import torch
 
     module = _import_fused_moe_utils()
-    monkeypatch.setattr(module, "_get_current_platform", lambda: SimpleNamespace(
-        vendor_name=vendor, is_cuda=lambda: vendor == "nvidia"))
+    monkeypatch.setattr(
+        module,
+        "_get_current_platform",
+        lambda: SimpleNamespace(vendor_name=vendor, is_cuda=lambda: vendor == "nvidia"),
+    )
     result = torch.full((2, 4), 7.0)
     nvidia = Mock(return_value=result)
     kunlunxin = Mock(return_value=result)
@@ -63,15 +66,37 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, ven
     monkeypatch.setitem(sys.modules, name, backend)
     experts = SimpleNamespace(
         _lora_context=None,
-        quant_config=SimpleNamespace(use_fp8_w8a8=False, use_int8_w8a8=False,
-                                     use_int8_w8a16=False, use_int4_w4a16=False),
-        per_act_token_quant=False, w1_scale=None, w2_scale=None,
-        block_shape=None, w1_bias=None, w2_bias=None,
+        quant_config=SimpleNamespace(
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+        ),
+        per_act_token_quant=False,
+        w1_scale=None,
+        w2_scale=None,
+        block_shape=None,
+        w1_bias=None,
+        w2_bias=None,
     )
     output = torch.zeros_like(result)
     module.TritonExpertsFL.apply(
-        experts, output, result, result, result, result, result,
-        module.MoEActivation.SILU, 2, None, None, None, result, result, None, False,
+        experts,
+        output,
+        result,
+        result,
+        result,
+        result,
+        result,
+        module.MoEActivation.SILU,
+        2,
+        None,
+        None,
+        None,
+        result,
+        result,
+        None,
+        False,
     )
     torch.testing.assert_close(output, result)
     selected, other = (nvidia, kunlunxin) if vendor == "nvidia" else (kunlunxin, nvidia)
@@ -81,20 +106,16 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, ven
 
 
 @pytest.mark.parametrize("backend", ["auto", "triton"])
-def test_fl_provider_uses_flaggems_experts_for_auto_and_triton(
-    monkeypatch, backend
-):
+def test_fl_provider_uses_flaggems_experts_for_auto_and_triton(monkeypatch, backend):
     fused_moe_utils = _import_fused_moe_utils()
     monkeypatch.setattr(
         fused_moe_utils, "_get_current_platform", lambda: _oot_platform()
     )
     monkeypatch.setattr(fused_moe_utils, "use_flaggems", lambda: True)
 
-    selected_backend, experts_cls = (
-        fused_moe_utils.select_unquantized_moe_backend_oot(
-            _moe_config(backend),
-            prefer_flaggems_experts=True,
-        )
+    selected_backend, experts_cls = fused_moe_utils.select_unquantized_moe_backend_oot(
+        _moe_config(backend),
+        prefer_flaggems_experts=True,
     )
 
     assert selected_backend is fused_moe_utils.UnquantizedMoeBackend.TRITON
@@ -118,11 +139,9 @@ def test_explicit_non_triton_backend_remains_authoritative(monkeypatch):
         lambda _backend: _SupportedNativeExperts,
     )
 
-    selected_backend, experts_cls = (
-        fused_moe_utils.select_unquantized_moe_backend_oot(
-            _moe_config("aiter"),
-            prefer_flaggems_experts=True,
-        )
+    selected_backend, experts_cls = fused_moe_utils.select_unquantized_moe_backend_oot(
+        _moe_config("aiter"),
+        prefer_flaggems_experts=True,
     )
 
     assert selected_backend is fused_moe_utils.UnquantizedMoeBackend.AITER
@@ -146,10 +165,8 @@ def test_native_oracle_does_not_reenable_flaggems_experts(monkeypatch):
         lambda _backend: _SupportedNativeExperts,
     )
 
-    selected_backend, experts_cls = (
-        fused_moe_utils.select_unquantized_moe_backend_oot(
-            _moe_config("triton")
-        )
+    selected_backend, experts_cls = fused_moe_utils.select_unquantized_moe_backend_oot(
+        _moe_config("triton")
     )
 
     assert selected_backend is fused_moe_utils.UnquantizedMoeBackend.TRITON
@@ -157,9 +174,10 @@ def test_native_oracle_does_not_reenable_flaggems_experts(monkeypatch):
 
 
 def test_factory_patch_rewrites_already_bound_model_symbol(monkeypatch):
-    from vllm_fl.ops import custom_ops
     import vllm.model_executor.layers.fused_moe as fused_moe_pkg
     import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    from vllm_fl.ops import custom_ops
 
     native_factory = object()
     fake_model = types.ModuleType("vllm.model_executor.models._fl_moe_test")

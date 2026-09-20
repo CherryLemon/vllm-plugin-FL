@@ -1,8 +1,8 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
 import pytest
+import torch
 
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
@@ -163,7 +163,12 @@ def test_packed_arena_common_producer_graph_replay():
     )
     torch.cuda.synchronize()
     assert table.block_tables[0].slot_mapping.gpu[:4].cpu().tolist() == [8, 9, 40, 41]
-    assert table.block_tables[1].slot_mapping.gpu[:4].cpu().tolist() == [48, 49, 104, 105]
+    assert table.block_tables[1].slot_mapping.gpu[:4].cpu().tolist() == [
+        48,
+        49,
+        104,
+        105,
+    ]
 
     query_start_loc.copy_(
         torch.tensor([0, 1, 3, 3, 3], dtype=torch.int32, device="cuda")

@@ -7,8 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from vllm.config import CUDAGraphMode
-from vllm_fl.worker import model_runner as runner_module
+
 from vllm_fl.patches.qwen3_8_flash_next import should_skip_generic_flaggems_aten
+from vllm_fl.worker import model_runner as runner_module
 
 
 class AlloptDay0IntegrationTests(unittest.TestCase):
@@ -44,7 +45,7 @@ class AlloptDay0IntegrationTests(unittest.TestCase):
         )
 
     def test_packed_arena_opt_in_and_required_gate(self):
-        arena_factory, logger = Mock(), Mock()
+        arena_factory = Mock()
         install = runner_module.ModelRunnerFL._install_packed_block_table_arena
         runner = SimpleNamespace(
             input_batch=SimpleNamespace(block_table=object()),

@@ -13,9 +13,7 @@ def _load_qsa_ops():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable; QSA split validation requires a GPU")
     try:
-        return importlib.import_module(
-            "vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa"
-        )
+        return importlib.import_module("vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa")
     except Exception as exc:  # pragma: no cover - target-GPU import guard
         pytest.fail(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}")
 
@@ -32,9 +30,7 @@ def _case(
     physical_blocks = rows * pages
     # Padding the final dimension preserves stride-one dim access while making
     # page/head strides non-contiguous, matching allocator-owned cache views.
-    q_storage = torch.randn(
-        rows, 3, head_dim + 8, dtype=torch.bfloat16, device=device
-    )
+    q_storage = torch.randn(rows, 3, head_dim + 8, dtype=torch.bfloat16, device=device)
     k_storage = torch.randn(
         physical_blocks,
         page_size,
@@ -48,12 +44,14 @@ def _case(
     k_cache = k_storage[..., :head_dim]
     v_cache = v_storage[..., :head_dim]
     # Reverse each request's page order to exercise the page-table indirection.
-    table = torch.arange(
-        physical_blocks, dtype=torch.int32, device=device
-    ).reshape(rows, pages).flip(1)
-    indices = torch.arange(topk, dtype=torch.int32, device=device).expand(
-        rows, -1
-    ).clone()
+    table = (
+        torch.arange(physical_blocks, dtype=torch.int32, device=device)
+        .reshape(rows, pages)
+        .flip(1)
+    )
+    indices = (
+        torch.arange(topk, dtype=torch.int32, device=device).expand(rows, -1).clone()
+    )
     # One sentinel and one out-of-table token per row must be ignored by both
     # the split and single kernels.
     indices[:, -1] = -1
@@ -75,17 +73,24 @@ def _workspace(case: dict[str, torch.Tensor], splits: int):
     q = case["q"]
     return (
         torch.empty(
-            q.shape[0], q.shape[1], splits, q.shape[2],
+            q.shape[0],
+            q.shape[1],
+            splits,
+            q.shape[2],
             dtype=torch.float32,
             device=q.device,
         ),
         torch.empty(
-            q.shape[0], q.shape[1], splits,
+            q.shape[0],
+            q.shape[1],
+            splits,
             dtype=torch.float32,
             device=q.device,
         ),
         torch.empty(
-            q.shape[0], q.shape[1], splits,
+            q.shape[0],
+            q.shape[1],
+            splits,
             dtype=torch.float32,
             device=q.device,
         ),
@@ -115,10 +120,7 @@ def _assert_split_error(candidate: torch.Tensor, baseline: torch.Tensor) -> None
     max_abs = float(flat.max().item())
     rmse = float(torch.sqrt(torch.mean(diff.square())).item())
     p99 = float(torch.quantile(flat, 0.99).item())
-    print(
-        f"qsa split error: max_abs={max_abs:.8g} rmse={rmse:.8g} "
-        f"p99={p99:.8g}"
-    )
+    print(f"qsa split error: max_abs={max_abs:.8g} rmse={rmse:.8g} p99={p99:.8g}")
     assert math.isfinite(max_abs) and math.isfinite(rmse) and math.isfinite(p99)
     # The merge is FP32 and both paths round the gated result to BF16.  These
     # gates leave room for reduction-order ULPs while catching a real ABI or
@@ -163,15 +165,9 @@ def test_qsa_split_dispatch_topk_boundaries(monkeypatch):
     device = torch.device("cuda")
     case = _case(device, rows=2, topk=512)
     monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
-    assert (
-        ops.qsa_sparse_split_count(case["q"], case["k"], 511) == 1
-    )
-    assert (
-        ops.qsa_sparse_split_count(case["q"], case["k"], 512) == 8
-    )
-    assert (
-        ops.qsa_sparse_split_count(case["q"], case["k"], 513) == 8
-    )
+    assert ops.qsa_sparse_split_count(case["q"], case["k"], 511) == 1
+    assert ops.qsa_sparse_split_count(case["q"], case["k"], 512) == 8
+    assert ops.qsa_sparse_split_count(case["q"], case["k"], 513) == 8
 
     # Execute both sides of the dispatch boundary.  511 remains the explicit
     # single-kernel fallback, while 512 enters split=8.
@@ -261,8 +257,10 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     captured_out = torch.empty_like(case["q"])
     graph = torch.cuda.CUDAGraph()
     from types import SimpleNamespace
+
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import BatchDescriptor
+
     from vllm_fl.worker.model_runner import ModelRunnerFL
 
     def attention():
@@ -283,7 +281,9 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     # now fails REQUIRE during capture instead of passing a source-text check.
     runner = SimpleNamespace(_dummy_run=dummy)
     ModelRunnerFL._warmup_and_capture(
-        runner, BatchDescriptor(num_tokens=8, num_reqs=8), CUDAGraphMode.FULL,
+        runner,
+        BatchDescriptor(num_tokens=8, num_reqs=8),
+        CUDAGraphMode.FULL,
         num_warmups=3,
     )
     workspace = next(iter(cache.values()))

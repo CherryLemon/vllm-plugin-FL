@@ -131,6 +131,7 @@ def test_worker_state_updates_invalidate_finished_resumed_and_replaced_history(
     device, monkeypatch
 ):
     from unittest.mock import Mock
+
     from vllm_fl.worker import model_runner as module
 
     h = Harness(device)
