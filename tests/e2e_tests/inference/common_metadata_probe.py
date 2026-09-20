@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -37,6 +38,8 @@ class MetadataProbe:
         return {
             "identity": identity,
             "shape_aware_mm": mm_state.result.status if mm_state else "disabled",
+            "mm_backends": asdict(mm_state.result) if mm_state else None,
+            "mm_threshold": state.config.mm_threshold if state else None,
             "policy": runner.common_metadata_policy.mode,
             "async_scheduling": runner.use_async_scheduling,
             "captures": helper.captures if helper else 0,
