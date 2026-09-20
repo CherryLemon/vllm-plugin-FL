@@ -18,6 +18,7 @@ python3 "$script_dir/identity_preflight.py" \
   --output "$runtime_dir/source_identity_at_server_start.json" \
   --expected-init-sha256 "$EXPECTED_FLAGGEMS_INIT_SHA256" \
   --expected-plan-cache-sha256 "$EXPECTED_FLAGGEMS_PLAN_CACHE_SHA256" \
+  --expected-fused-moe-sha256 "$EXPECTED_FLAGGEMS_FUSED_MOE_SHA256" \
   --expected-gpu-count "$EXPECTED_GPU_COUNT" \
   --expected-gpu-substring "$EXPECTED_GPU_SUBSTRING"
 

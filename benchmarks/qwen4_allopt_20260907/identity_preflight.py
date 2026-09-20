@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--expected-init-sha256", required=True)
     parser.add_argument("--expected-plan-cache-sha256", required=True)
+    parser.add_argument("--expected-fused-moe-sha256", required=True)
     parser.add_argument("--expected-gpu-count", required=True, type=int)
     parser.add_argument("--expected-gpu-substring", required=True)
     return parser.parse_args()
@@ -96,6 +97,7 @@ def main() -> int:
     for label, path in (
         ("flaggems_init", init_file),
         ("flaggems_plan_cache", cache_file),
+        ("flaggems_fused_moe", flaggems_root / "src/flag_gems/fused/fused_moe.py"),
         ("plugin_plan_cache_bridge", bridge_file),
     ):
         try:
@@ -108,6 +110,8 @@ def main() -> int:
         errors.append("FlagGems __init__.py hash mismatch")
     if file_hashes["flaggems_plan_cache"] != args.expected_plan_cache_sha256:
         errors.append("FlagGems aten_plan_cache.py hash mismatch")
+    if file_hashes["flaggems_fused_moe"] != args.expected_fused_moe_sha256:
+        errors.append("FlagGems fused_moe.py hash mismatch; see the review2 dependency fix")
 
     bridge_text = ""
     try:

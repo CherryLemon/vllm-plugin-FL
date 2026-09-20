@@ -1,5 +1,10 @@
 # Qwen4 all-on checkpoint — 2026-09-07
 
+The current shared-owner implementation, dependency fix and 1K/1K + 4K/1K
+acceptance are documented in [the September 20 review](REVIEW2_20260920.md).
+The implementation notes and measurements below retain the September 7
+checkpoint history; use the current report for the final tested stack.
+
 The measured plugin checkpoint is commit
 `efc05b365ed12675098d95ac65f80c80457f16f6`, based on
 `fadbba0ea59bbaa46c77b06d465321ab88b44643`. Its Qwen adaptation,
@@ -120,7 +125,11 @@ Use an already validated H100 container and mount:
 - the checkpoint at `/models/Qwen3.8-Flash-Next`;
 - a fresh writable results directory at `/artifact`.
 
-The entry/cache-module FlagGems hashes are checked in `all_on_env.sh`.
+The entry/cache/MoE-module FlagGems hashes are checked before startup.
+The September 20 acceptance requires the deterministic multi-expert reduction
+fix in [FlagGems #6492](https://github.com/flagos-ai/FlagGems/pull/6492).
+See [the current acceptance report](REVIEW2_20260920.md) for the pinned dependency
+snapshot, patch and separate 1K/1K and 4K/1K protocols.
 The expected cache module hash is
 `d9afa71ffb3aada02b82468569d9e02c07b5981a83066fab56f82bd2f3390921`;
 the older install-only tree is not interchangeable. Checkpoint config hash:

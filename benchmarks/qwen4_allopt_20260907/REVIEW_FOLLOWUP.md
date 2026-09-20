@@ -1,10 +1,12 @@
 # PR 455 review follow-up (2026-09-19)
 
-Latest performance follow-up: the safe GPU-history/within-budget QSA candidate
-reached **3376.54 output tokens/s**, **17.66 ms TPOT**, and **0.65%** drift on the
-same short-context profile, recovering the historical throughput level.
-See [the matched scheduling and QSA experiment](PERFORMANCE_ASYNC_20260920.md).
-The measurements below describe the earlier iterations.
+Current implementation and 1K/1K + 4K/1K acceptance are recorded in
+[the September 20 integration review](REVIEW2_20260920.md). The optional native
+completion subsystem has moved to draft [PR547](https://github.com/flagos-ai/vllm-plugin-FL/pull/547).
+PR455 now uses ordinary accelerator Event completion. The sections below are
+historical records, including the former opt-in flag and native fault-test scope.
+The earlier scheduling/QSA experiment reached 3376.54 output tokens/s with
+17.66 ms TPOT; see [its original evidence](PERFORMANCE_ASYNC_20260920.md).
 
 This iteration addresses the four concrete findings against `d79cd85`.
 [review_followup_validation.json](review_followup_validation.json) binds the
