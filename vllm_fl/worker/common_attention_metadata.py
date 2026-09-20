@@ -62,6 +62,7 @@ def _compute_slot_mapping_graph_kernel(
     positions_ptr,
     block_table_ptr,
     block_table_stride,
+    block_table_width,
     block_size,
     slot_mapping_ptr,
     TOTAL_CP_WORLD_SIZE: tl.constexpr,
@@ -95,12 +96,12 @@ def _compute_slot_mapping_graph_kernel(
     # the predicate: valid scheduler rows can transiently carry seq_len == 0.
     if start_idx == end_idx:
         row_offset = req_idx * block_table_stride
-        for i in range(0, block_table_stride, BLOCK_SIZE):
+        for i in range(0, block_table_width, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
             tl.store(
                 block_table_ptr + row_offset + offsets,
                 NULL_BLOCK_ID,
-                mask=offsets < block_table_stride,
+                mask=offsets < block_table_width,
             )
 
     virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
@@ -167,6 +168,7 @@ def compute_common_attention_metadata(
             positions,
             table.block_table.gpu,
             table.block_table.gpu.stride(0),
+            table.block_table.gpu.shape[1],
             table.block_size,
             table.slot_mapping.gpu,
             TOTAL_CP_WORLD_SIZE=total_cp_world_size,

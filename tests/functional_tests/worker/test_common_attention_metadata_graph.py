@@ -17,6 +17,43 @@ from vllm_fl.worker.common_attention_metadata import (
 pytestmark = pytest.mark.gpu
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_padded_rows_clear_only_group_width_in_strided_storage():
+    """A group's row stride can include other groups and allocation guards."""
+    table = _make_block_table(torch.device("cuda"))
+    widths = [group.block_table.gpu.shape[1] for group in table.block_tables]
+    backing = torch.full((5, sum(widths) + 7), -555, dtype=torch.int32, device="cuda")
+    offset = 0
+    for group, width in zip(table.block_tables, widths):
+        group.block_table.gpu = backing[:4, offset:offset + width]
+        group.block_table.gpu.copy_(group.block_table.cpu)
+        offset += width
+    query = torch.tensor([0, 1, 1, 2, 2], dtype=torch.int32, device="cuda")
+    positions = torch.zeros(16, dtype=torch.int64, device="cuda")
+    positions[1] = 8
+    lengths = torch.tensor([2, 0, 12, 0], dtype=torch.int32, device="cuda")
+    computed = torch.empty(4, dtype=torch.int32, device="cuda")
+    runner = CommonAttentionMetadataGraphRunner()
+    for capture, active in ((True, [0, 2]), (False, [0, 1])):
+        for group in table.block_tables:
+            group.block_table.gpu.copy_(group.block_table.cpu)
+            group.slot_mapping.gpu.fill_(-555)
+        if not capture:
+            query.copy_(torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32))
+            lengths.copy_(torch.tensor([2, 12, 0, 0], dtype=torch.int32))
+        receipt = runner.run(table, 4, query, positions, lengths, computed,
+                             use_graph=True, capture=capture)
+        receipt.validate(table, 4, 16)
+        torch.cuda.synchronize()
+        for group, expected in zip(table.block_tables, _expected_slots(table, query, positions)):
+            torch.testing.assert_close(group.slot_mapping.gpu.cpu(), expected, rtol=0, atol=0)
+            for row in range(4):
+                reference = group.block_table.cpu[row] if row in active else torch.zeros_like(group.block_table.cpu[row])
+                torch.testing.assert_close(group.block_table.gpu[row].cpu(), reference, rtol=0, atol=0)
+        assert torch.all(backing[:, sum(widths):] == -555)
+        assert torch.all(backing[4] == -555)
+
+
 def _make_block_table(device: torch.device) -> MultiGroupBlockTable:
     table = MultiGroupBlockTable(
         max_num_reqs=4,
