@@ -67,6 +67,16 @@ class AlloptDay0IntegrationTests(unittest.TestCase):
 
     def test_plan_cache_request_retains_generic_flaggems(self):
         skip = should_skip_generic_flaggems_aten
+
+        def config(model_type):
+            return SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(model_type=model_type)
+                )
+            )
+
+        qwen = config("qwen3_8_flash_next_text")
+        other = config("llama")
         for plugin_value in (None, "0", "1", "true"):
             for gems_value in ("0", "1"):
                 with self.subTest(plugin=plugin_value, gems=gems_value):
@@ -78,13 +88,13 @@ class AlloptDay0IntegrationTests(unittest.TestCase):
                             plugin_value if plugin_value is not None else gems_value
                         ) != "0"
                         self.assertEqual(
-                            skip(True, vendor_name="nvidia", whitelist=None),
+                            skip(qwen, vendor_name="nvidia", whitelist=None),
                             not requested,
                         )
                         self.assertFalse(
-                            skip(False, vendor_name="nvidia", whitelist=None)
+                            skip(other, vendor_name="nvidia", whitelist=None)
                         )
-                        self.assertFalse(skip(True, vendor_name="amd", whitelist=None))
+                        self.assertFalse(skip(qwen, vendor_name="amd", whitelist=None))
                         self.assertFalse(
-                            skip(True, vendor_name="nvidia", whitelist=["sigmoid"])
+                            skip(qwen, vendor_name="nvidia", whitelist=["sigmoid"])
                         )
