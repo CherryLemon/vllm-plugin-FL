@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
-
-path = Path(__file__).resolve().parents[2] / "e2e_tests/inference/common_metadata_probe.py"
+path = (
+    Path(__file__).resolve().parents[2] / "e2e_tests/inference/common_metadata_probe.py"
+)
 spec = importlib.util.spec_from_file_location("common_metadata_probe", path)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
