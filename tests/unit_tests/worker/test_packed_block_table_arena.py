@@ -6,9 +6,9 @@ import pytest
 
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
-from vllm_fl.worker.common_slot_mapping import (
-    CommonSlotMappingGraphRunner,
-    compute_common_slot_mapping,
+from vllm_fl.worker.common_attention_metadata import (
+    CommonAttentionMetadataGraphRunner,
+    compute_common_attention_metadata,
 )
 from vllm_fl.worker.packed_block_table import PackedBlockTableArena
 
@@ -120,7 +120,7 @@ def test_packed_arena_rejects_out_of_range_commit():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_packed_arena_2d_producer_graph_replay():
+def test_packed_arena_common_producer_graph_replay():
     table = MultiGroupBlockTable(
         max_num_reqs=4,
         max_model_len=64,
@@ -142,7 +142,7 @@ def test_packed_arena_2d_producer_graph_replay():
     seq_lens = torch.tensor([6, 12, 0, 0], dtype=torch.int32, device="cuda")
     num_computed_tokens = torch.empty(4, dtype=torch.int32, device="cuda")
 
-    compute_common_slot_mapping(
+    compute_common_attention_metadata(
         table,
         4,
         query_start_loc,
@@ -150,7 +150,7 @@ def test_packed_arena_2d_producer_graph_replay():
         seq_lens,
         num_computed_tokens,
     )
-    runner = CommonSlotMappingGraphRunner()
+    runner = CommonAttentionMetadataGraphRunner()
     runner.run(
         table,
         4,

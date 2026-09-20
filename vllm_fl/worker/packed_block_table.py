@@ -227,8 +227,7 @@ class PackedBlockTableArena:
                 group.slot_mapping.np = saved.slot_np
             raise
 
-        # common_slot_mapping.py discovers this object without importing it,
-        # avoiding a model-runner <-> producer import cycle.
+        # Keep ownership discoverable when retiring these aliased buffers.
         block_table._packed_block_table_arena = self
         self.commit_calls = 0
         self.last_num_reqs: int | None = None

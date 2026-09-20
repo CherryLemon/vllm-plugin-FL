@@ -202,6 +202,18 @@ class WorkerFL(WorkerBase):
         is_driver_worker: bool = False,
     ):
 
+        # GCU (Enflame): the torch_gcu Triton build JIT-compiles flag_gems
+        # kernels inside spawned workers; when every rank shares the default
+        # Triton cache directory, concurrent compilation of the same kernel
+        # can deadlock on the cache file locks. Give each rank its own cache
+        # directory unless the operator overrode it.
+        if current_platform.device_type == "gcu" and not os.environ.get(
+            "TRITON_CACHE_DIR"
+        ):
+            os.environ["TRITON_CACHE_DIR"] = (
+                f"/tmp/triton-cache-fl-rank-{rank}"
+            )
+
         if (
             vllm_config.num_speculative_tokens == 1
             and vllm_config.scheduler_config.async_scheduling
@@ -243,91 +255,47 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
+        from vllm_fl.flaggems_runtime import configure_flaggems
+
+        from vllm_fl.flaggems_policy import resolve_flag_gems_policy
+        from vllm_fl.patches.flaggems_aten_plan_cache import apply_flaggems_aten_plan_cache
+
         if fl_envs.USE_FLAGGEMS:
-            # Capture native CUDA aten::mm before FlagGems changes the CUDA
-            # registration. The common policy is opt-in; model integrations
-            # may supply a validated default in their own commit.
-            from vllm_fl.patches.flaggems_mm_shape_aware import (
-                capture_native_mm_kernel,
-                is_mm_dispatch_enabled,
-                is_shape_aware_mm_enabled,
-            )
-
-            shape_aware_mm_enabled = is_shape_aware_mm_enabled()
-
-            from vllm_fl.patches.flaggems_aten_plan_cache import (
-                apply_flaggems_aten_plan_cache,
-            )
-
             apply_flaggems_aten_plan_cache()
+        whitelist, blacklist = get_flag_gems_whitelist_blacklist()
+        model_policy = resolve_flag_gems_policy(
+            vllm_config, whitelist, blacklist,
+            vendor_name=getattr(current_platform, "vendor_name", None),
+        )
+        whitelist, blacklist = model_policy.whitelist, model_policy.blacklist
+        for message in model_policy.log_messages:
+            logger.info(message)
 
-            # Resolve policy before capturing native mm. An override is valid
-            # only when FlagGems retains ownership of aten::mm.
-            whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-            # Model integrations register a scoped provider with the generic
-            # factory; the worker must not import a specific model module.
-            # Providers merge model-scoped exclusions with platform defaults,
-            # never mutate global policy, and are no-ops for other models.
-            from vllm_fl.flaggems_policy import resolve_flag_gems_policy
-
-            model_policy = resolve_flag_gems_policy(
-                vllm_config,
-                whitelist,
-                blacklist,
-                vendor_name=getattr(current_platform, "vendor_name", None),
-            )
-            whitelist, blacklist = model_policy.whitelist, model_policy.blacklist
-            for message in model_policy.log_messages:
-                logger.info(message)
-            skip_generic_flaggems_aten = model_policy.skip_generic_aten
-            mm_dispatch_enabled = is_mm_dispatch_enabled(whitelist, blacklist)
-            native_mm_kernel = None
-            if shape_aware_mm_enabled and mm_dispatch_enabled:
-                native_mm_kernel = capture_native_mm_kernel()
-
+        def enable_flaggems(library):
             import flag_gems
 
-            # Only rank 0 records the oplist to avoid file truncation and
-            # interleaved writes when tensor-parallel-size > 1.
-            should_record = (rank == 0)
+            kwargs = dict(
+                record=rank == 0, once=True,
+                path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+            )
+            if library is not None:
+                kwargs["lib"] = library
+            if whitelist is not None:
+                flag_gems.only_enable(include=whitelist, **kwargs)
+            elif blacklist:
+                flag_gems.enable(unused=blacklist, **kwargs)
+            else:
+                flag_gems.enable(**kwargs)
 
-            # Use whitelist if specified (takes precedence over blacklist). A
-            # model policy that keeps generic ATen native skips the FlagGems
-            # reconfiguration entirely; its rationale was logged above.
-            if not skip_generic_flaggems_aten:
-                if whitelist:
-                    logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
-                    flag_gems.only_enable(
-                        include=whitelist,
-                        record=should_record,
-                        once=True,
-                        path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                    )
-                elif blacklist:
-                    logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
-                    flag_gems.enable(
-                        unused=blacklist,
-                        record=should_record,
-                        once=True,
-                        path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                    )
-                else:
-                    logger.info("[FlagGems] Enable all ops")
-                    flag_gems.enable(
-                        record=should_record,
-                        once=True,
-                        path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                    )
-
-            from vllm_fl.patches.flaggems_mm_shape_aware import apply_shape_aware_mm
-
-            if shape_aware_mm_enabled and not mm_dispatch_enabled:
-                logger.warning(
-                    "[FlagGems] Skip shape-aware aten.mm because mm is "
-                    "excluded by the active whitelist/blacklist"
-                )
-            elif shape_aware_mm_enabled:
-                apply_shape_aware_mm(native_mm_kernel=native_mm_kernel)
+        mm_status = configure_flaggems(
+            enable_flaggems,
+            use_flaggems=fl_envs.USE_FLAGGEMS and not model_policy.skip_generic_aten,
+            whitelist=whitelist,
+            blacklist=blacklist,
+        )
+        logger.info(
+            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
+        )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator
@@ -557,6 +525,14 @@ class WorkerFL(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        if current_platform.device_type == "txda":
+            # Avoid memory profiling OOM on txda platform, return a dummy/fallback value
+            # e.g., 20 GiB or similar default cache memory size.
+            fallback_val = int(os.environ.get("VLLM_TXDA_KV_CACHE_SIZE", 20 * 1024 * 1024 * 1024))
+            logger.info("txda platform detected. Skipping memory profiling to avoid OOM. "
+                        f"Using KV cache memory fallback size: {fallback_val / GiB_bytes:.2f} GiB.")
+            return fallback_val
+
         GiB = lambda b: b / GiB_bytes
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
@@ -775,15 +751,27 @@ class WorkerFL(WorkerBase):
         ### NOTE(lms): can add gems kernel pretune here
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        try:
-            kernel_warmup(self)
-        except ImportError as e:
-            # vllm 0.24.0's kernel_warmup unconditionally imports
-            # minimax_m3_msa_warmup, whose chain reaches torchvision.
-            # torchvision is not installed on OOT runtimes (installing it
-            # would overwrite the vendor-matched torch matrix); the warmup
-            # is a no-op for any model other than MiniMaxM3, so skip it.
-            logger.warning("kernel_warmup skipped: %s", e)
+        if current_platform.device_type == "txda" or getattr(
+            current_platform, "vendor_name", None
+        ) == "kunlunxin":
+            logger.warning(
+                "Detected %s device, skipping generic kernel_warmup",
+                getattr(
+                    current_platform,
+                    "vendor_name",
+                    current_platform.device_type,
+                ),
+            )
+        else:
+            try:
+                kernel_warmup(self)
+            except ImportError as e:
+                # vllm 0.24.0's kernel_warmup unconditionally imports
+                # minimax_m3_msa_warmup, whose chain reaches torchvision.
+                # torchvision is not installed on OOT runtimes (installing it
+                # would overwrite the vendor-matched torch matrix); the warmup
+                # is a no-op for any model other than MiniMaxM3, so skip it.
+                logger.warning("kernel_warmup skipped: %s", e)
 
         cuda_graph_memory_bytes = 0
         if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
