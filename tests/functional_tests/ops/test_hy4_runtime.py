@@ -65,12 +65,18 @@ def test_portable_prefill_matches_torch_at_mla_dimensions(causal, qk_width, v_wi
 
 @pytest.mark.parametrize("ue8m0", [False, True])
 def test_planned_query_quantizer_matches_torch(ue8m0):
+    # FlagGems defaults to FP32 output before Hopper; that is not the HY4
+    # FP8 query path exercised by this numerical reference.
+    if not current_platform.has_device_capability(90):
+        pytest.skip("HY4 FP8 query quantization is validated on Hopper or newer")
+
     import flag_gems
 
     quantizer = runtime._flaggems_query_quantizer(flag_gems.per_token_group_quant_fp8)
     torch.manual_seed(29)
     x = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     quantized, scales = quantizer(x, 128, use_ue8m0=ue8m0)
+    assert quantized.dtype == torch.float8_e4m3fn
     xr = x.cpu().float().reshape(5, 2, 128)
     expected_scale = (
         xr.abs().amax(-1).clamp_min(1e-10) / torch.finfo(quantized.dtype).max

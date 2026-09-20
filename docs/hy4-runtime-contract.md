@@ -95,6 +95,11 @@ has been provisioned or that CI has executed the case. The standard case is
 a real-weight semantic smoke test with expected Paris/green answers, not a
 logits-parity or accuracy benchmark.
 
+The query-quantizer FP8 reference test requires Hopper or newer and asserts
+E4M3 output. The pinned FlagGems implementation defaults to FP32 output on
+pre-Hopper devices, so the A100 CI runner skips this FP8-specific case while
+retaining the BF16 prefill reference tests. This does not add A100 model support.
+
 The separate `tests/e2e_tests/inference/test_hy_v4.py` is a manually invoked
 single-GPU dummy-weight smoke and must not be reported as checkpoint validation.
 Full-model evidence must identify the installed wheel hash, checkpoint,
