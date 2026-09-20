@@ -324,10 +324,17 @@ def main():
                 timeout=600,
             )
         runs[mode] = json.loads((args.output_dir / f"{mode}.json").read_text())
-    # Separate Inductor compilations can differ by a few FP32 log-softmax
-    # ULPs. Keep token IDs and top-k identities exact; only PIECEWISE permits
-    # this small absolute logprob tolerance. Metadata tensor tests stay exact.
-    atol = 1e-5 if args.cudagraph_mode == "PIECEWISE" else 0.0
+    # The combined probe intentionally switches between native and FlagGems
+    # GEMM as M changes across reordered batches. Those FP16 kernels need not
+    # round identically. Bound logprob drift by one FP16 epsilon while keeping
+    # token IDs and top-k identities exact. Without MM routing, only separate
+    # PIECEWISE compilations allow a few FP32 log-softmax ULPs. Metadata tensor
+    # comparisons remain exact in all modes.
+    atol = (
+        2**-10
+        if args.combination
+        else (1e-5 if args.cudagraph_mode == "PIECEWISE" else 0.0)
+    )
     max_delta = compare_runs(runs, atol)
     summary = {
         "cudagraph_mode": args.cudagraph_mode,
