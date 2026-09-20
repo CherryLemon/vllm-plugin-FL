@@ -7,15 +7,15 @@ IDs/logprobs, producer counters and one log per policy.
 """
 
 import argparse
-import json
 import hashlib
 import importlib
-from importlib.metadata import version, PackageNotFoundError
-import shutil
+import json
 import math
 import os
+import shutil
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 

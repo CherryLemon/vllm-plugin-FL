@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_fl.patches import flaggems_mm_shape_aware as shape_aware
 from vllm_fl import flaggems_runtime as runtime
+from vllm_fl.patches import flaggems_mm_shape_aware as shape_aware
 
 
 class _FakeTensor:

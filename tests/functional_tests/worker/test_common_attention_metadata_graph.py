@@ -25,7 +25,7 @@ def test_padded_rows_clear_only_group_width_in_strided_storage():
     backing = torch.full((5, sum(widths) + 7), -555, dtype=torch.int32, device="cuda")
     offset = 0
     for group, width in zip(table.block_tables, widths):
-        group.block_table.gpu = backing[:4, offset:offset + width]
+        group.block_table.gpu = backing[:4, offset : offset + width]
         group.block_table.gpu.copy_(group.block_table.cpu)
         offset += width
     query = torch.tensor([0, 1, 1, 2, 2], dtype=torch.int32, device="cuda")
@@ -41,16 +41,34 @@ def test_padded_rows_clear_only_group_width_in_strided_storage():
         if not capture:
             query.copy_(torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32))
             lengths.copy_(torch.tensor([2, 12, 0, 0], dtype=torch.int32))
-        receipt = runner.run(table, 4, query, positions, lengths, computed,
-                             use_graph=True, capture=capture)
+        receipt = runner.run(
+            table,
+            4,
+            query,
+            positions,
+            lengths,
+            computed,
+            use_graph=True,
+            capture=capture,
+        )
         receipt.validate(table, 4, 16)
         torch.cuda.synchronize()
-        for group, expected in zip(table.block_tables, _expected_slots(table, query, positions)):
-            torch.testing.assert_close(group.slot_mapping.gpu.cpu(), expected, rtol=0, atol=0)
+        for group, expected in zip(
+            table.block_tables, _expected_slots(table, query, positions)
+        ):
+            torch.testing.assert_close(
+                group.slot_mapping.gpu.cpu(), expected, rtol=0, atol=0
+            )
             for row in range(4):
-                reference = group.block_table.cpu[row] if row in active else torch.zeros_like(group.block_table.cpu[row])
-                torch.testing.assert_close(group.block_table.gpu[row].cpu(), reference, rtol=0, atol=0)
-        assert torch.all(backing[:, sum(widths):] == -555)
+                reference = (
+                    group.block_table.cpu[row]
+                    if row in active
+                    else torch.zeros_like(group.block_table.cpu[row])
+                )
+                torch.testing.assert_close(
+                    group.block_table.gpu[row].cpu(), reference, rtol=0, atol=0
+                )
+        assert torch.all(backing[:, sum(widths) :] == -555)
         assert torch.all(backing[4] == -555)
 
 
