@@ -2,8 +2,6 @@
 """C6: vLLM 0.24 KV binding must call the cache-owner hook exactly once, after
 the upstream bind, and identify owners by registration rather than module name."""
 
-from types import SimpleNamespace
-
 import torch
 import pytest
 
@@ -96,9 +94,7 @@ def test_native_upstream_hook_is_not_duplicated(monkeypatch):
 def test_validation_failure_leaves_no_mutation(monkeypatch):
     _noop_upstream(monkeypatch)
     owner = _Owner()
-    owner.validate_kv_cache = lambda kv: (_ for _ in ()).throw(
-        ValueError("bad dtype")
-    )
+    owner.validate_kv_cache = lambda kv: (_ for _ in ()).throw(ValueError("bad dtype"))
     runner: list = []
     kv_caches = {"qsa": torch.zeros(1)}
     with pytest.raises(ValueError, match="bad dtype"):
@@ -107,16 +103,13 @@ def test_validation_failure_leaves_no_mutation(monkeypatch):
     assert owner.bound == []
 
 
-def test_hook_failure_rolls_back_runner_and_owner(monkeypatch):
-    _noop_upstream(monkeypatch, mutates=True)
-    failing = _FailingOwner()
-    failing.kv_cache = "sentinel"
-    runner: list = []
-    kv_caches = {"qsa": torch.zeros(2, 4, 1, 8)}
+def test_hook_failure_aborts_initialization_and_does_not_run_later_owners(monkeypatch):
+    _noop_upstream(monkeypatch)
+    failing, later = _FailingOwner(), _Owner()
+    caches = {"failing": torch.zeros(1), "later": torch.zeros(1)}
     with pytest.raises(RuntimeError, match="hook failed"):
-        kv_bind.bind_kv_cache(kv_caches, {"qsa": failing}, runner, 1)
-    assert runner == []
-    assert failing.kv_cache == "sentinel"
+        kv_bind.bind_kv_cache(caches, {"failing": failing, "later": later}, [])
+    assert later.bound == []
 
 
 def test_runner_binds_registered_owner_exactly_once(monkeypatch):
@@ -146,22 +139,6 @@ def test_runner_binds_registered_owner_exactly_once(monkeypatch):
     assert len(owner.bound) == 1
 
 
-def test_non_owner_layer_is_also_rolled_back(monkeypatch):
-    """Finding 5: upstream mutates every layer, so all must be restored."""
-    _noop_upstream(monkeypatch, mutates=True)
-    failing = _FailingOwner()
-    plain = SimpleNamespace()
-    runner: list = []
-    kv_caches = {"qsa": torch.zeros(2, 4, 1, 8), "plain": torch.zeros(1)}
-    forward_context = {"qsa": failing, "plain": plain}
-
-    with pytest.raises(RuntimeError, match="hook failed"):
-        kv_bind.bind_kv_cache(kv_caches, forward_context, runner, 1)
-
-    assert not hasattr(plain, "kv_cache")
-    assert runner == []
-
-
 def test_qsa_validate_rejects_non_contiguous_last_dim():
     """Finding 5: reject a layout whose typed int64 view cannot be built."""
     obj = object.__new__(QSAKeyStateCache)
@@ -186,9 +163,7 @@ def test_qsa_validate_rejects_view_incompatible_outer_stride():
 
     width = obj.head_size
     base = torch.zeros(2048, dtype=torch.bfloat16)
-    bad = torch.as_strided(
-        base, (2, 2, 1, width), (width * 2 + 1, width, width, 1)
-    )
+    bad = torch.as_strided(base, (2, 2, 1, width), (width * 2 + 1, width, width, 1))
     assert bad.stride(-1) == 1
     assert (bad.storage_offset() + obj.rope_position_offset) % 4 == 0
     with pytest.raises(ValueError, match="cannot be viewed as int64"):
@@ -209,61 +184,22 @@ def test_rebind_replaces_typed_views():
 
     first = torch.zeros(2, 4, 1, obj.head_size, dtype=torch.bfloat16)
     obj.bind_kv_cache(first)
-    assert obj.key_cache.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert (
+        obj.key_cache.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    )
 
     second = torch.zeros(2, 4, 1, obj.head_size, dtype=torch.bfloat16)
     obj.bind_kv_cache(second)
-    assert obj.key_cache.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
-    assert obj.rope_position_cache.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+    assert (
+        obj.key_cache.untyped_storage().data_ptr()
+        == second.untyped_storage().data_ptr()
+    )
+    assert (
+        obj.rope_position_cache.untyped_storage().data_ptr()
+        == second.untyped_storage().data_ptr()
+    )
     assert obj.rope_position_cache.dtype == torch.int64
     assert obj.rope_position_cache.storage_offset() == obj.rope_position_offset // 4
-
-
-@pytest.mark.parametrize("owners_only", [False, True])
-def test_late_failure_restores_earlier_owners_mutable_state(monkeypatch, owners_only):
-    _noop_upstream(monkeypatch)
-    first, failing = _Owner(), _FailingOwner()
-    original_bound = first.bound
-    caches = {"first": torch.zeros(1), "failing": torch.zeros(1)}
-    context = {"first": first, "failing": failing}
-    runner = []
-    with pytest.raises(RuntimeError, match="hook failed"):
-        if owners_only:
-            kv_bind.bind_kv_cache_owners(context, caches)
-        else:
-            kv_bind.bind_kv_cache(caches, context, runner)
-    assert first.bound is original_bound
-    assert first.bound == []
-    assert not hasattr(first, "kv_cache")
-    assert failing.kv_cache is None
-    assert runner == []
-
-
-def test_failure_restores_module_buffers_without_copying_cache(monkeypatch):
-    _noop_upstream(monkeypatch)
-
-    class BufferOwner(torch.nn.Module, _Owner):
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("kv_cache", torch.ones(4))
-            self.register_buffer("typed_view", self.kv_cache[:2])
-
-        def bind_kv_cache(self, kv_cache):
-            self.typed_view = kv_cache[:2]
-            self.register_buffer("new_view", kv_cache[2:])
-            raise RuntimeError("hook failed")
-
-    owner = BufferOwner()
-    buffers = owner._buffers
-    old_cache, old_view = owner.kv_cache, owner.typed_view
-    runner = []
-    with pytest.raises(RuntimeError, match="hook failed"):
-        kv_bind.bind_kv_cache({"qsa": torch.zeros(4)}, {"qsa": owner}, runner)
-    assert owner._buffers is buffers
-    assert owner.kv_cache is old_cache
-    assert owner.typed_view is old_view
-    assert not hasattr(owner, "new_view")
-    assert runner == []
 
 
 def test_unknown_abi_fails_before_upstream_bind(monkeypatch):

@@ -21,7 +21,6 @@ is detected and used natively, so the hook is never invoked twice.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, MutableMapping
 
@@ -161,52 +160,6 @@ def _preflight_owners(owners: list[tuple[str, Any, Any]]) -> None:
             validate(kv_cache)
 
 
-@dataclass
-class _BindingSnapshot:
-    attributes: dict[str, Any]
-    containers: list[tuple[Any, Any]]
-
-
-def _snapshot_state(layer: Any) -> _BindingSnapshot:
-    # Bind hooks replace tensor/view references; they must not write cache
-    # contents.  Preserve these references, not copies of the (potentially
-    # enormous) cache storage.  Mutable containers need separate snapshots:
-    # nn.Module.__setattr__ changes _buffers in place when binding a buffer.
-    snapshot = _BindingSnapshot(dict(vars(layer)), [])
-    seen: set[int] = set()
-
-    def visit(value: Any) -> None:
-        if id(value) in seen:
-            return
-        seen.add(id(value))
-        if isinstance(value, (dict, list, set)):
-            saved = value.copy()
-            snapshot.containers.append((value, saved))
-            items = saved.values() if isinstance(saved, dict) else saved
-            for item in items:
-                visit(item)
-        elif isinstance(value, tuple):
-            for item in value:
-                visit(item)
-
-    for value in snapshot.attributes.values():
-        visit(value)
-    return snapshot
-
-
-def _restore_state(layer: Any, snapshot: _BindingSnapshot) -> None:
-    for container, saved in reversed(snapshot.containers):
-        if isinstance(container, list):
-            container[:] = saved
-        else:
-            container.clear()
-            container.update(saved)
-    # Restore the raw attribute table to avoid running nn.Module/custom
-    # setters again while unwinding the original error.
-    vars(layer).clear()
-    vars(layer).update(snapshot.attributes)
-
-
 def bind_kv_cache_owners(
     forward_context: MutableMapping[str, Any],
     kv_caches: MutableMapping[str, Any],
@@ -214,14 +167,8 @@ def bind_kv_cache_owners(
     """Call the bind hook once for each registered owner.  Returns the count."""
     owners = _collect_owners(forward_context, kv_caches)
     _preflight_owners(owners)
-    snapshots = [(layer, _snapshot_state(layer)) for _, layer, _ in owners]
-    try:
-        for _layer_name, layer, kv_cache in owners:
-            layer.bind_kv_cache(kv_cache)
-    except Exception:
-        for layer, snapshot in reversed(snapshots):
-            _restore_state(layer, snapshot)
-        raise
+    for _layer_name, layer, kv_cache in owners:
+        layer.bind_kv_cache(kv_cache)
     return len(owners)
 
 
@@ -234,9 +181,9 @@ def bind_kv_cache(
     """Bind the allocated KV cache to the runner and to cache owners.
 
     Order: preflight owners/ABI -> upstream bind (once) -> owner hook (once,
-    unless the ABI already did it). On failure restore the runner list, tensor
-    references and mutable binding containers. Hooks must not mutate tensor
-    contents: rollback intentionally never copies the cache storage.
+    unless the ABI already did it). Preflight failures leave state untouched.
+    A failure during binding aborts runner initialization: the partially bound
+    runner must be discarded, not retried. Hooks must not mutate cache contents.
     """
     from vllm.v1.worker.utils import bind_kv_cache as upstream_bind_kv_cache
 
@@ -245,32 +192,9 @@ def bind_kv_cache(
     _preflight_owners(owners)
     calls_owner_hook = resolve_kv_bind_abi()
 
-    # Upstream assigns ``kv_cache`` on *every* layer in ``forward_context``, not
-    # only the registered owners, so snapshot and restore all of them.
-    bound_layers: list[tuple[str, Any]] = [
-        (layer_name, forward_context[layer_name])
-        for layer_name in kv_caches
-        if layer_name in forward_context
-    ]
-
-    runner_snapshot = list(runner_kv_caches)
-    layer_snapshots = {
-        layer_name: _snapshot_state(layer)
-        for layer_name, layer in bound_layers
-    }
-
-    try:
-        upstream_bind_kv_cache(
-            kv_caches, forward_context, runner_kv_caches, num_attn_module
-        )
-        if calls_owner_hook:
-            return
+    upstream_bind_kv_cache(
+        kv_caches, forward_context, runner_kv_caches, num_attn_module
+    )
+    if not calls_owner_hook:
         for _layer_name, layer, kv_cache in owners:
             layer.bind_kv_cache(kv_cache)
-    except Exception:
-        del runner_kv_caches[:]
-        runner_kv_caches.extend(runner_snapshot)
-        for layer_name, layer in bound_layers:
-            _restore_state(layer, layer_snapshots[layer_name])
-        logger.exception("Rolled back KV-cache bind after failure")
-        raise

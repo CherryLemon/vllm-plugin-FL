@@ -258,20 +258,35 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     # single CTA kernel on a capture miss.
     monkeypatch.setenv("QWEN4_QSA_SPLIT_REQUIRE", "1")
     cache = {}
-    splits, workspace = ops.qsa_prepare_split_workspace(
-        case["q"], case["k"], case["indices"].shape[1], cache
-    )
-    assert splits == 8
-    assert workspace is not None
     captured_out = torch.empty_like(case["q"])
-
-    # Eager warmup compiles both kernels before capture.
-    for _ in range(3):
-        _run(ops, case, captured_out, workspace=workspace)
-    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+    from types import SimpleNamespace
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+    from vllm_fl.worker.model_runner import ModelRunnerFL
+
+    def attention():
+        splits, workspace = ops.qsa_prepare_split_workspace(
+            case["q"], case["k"], case["indices"].shape[1], cache
+        )
+        assert splits == 8 and workspace is not None
         _run(ops, case, captured_out, workspace=workspace)
+
+    def dummy(tokens, *, is_graph_capturing=False, force_attention=False, **kwargs):
+        if is_graph_capturing:
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                attention()
+        elif force_attention:
+            attention()
+
+    # Exercise the worker entry: removing force_attention from eager warmup
+    # now fails REQUIRE during capture instead of passing a source-text check.
+    runner = SimpleNamespace(_dummy_run=dummy)
+    ModelRunnerFL._warmup_and_capture(
+        runner, BatchDescriptor(num_tokens=8, num_reqs=8), CUDAGraphMode.FULL,
+        num_warmups=3,
+    )
+    workspace = next(iter(cache.values()))
 
     new_case = _case(device)
     case["q"].copy_(new_case["q"])

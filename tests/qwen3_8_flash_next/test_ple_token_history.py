@@ -127,6 +127,93 @@ def test_non_token_prefix_positions_use_eos(device):
     assert out[0].tolist() == [1, 0]
 
 
+def test_worker_state_updates_invalidate_finished_resumed_and_replaced_history(
+    device, monkeypatch
+):
+    from unittest.mock import Mock
+    from vllm_fl.worker import model_runner as module
+
+    h = Harness(device)
+    runner = object.__new__(module.ModelRunnerFL)
+    runner.uses_ngram_embedding = True
+    runner.ple_token_history = h.history
+    runner.requests = {}
+    runner.num_prompt_logprobs = {}
+    runner.late_interaction_runner = Mock()
+    runner.encoder_cache = {}
+    runner.speculative_config = None
+    runner.is_pooling_model = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.use_async_spec_decode = False
+    runner.use_async_scheduling = True
+    runner.device = device
+    runner._may_reorder_batch = lambda output: None
+    indices = {}
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index=indices,
+        remove_request=lambda req_id: indices.pop(req_id, None),
+        add_request=lambda request: indices.update({request.req_id: len(indices)}),
+        update_req_spec_token_ids=lambda *args: None,
+        condense=lambda: None,
+        refresh_metadata=lambda: None,
+    )
+    monkeypatch.setattr(
+        module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+
+    def update(tokens=None, *, finished=False, resume=False):
+        new = (
+            []
+            if tokens is None
+            else [
+                SimpleNamespace(
+                    req_id="a",
+                    prompt_token_ids=tokens,
+                    prompt_embeds=None,
+                    prompt_is_token_ids=None,
+                    mm_features=[],
+                    sampling_params=None,
+                    pooling_params=None,
+                    block_ids=([1],),
+                    num_computed_tokens=2,
+                    lora_request=None,
+                )
+            ]
+        )
+        cached = SimpleNamespace(
+            req_ids=["a"] if resume else [],
+            resumed_req_ids={"a"} if resume else set(),
+            num_computed_tokens=[2],
+            new_block_ids=[([2],)],
+            num_output_tokens=[0],
+            all_token_ids={},
+        )
+        runner._update_states(
+            SimpleNamespace(
+                finished_req_ids={"a"} if finished else set(),
+                new_block_ids_to_zero=[],
+                free_encoder_mm_hashes=[],
+                num_scheduled_tokens={"a": 1} if tokens is not None or resume else {},
+                scheduled_new_reqs=new,
+                scheduled_cached_reqs=cached,
+                scheduled_spec_decode_tokens={},
+            )
+        )
+
+    update([1, 2, 3])
+    h.step(["a"], [0], [[1, 2, 3]])
+    # This invokes the real streaming replacement entry, not history.forget().
+    update([11, 12, 13])
+    assert h.step(["a"], [2], [[13]], seeds={0: [11, 12]})[0].tolist() == [11, 12]
+    update(resume=True)
+    assert h.step(["a"], [2], [[23]], seeds={0: [21, 22]})[0].tolist() == [21, 22]
+    update(finished=True)
+    assert "a" not in h.history._slots
+    update([31, 32, 33], finished=True)
+    assert h.step(["a"], [2], [[33]], seeds={0: [31, 32]})[0].tolist() == [31, 32]
+
+
 def test_selected_runner_reads_resolved_device_inputs_and_dummy_is_stateless(device):
     from vllm_fl.worker.model_runner import ModelRunnerFL
 
@@ -173,7 +260,7 @@ def test_selected_runner_reads_resolved_device_inputs_and_dummy_is_stateless(dev
 
 
 @pytest.mark.gpu
-def test_captured_consumer_reads_updated_context_and_padding():
+def test_fixed_address_consumer_smoke_reads_updated_context_and_padding():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     h = Harness(torch.device("cuda"))
