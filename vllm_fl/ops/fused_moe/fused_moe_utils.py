@@ -348,12 +348,15 @@ class TritonExpertsFL(TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        # Resolve after platform activation for every vendor branch. This module
+        # can be imported while the OOT platform is still being selected.
+        runtime_platform = _get_current_platform()
         # vLLM 0.24 routes unquantized MoE through this modular Experts API.
         # Reuse the Kunlunxin implementation migrated from the known-good
         # plugin instead of entering the generic Triton two-GEMM pipeline.
         if (
             self._lora_context is None
-            and getattr(current_platform, "vendor_name", None) == "kunlunxin"
+            and getattr(runtime_platform, "vendor_name", None) == "kunlunxin"
         ):
             from vllm_fl.dispatch.backends.vendor.kunlunxin.impl.fused_moe.fused_moe import (
                 fused_experts_impl as klx_fused_experts_impl,
@@ -388,10 +391,6 @@ class TritonExpertsFL(TritonExperts):
             return
 
         # Fast path (no LoRA, NVIDIA only): single fused FlagGems call.
-        # Resolve dynamically for the same reason as the backend selector:
-        # this module may have been imported before PlatformFL activation.
-        runtime_platform = _get_current_platform()
-
         if self._lora_context is None and runtime_platform.is_cuda():
             import flag_gems
 

@@ -44,6 +44,42 @@ class _SupportedNativeExperts:
         return True, None
 
 
+@pytest.mark.parametrize("vendor", ["nvidia", "kunlunxin"])
+def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, vendor):
+    """Exercise the execution entry, including a vendor added after import."""
+    import flag_gems
+    import torch
+
+    module = _import_fused_moe_utils()
+    monkeypatch.setattr(module, "_get_current_platform", lambda: SimpleNamespace(
+        vendor_name=vendor, is_cuda=lambda: vendor == "nvidia"))
+    result = torch.full((2, 4), 7.0)
+    nvidia = Mock(return_value=result)
+    kunlunxin = Mock(return_value=result)
+    monkeypatch.setattr(flag_gems, "fused_experts_impl", nvidia)
+    name = "vllm_fl.dispatch.backends.vendor.kunlunxin.impl.fused_moe.fused_moe"
+    backend = types.ModuleType(name)
+    backend.fused_experts_impl = kunlunxin
+    monkeypatch.setitem(sys.modules, name, backend)
+    experts = SimpleNamespace(
+        _lora_context=None,
+        quant_config=SimpleNamespace(use_fp8_w8a8=False, use_int8_w8a8=False,
+                                     use_int8_w8a16=False, use_int4_w4a16=False),
+        per_act_token_quant=False, w1_scale=None, w2_scale=None,
+        block_shape=None, w1_bias=None, w2_bias=None,
+    )
+    output = torch.zeros_like(result)
+    module.TritonExpertsFL.apply(
+        experts, output, result, result, result, result, result,
+        module.MoEActivation.SILU, 2, None, None, None, result, result, None, False,
+    )
+    torch.testing.assert_close(output, result)
+    selected, other = (nvidia, kunlunxin) if vendor == "nvidia" else (kunlunxin, nvidia)
+    selected.assert_called_once()
+    assert selected.call_args.kwargs["activation"] == "silu"
+    other.assert_not_called()
+
+
 @pytest.mark.parametrize("backend", ["auto", "triton"])
 def test_fl_provider_uses_flaggems_experts_for_auto_and_triton(
     monkeypatch, backend
