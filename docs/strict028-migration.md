@@ -56,7 +56,7 @@ No host source patch, module stub or registry dictionary write is used.
   bytes/scales and tested mHC coefficients agree exactly; the random sparse
   attention comparison has maximum absolute error 0.0001220703125.
 - Plugin foundation and state regression: 123 passing tests; greedy sampling
-  admission: 10 tests; aliased reference-buffer regression: 1 test.
+  admission: 13 tests; aliased reference-buffer regression: 1 test.
   Deterministic FP4 allocation/loading: 1 GPU regression.
   FlagGems new-operator suite: 69 tests.
 - Published whole-graph comparison on eight ranks: 12- and 141-token prefill,
@@ -85,7 +85,7 @@ The development container is `dsv41-fl-028`; runtime Python is
 
 Component tests used source snapshots during development. Normal wheels have
 now been built and installed in the isolated environment without `PYTHONPATH`.
-The install audit verifies 2,238 host, 252 plugin and 3,393 FlagGems Python files
+The install audit verifies 2,238 host, 253 plugin and 3,393 FlagGems Python files
 against the frozen sources, confirms no host device extension is active and
 confirms host Worker methods are unchanged by importing FlagGems. Delivery
 contains the installed-wheel whole-model receipt, exact tested package versions

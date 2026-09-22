@@ -14,6 +14,7 @@ exec docker run --rm --name "${FL_CONTAINER_NAME:-dsv41-fl-serving}" \
   --tokenizer-mode fl_deepseek_v41 \
   --hf-overrides '{"architectures":["DeepseekV41FlashFLForCausalLM"]}' \
   --load-format fl_dsv41 --dtype bfloat16 \
+  --generation-config vllm --override-generation-config '{"temperature":0}' \
   --tensor-parallel-size 8 --distributed-executor-backend mp \
   --max-model-len 256 --max-num-seqs 2 --max-num-batched-tokens 256 \
   --gpu-memory-utilization 0.95 --enforce-eager \

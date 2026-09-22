@@ -9,6 +9,7 @@ import os
 from contextlib import contextmanager
 
 import torch
+
 from vllm.platforms import Platform, PlatformEnum
 from vllm.platforms.interface import DeviceCapability
 
@@ -43,6 +44,18 @@ class PlatformFL028(Platform):
     ray_device_key = "GPU"
     device_control_env_var = "CUDA_VISIBLE_DEVICES"
     torch_device_fn = torch.cuda
+
+    @classmethod
+    def validate_request(cls, processed_inputs, params):
+        from vllm.sampling_params import SamplingParams
+
+        from .sampling import validate_sampling
+
+        if processed_inputs.get("type") != "token" or not isinstance(
+            params, SamplingParams
+        ):
+            raise ValueError("FL reference profile accepts text token generation only")
+        validate_sampling(params)
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):

@@ -3,6 +3,7 @@ import pytest
 
 from vllm.sampling_params import SamplingParams
 
+from vllm_fl.strict028.platform import PlatformFL028
 from vllm_fl.strict028.worker import validate_sampling
 
 
@@ -13,6 +14,9 @@ def test_greedy_defaults_and_host_stop_handling_are_accepted():
     # vLLM normalizes bad_words=None to [], which is still an unrestricted request.
     assert params.bad_words == []
     validate_sampling(params)
+    PlatformFL028.validate_request(
+        {"type": "token", "prompt_token_ids": [0, 19]}, params
+    )
 
 
 @pytest.mark.parametrize(
@@ -33,3 +37,13 @@ def test_unimplemented_sampling_is_rejected_explicitly(change):
     params = SamplingParams(**({"temperature": 0} | change))
     with pytest.raises(ValueError, match="does not yet support"):
         validate_sampling(params)
+    with pytest.raises(ValueError, match="does not yet support"):
+        PlatformFL028.validate_request(
+            {"type": "token", "prompt_token_ids": [0, 19]}, params
+        )
+
+
+@pytest.mark.parametrize("kind", ["embeds", "multimodal", "enc_dec"])
+def test_non_token_input_is_rejected_before_worker_dispatch(kind):
+    with pytest.raises(ValueError, match="text token generation only"):
+        PlatformFL028.validate_request({"type": kind}, SamplingParams(temperature=0))

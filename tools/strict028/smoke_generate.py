@@ -50,6 +50,16 @@ def main():
         for text in ["你好，请用一句话介绍自己。", "1加1等于几？请简短回答。"]
     ]
     samples = SamplingParams(temperature=0, max_tokens=args.max_tokens)
+    try:
+        llm.generate(
+            [{"prompt_token_ids": prompts[0]}],
+            SamplingParams(temperature=1, max_tokens=1),
+        )
+    except ValueError as error:
+        if "temperature != 0" not in str(error):
+            raise
+    else:
+        raise AssertionError("unsupported sampling reached the Worker")
     differential = None
     result = llm.generate([{"prompt_token_ids": ids} for ids in prompts], samples)
     repeated = llm.generate([{"prompt_token_ids": prompts[0]}], samples)
@@ -72,6 +82,7 @@ def main():
         "load_seconds": loaded - begin,
         "total_seconds": time.monotonic() - begin,
         "repeat_request_equal": repeat_equal,
+        "unsupported_sampling_rejected_before_dispatch": True,
         "repeated_output_ids": repeated[0].outputs[0].token_ids,
         "reference_differential": differential,
         "outputs": rows,

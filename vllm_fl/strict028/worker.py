@@ -15,38 +15,9 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from .cache import RequestState
 from .model_loader import FLDeepseekV41Loader
+from .sampling import validate_sampling
 
 logger = logging.getLogger(__name__)
-
-
-def validate_sampling(params):
-    if params is None:
-        raise ValueError("FL reference profile only supports text generation")
-    unsupported = []
-    if params.temperature != 0:
-        unsupported.append("temperature != 0")
-    for name in ("presence_penalty", "frequency_penalty", "min_tokens"):
-        if getattr(params, name, 0):
-            unsupported.append(name)
-    if params.repetition_penalty != 1:
-        unsupported.append("repetition_penalty")
-    for name in (
-        "logprobs",
-        "prompt_logprobs",
-        "structured_outputs",
-        "logit_bias",
-        "allowed_token_ids",
-    ):
-        value = getattr(params, name, None)
-        if value is not None and value != {}:
-            unsupported.append(name)
-    for name in ("bad_words", "logits_processors"):
-        if getattr(params, name, None):
-            unsupported.append(name)
-    if unsupported:
-        raise ValueError(
-            "FL Eager reference profile does not yet support: " + ", ".join(unsupported)
-        )
 
 
 @dataclass
