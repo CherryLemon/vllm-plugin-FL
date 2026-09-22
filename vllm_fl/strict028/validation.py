@@ -195,9 +195,19 @@ def reference_differential(worker, prompt_ids):
 
 class ReferenceProbeExtension:
     def fl_reference_differential(self, prompt_ids):
+        if isinstance(prompt_ids, str):
+            import json
+
+            prompt_ids = json.loads(prompt_ids)
         return reference_differential(self, prompt_ids)
 
     def fl_set_drafting(self, enabled):
+        if isinstance(enabled, str):
+            import json
+
+            enabled = json.loads(enabled)
+        if not isinstance(enabled, bool):
+            raise ValueError("drafting mode must be a boolean")
         runner = self.model_runner
         if enabled and not len(self.get_model().core.mtp):
             raise ValueError("this model was loaded without DSpark weights")
@@ -209,6 +219,10 @@ class ReferenceProbeExtension:
         return {"rank": self.rank, **self.model_runner.spec_stats}
 
     def fl_mtp_differential(self, prompt_ids):
+        if isinstance(prompt_ids, str):
+            import json
+
+            prompt_ids = json.loads(prompt_ids)
         return mtp_differential(self, prompt_ids)
 
 
