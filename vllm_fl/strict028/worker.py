@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from .cache import RequestState
@@ -33,6 +33,31 @@ class ModelRunnerFL028:
         self.state = state
         self.device = device
         self.requests = {}
+        self.drafting_enabled = model.speculative_config is not None
+        self.draft_token_ids = None
+        self.spec_stats = {
+            "draft_steps": 0,
+            "draft_tokens": 0,
+            "accepted_tokens": 0,
+            "verified_steps": 0,
+            "target_forward_calls": 0,
+            "accepted_prefix_histogram": [0] * 6,
+        }
+
+    def take_draft_token_ids(self):
+        result, self.draft_token_ids = self.draft_token_ids, None
+        return result
+
+    def target_forward(self, tokens, position):
+        ids = torch.tensor(tokens, device=self.device, dtype=torch.long)
+        logits, hidden = self.model.forward_with_aux(ids, start_pos=position)
+        logits = self.model.compute_logits(logits)
+        if not bool(torch.isfinite(logits).all().item()):
+            raise FloatingPointError("non-finite target logits")
+        self.spec_stats["target_forward_calls"] += 1
+        if self.drafting_enabled:
+            self.model.store_draft_context(hidden, position)
+        return int(logits[0].argmax().item()), hidden
 
     @staticmethod
     def request_block(block_ids):
@@ -46,10 +71,10 @@ class ModelRunnerFL028:
     def execute_model(self, output):
         for req_id in output.finished_req_ids:
             self.requests.pop(req_id, None)
-        if output.scheduled_spec_decode_tokens or output.scheduled_encoder_inputs:
-            raise ValueError(
-                "speculative or multimodal scheduling is not enabled in this profile"
-            )
+        if output.scheduled_encoder_inputs:
+            raise ValueError("multimodal scheduling is not enabled in this profile")
+        if output.scheduled_spec_decode_tokens and not self.drafting_enabled:
+            raise ValueError("draft tokens scheduled while DSpark is disabled")
         if getattr(output, "kv_connector_metadata", None) is not None:
             raise ValueError("PD is not enabled in this profile")
         if getattr(output, "kv_cache_block_copies", None):
@@ -81,29 +106,69 @@ class ModelRunnerFL028:
                 raise ValueError("a request cannot acquire a second state block")
             request.computed = cached.num_computed_tokens[i]
 
-        req_ids, samples = [], []
+        req_ids, samples, next_drafts = [], [], []
         for req_id, count in output.num_scheduled_tokens.items():
             request = self.requests[req_id]
             start = request.computed
-            tokens = request.tokens[start : start + count]
-            if len(tokens) != count or not count:
-                raise ValueError(f"invalid scheduled token span for {req_id}")
-            if (start == 0 and count != len(request.tokens)) or (
-                start > 0 and count != 1
-            ):
-                raise ValueError(
-                    "chunked prefill is not supported by this reference profile"
-                )
+            drafts = output.scheduled_spec_decode_tokens.get(req_id, [])
             self.state.bind(request.block, reset=start == 0)
-            ids = torch.tensor(tokens, device=self.device, dtype=torch.long)
-            logits = self.model.compute_logits(self.model(ids, start_pos=start))
-            if not bool(torch.isfinite(logits).all().item()):
-                raise FloatingPointError(f"non-finite logits for {req_id}")
-            token = int(logits[0].argmax().item())
-            request.tokens.append(token)
-            request.computed += count
+            if start == 0:
+                if count != len(request.tokens) or not count or drafts:
+                    raise ValueError("chunked prefill is not supported")
+                token, hidden = self.target_forward(request.tokens, 0)
+                generated = [token]
+                request.computed = count
+            else:
+                if count != 1 + len(drafts) or len(request.tokens) != start + 1:
+                    raise ValueError(f"invalid scheduled decode span for {req_id}")
+                # Verify greedily in order. Only accepted inputs are committed to
+                # Engram/compressor/ring state, so a rejected suffix needs no
+                # rollback. This is a correctness baseline, not parallel verify.
+                generated = []
+                input_token = request.tokens[start]
+                for offset in range(count):
+                    token, hidden = self.target_forward([input_token], start + offset)
+                    generated.append(token)
+                    if offset == len(drafts) or token != drafts[offset]:
+                        break
+                    input_token = token
+                request.computed += len(generated)
+                if drafts:
+                    accepted = len(generated) - 1
+                    self.spec_stats["verified_steps"] += 1
+                    self.spec_stats["draft_tokens"] += len(drafts)
+                    self.spec_stats["accepted_tokens"] += accepted
+                    self.spec_stats["accepted_prefix_histogram"][accepted] += 1
+            request.tokens.extend(generated)
+            draft = []
+            if (
+                self.drafting_enabled
+                and start > 0
+                and request.computed + 5 <= self.model.args.max_seq_len
+            ):
+                result = self.model.propose_draft(
+                    torch.tensor([generated[-1]], device=self.device),
+                    hidden,
+                    request.computed - 1,
+                )
+                ids, logits, confidence = result
+                if not (
+                    bool(torch.isfinite(logits).all().item())
+                    and bool(torch.isfinite(confidence).all().item())
+                ):
+                    raise FloatingPointError("non-finite DSpark logits/confidence")
+                draft = ids[0, 1:].tolist()
+                if len(draft) != 5 or int(ids[0, 0]) != generated[-1]:
+                    raise ValueError(
+                        "DSpark must return the bonus token and five drafts"
+                    )
+                self.spec_stats["draft_steps"] += 1
             req_ids.append(req_id)
-            samples.append([token])
+            samples.append(generated)
+            next_drafts.append(draft)
+        self.draft_token_ids = (
+            DraftTokenIds(req_ids, next_drafts) if self.drafting_enabled else None
+        )
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={req: i for i, req in enumerate(req_ids)},
@@ -162,7 +227,7 @@ class WorkerFL028(WorkerBase):
         return None
 
     def take_draft_token_ids(self):
-        return None
+        return self.model_runner.take_draft_token_ids()
 
     def execute_dummy_batch(self):
         # DP is disabled and there are no unmatched rank-local collectives.
@@ -208,9 +273,15 @@ class WorkerFL028(WorkerBase):
             device=self.device,
         )
         with torch.inference_mode():
-            self.get_model()(ids, start_pos=0)
+            _, hidden = self.get_model().forward_with_aux(ids, start_pos=0)
+            if self.model_runner.drafting_enabled:
+                self.get_model().store_draft_context(hidden, 0)
             if count < limit:
-                self.get_model()(ids[:1], start_pos=count)
+                logits, hidden = self.get_model().forward_with_aux(
+                    ids[:1], start_pos=count
+                )
+                if self.model_runner.drafting_enabled and count + 6 <= limit:
+                    self.get_model().propose_draft(logits.argmax(-1), hidden, count)
         torch.cuda.synchronize(self.device)
         state.bind(0, reset=True)
         elapsed = time.monotonic() - begin

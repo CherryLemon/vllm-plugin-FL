@@ -1175,17 +1175,16 @@ def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos:
 
 
 class DSparkAttention(Attention):
-    def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor):
+    def store_context(self, main_x: torch.Tensor, start_pos: int):
+        """Commit target context only; draft queries never enter the ring cache."""
         assert self.compress_ratio == 0
         bsz, seqlen, _ = main_x.size()
         win = self.window_size
         rd = self.rope_head_dim
-
         main_freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         main_kv = self.kv_norm(self.wkv(main_x))
         apply_rotary_emb(main_kv[..., -rd:], main_freqs_cis)
         act_quant(main_kv, fp8_block_size, scale_fmt, scale_dtype, True)
-
         if start_pos == 0:
             if seqlen <= win:
                 self.window_kv_cache[:bsz, :seqlen] = main_kv
@@ -1195,7 +1194,17 @@ class DSparkAttention(Attention):
                     self.window_kv_cache[:bsz, cutoff:win],
                     self.window_kv_cache[:bsz, :cutoff],
                 ) = main_kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+        else:
+            if seqlen != 1:
+                raise ValueError("DSpark context decode must commit one target token")
+            self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1)
+
+    def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor):
+        self.store_context(main_x, start_pos)
+        if start_pos == 0:
             return x
+        seqlen = main_x.size(1)
+        win, rd = self.window_size, self.rope_head_dim
 
         bsz, block_size, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos + seqlen : start_pos + seqlen + block_size]
@@ -1208,7 +1217,6 @@ class DSparkAttention(Attention):
         act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)
 
         topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos)
-        self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1)
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
         o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
@@ -1462,6 +1470,31 @@ class Transformer(nn.Module):
         if start_pos == 0:
             return None
         return self.mtp[-1].forward_head(h, pre_mix, input_ids)
+
+    @torch.inference_mode()
+    def store_spec_context(self, main_hidden: torch.Tensor, start_pos: int):
+        main_x = self.mtp[0].main_norm(self.mtp[0].main_proj(main_hidden))
+        for layer in self.mtp:
+            layer.attn.store_context(main_x, start_pos)
+
+
+class DSparkTransformer(Transformer):
+    """Standalone draft graph; the serving Worker shares these layers in Transformer."""
+
+    def __init__(self, args):
+        global world_size, rank, default_dtype
+        nn.Module.__init__(self)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        self.hc_mult = args.hc_mult
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.head = ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps)
+        self.mtp = nn.ModuleList(
+            DSparkBlock(args.n_layers + i, args) for i in range(args.n_mtp_layers)
+        )
+        for layer in self.mtp:
+            layer.embed, layer.head = self.embed, self.head
 
 
 def sample(logits, temperature: float = 1.0):

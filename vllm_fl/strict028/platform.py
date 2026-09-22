@@ -108,12 +108,27 @@ class PlatformFL028(Platform):
             raise ValueError(
                 "multi-node execution requires separate communication acceptance"
             )
-        if (
-            vllm_config.speculative_config
-            or vllm_config.kv_transfer_config
-            or vllm_config.lora_config
-        ):
-            raise ValueError("MTP, PD and LoRA require separate integration acceptance")
+        if vllm_config.kv_transfer_config or vllm_config.lora_config:
+            raise ValueError("PD and LoRA require separate integration acceptance")
+        spec = vllm_config.speculative_config
+        if spec is not None:
+            if spec.method != "dspark" or spec.num_speculative_tokens != 5:
+                raise ValueError(
+                    "FL V4.1 MTP requires method=dspark and 5 draft tokens"
+                )
+            if (
+                spec.enable_adaptive_verification
+                or spec.dspark_draft_topk is not None
+                or spec.draft_sample_method != "greedy"
+                or spec.num_speculative_tokens_per_batch_size is not None
+            ):
+                raise ValueError("FL DSpark uses fixed-length greedy verification")
+            if (
+                spec.model != model.model
+                or spec.draft_parallel_config.tensor_parallel_size
+                != parallel.tensor_parallel_size
+            ):
+                raise ValueError("FL DSpark shares the target checkpoint and TP ranks")
         if scheduler.enable_chunked_prefill or scheduler.async_scheduling:
             raise ValueError(
                 "disable chunked prefill and async scheduling for FL Eager reference"

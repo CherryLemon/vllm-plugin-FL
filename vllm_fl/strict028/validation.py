@@ -54,7 +54,8 @@ def reference_differential(worker, prompt_ids):
     finally:
         sys.path.remove(str(source_dir))
     args = dataclasses.asdict(model.args)
-    args["dspark_block_size"] = 0
+    if not len(model.core.mtp):
+        args["dspark_block_size"] = 0
     tok = AutoTokenizer.from_pretrained(
         worker.model_config.model, local_files_only=True
     )
@@ -195,3 +196,170 @@ def reference_differential(worker, prompt_ids):
 class ReferenceProbeExtension:
     def fl_reference_differential(self, prompt_ids):
         return reference_differential(self, prompt_ids)
+
+    def fl_set_drafting(self, enabled):
+        runner = self.model_runner
+        if enabled and not len(self.get_model().core.mtp):
+            raise ValueError("this model was loaded without DSpark weights")
+        runner.drafting_enabled = enabled
+        runner.draft_token_ids = None
+        return {"rank": self.rank, "enabled": enabled}
+
+    def fl_mtp_stats(self):
+        return {"rank": self.rank, **self.model_runner.spec_stats}
+
+    def fl_mtp_differential(self, prompt_ids):
+        return mtp_differential(self, prompt_ids)
+
+
+def mtp_differential(worker, prompt_ids):
+    """Compare real-weight DSpark stages, Markov heads and context with the publisher."""
+    import dataclasses
+    import hashlib
+    import importlib.util
+    import sys
+
+    import torch
+    from transformers import AutoTokenizer
+
+    model = worker.get_model()
+    state = worker.model_runner.state
+    source = Path(worker.model_config.model) / "inference"
+    sys.path.insert(0, str(source))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "published_v41_mtp", source / "model.py"
+        )
+        ref = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = ref
+        spec.loader.exec_module(ref)
+    finally:
+        sys.path.remove(str(source))
+    tok = AutoTokenizer.from_pretrained(
+        worker.model_config.model, local_files_only=True
+    )
+    with torch.device("meta"), ref.set_dtype(torch.bfloat16):
+        golden = ref.Transformer(ref.ModelArgs(**dataclasses.asdict(model.args)), tok)
+    golden.load_state_dict(model.core.state_dict(), strict=True, assign=True)
+    golden.requires_grad_(False)
+    for module in golden.modules():
+        if isinstance(module, ref.Linear) and module.scale is not None:
+            module.weight.scale = module.scale
+    state.bind(0, reset=True)
+    copy_reference_buffers(model.core, golden)
+    captured, handles = {}, []
+
+    def capture(key):
+        def hook(module, inputs, output):
+            captured[key] = tuple(t.detach().clone() for t in output)
+
+        return hook
+
+    for i in range(len(model.core.mtp)):
+        for tag, graph in (("fl", model.core), ("ref", golden)):
+            handles.append(graph.mtp[i].register_forward_hook(capture((tag, i))))
+
+    def difference(a, b):
+        af, bf = a.float(), b.float()
+        return {
+            "max_abs": (af - bf).abs().max().item(),
+            "relative_rms": (
+                (af - bf).square().mean().sqrt()
+                / bf.square().mean().sqrt().clamp_min(1e-30)
+            ).item(),
+            "equal": torch.equal(a, b),
+        }
+
+    def cache_equal(other):
+        return all(
+            torch.equal(a.attn.window_kv_cache, b.attn.window_kv_cache)
+            for a, b in zip(model.core.mtp, other.mtp)
+        )
+
+    try:
+        rows = []
+        with (
+            torch.inference_mode(),
+            torch.device(worker.device),
+            ref.set_dtype(torch.bfloat16),
+        ):
+            ids = torch.tensor(prompt_ids, device=worker.device).view(1, -1)
+            logits, hidden = model.forward_with_aux(ids, start_pos=0)
+            token, expected, hidden_ref = golden(ids, 0)
+            prefill = {
+                "logits": difference(logits, expected),
+                "hidden": difference(hidden, hidden_ref),
+            }
+            model.store_draft_context(hidden, 0)
+            golden.forward_spec(token, hidden_ref, 0)
+            prefill["context_equal"] = cache_equal(golden)
+            for offset in range(4):
+                pos = len(prompt_ids) + offset
+                logits, hidden = model.forward_with_aux(token, start_pos=pos)
+                token, expected, hidden_ref = golden(token.view(1, 1), pos)
+                # The Runner commits context separately for accepted target
+                # tokens; reference forward_spec commits it inside attention.
+                model.store_draft_context(hidden, pos)
+                actual_draft = model.propose_draft(token, hidden, pos)
+                ref_draft = golden.forward_spec(token, hidden_ref, pos)
+                rows.append(
+                    {
+                        "position": pos,
+                        "target_logits": difference(logits, expected),
+                        "target_hidden": difference(hidden, hidden_ref),
+                        "draft_ids_equal": torch.equal(actual_draft[0], ref_draft[0]),
+                        "draft_ids": actual_draft[0].tolist(),
+                        "draft_logits": difference(actual_draft[1], ref_draft[1]),
+                        "confidence": difference(actual_draft[2], ref_draft[2]),
+                        "context_equal": cache_equal(golden),
+                        "layers": [
+                            {
+                                "hidden": difference(
+                                    captured["fl", i][0], captured["ref", i][0]
+                                ),
+                                "mix": difference(
+                                    captured["fl", i][1], captured["ref", i][1]
+                                ),
+                            }
+                            for i in range(len(model.core.mtp))
+                        ],
+                    }
+                )
+        passed = (
+            prefill["context_equal"]
+            and all(
+                r["context_equal"]
+                and r["draft_ids_equal"]
+                and all(
+                    r[k]["equal"]
+                    for k in (
+                        "target_logits",
+                        "target_hidden",
+                        "draft_logits",
+                        "confidence",
+                    )
+                )
+                and all(x["hidden"]["equal"] and x["mix"]["equal"] for x in r["layers"])
+                for r in rows
+            )
+            and prefill["logits"]["equal"]
+            and prefill["hidden"]["equal"]
+        )
+        return {
+            "rank": worker.rank,
+            "passed": passed,
+            "prompt_tokens": len(prompt_ids),
+            "prefill": prefill,
+            "steps": rows,
+            "loaded_mtp_layers": len(model.core.mtp),
+            "reference_sha256": hashlib.sha256(
+                (source / "model.py").read_bytes()
+            ).hexdigest(),
+        }
+    finally:
+        for handle in handles:
+            handle.remove()
+        state.bind(0, reset=True)
+        del golden
+        captured.clear()
+        torch.cuda.empty_cache()

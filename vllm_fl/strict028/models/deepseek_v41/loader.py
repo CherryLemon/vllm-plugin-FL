@@ -164,11 +164,12 @@ def _load_original_checkpoint(model, root, rank, world_size, opened):
             )
 
     for name in sources.keys() - used:
-        if name.startswith("mtp."):
+        if name.startswith("mtp.") and not len(model.mtp):
             reason = "speculative decoding disabled"
         elif ".experts." in name:
             expert = int(name.split(".experts.")[1].split(".")[0])
-            count = model.layers[0].ffn.n_routed_experts // world_size
+            owner = model.get_submodule(name.split(".experts.")[0])
+            count = owner.n_routed_experts // world_size
             if rank * count <= expert < (rank + 1) * count:
                 raise ValueError(f"unconsumed local expert weight: {name}")
             reason = "owned by another expert rank"

@@ -30,6 +30,7 @@ def register_models() -> None:
     if _registered:
         return
     from transformers import AutoConfig
+
     from vllm.tokenizers.registry import TokenizerRegistry
 
     from .config import DeepseekV41FLConfig
@@ -50,6 +51,17 @@ def register_models() -> None:
     ModelRegistry.register_model(
         "DeepseekV41FlashFLForCausalLM",
         "vllm_fl.strict028.models.deepseek_v41.entry:DeepseekV41FlashFLForCausalLM",
+    )
+    # 0.28 reconstructs the draft config from the original checkpoint, then
+    # selects DSparkDraftModel by name. Route both through public registration;
+    # the strict platform admits V4.1 only. No stock GPU model/extension is loaded.
+    ModelRegistry.register_model(
+        "DeepseekV41ForCausalLM",
+        "vllm_fl.strict028.models.deepseek_v41.entry:DeepseekV41FlashFLForCausalLM",
+    )
+    ModelRegistry.register_model(
+        "DSparkDraftModel",
+        "vllm_fl.strict028.models.deepseek_v41.entry:DeepseekV41DSparkFLForCausalLM",
     )
     # Public registration APIs, also required in engine/scheduler processes.
     from . import model_loader  # noqa: F401
