@@ -175,6 +175,7 @@ def main():
         "plugin-foundation-regression.log",
         "sampling-contract-tests.log",
         "reference-probe-tests.log",
+        "deterministic-loading-tests.log",
         "flaggems-new-operators.log",
         "mxfp4-moe-clamp-tests.log",
         "real-expert-tp1.json",

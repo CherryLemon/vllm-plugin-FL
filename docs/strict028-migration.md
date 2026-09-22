@@ -57,6 +57,7 @@ No host source patch, module stub or registry dictionary write is used.
   attention comparison has maximum absolute error 0.0001220703125.
 - Plugin foundation and state regression: 123 passing tests; greedy sampling
   admission: 10 tests; aliased reference-buffer regression: 1 test.
+  Deterministic FP4 allocation/loading: 1 GPU regression.
   FlagGems new-operator suite: 69 tests.
 - Published whole-graph comparison on eight ranks: 12- and 141-token prefill,
   followed by four cached decode steps each. All 40 layer outputs, routing

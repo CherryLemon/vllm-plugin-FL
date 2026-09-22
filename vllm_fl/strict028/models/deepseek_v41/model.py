@@ -219,9 +219,11 @@ class Linear(nn.Module):
         dtype = dtype or default_dtype
         if dtype == torch.float4_e2m1fn_x2:
             # two values per byte: [out, in] logically, [out, in//2] stored
+            # Torch 2.13's deterministic empty fill lacks FP4. Allocate the
+            # original byte storage first; the loader overwrites every byte.
             self.weight = nn.Parameter(
-                torch.empty(
-                    out_features, in_features // 2, dtype=torch.float4_e2m1fn_x2
+                torch.empty(out_features, in_features // 2, dtype=torch.uint8).view(
+                    torch.float4_e2m1fn_x2
                 )
             )
             self.weight.scale = self.scale = nn.Parameter(
