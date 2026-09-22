@@ -75,7 +75,6 @@ def test_padded_rows_clear_only_group_width_in_strided_storage():
 def _make_block_table(device: torch.device) -> MultiGroupBlockTable:
     table = MultiGroupBlockTable(
         max_num_reqs=4,
-        max_model_len=64,
         max_num_batched_tokens=16,
         pin_memory=False,
         device=device,
@@ -91,6 +90,23 @@ def _make_block_table(device: torch.device) -> MultiGroupBlockTable:
     table.add_row(([20, 21, 22, 23], [24, 25]), 3)
     table.commit_block_table(4)
     return table
+
+
+def test_recurrent_state_group_does_not_generate_kv_slots(device):
+    from vllm.v1.worker.block_table import SlotMappingMode
+
+    table = _make_block_table(device)
+    table.block_tables[1].slot_mapping_mode = SlotMappingMode.NONE
+    for group in table.block_tables:
+        group.slot_mapping.gpu.fill_(12345)
+    query = torch.tensor([0, 1, 2, 2, 2], device=device, dtype=torch.int32)
+    positions = torch.zeros(16, device=device, dtype=torch.int64)
+    lengths = torch.tensor([1, 1, 0, 0], device=device, dtype=torch.int32)
+    computed = torch.empty_like(lengths)
+    compute_common_attention_metadata(table, 4, query, positions, lengths, computed)
+    torch.testing.assert_close(table.block_tables[0].slot_mapping.gpu[:2],
+                               torch.tensor([8, 32], device=device), rtol=0, atol=0)
+    assert torch.all(table.block_tables[1].slot_mapping.gpu == -1)
 
 
 def _expected_slots(
@@ -290,12 +306,18 @@ def test_common_attention_metadata_graph_off_runs_eager(
     )
 
 
+@pytest.mark.parametrize(
+    "pcp_size,pcp_rank,dcp_size,dcp_rank", [(2, 1, 1, 0), (1, 0, 2, 1), (2, 1, 2, 0)]
+)
 def test_common_attention_metadata_matches_vllm_with_hybrid_blocks_and_cp(
     device: torch.device,
+    pcp_size,
+    pcp_rank,
+    dcp_size,
+    dcp_rank,
 ) -> None:
     table = MultiGroupBlockTable(
         max_num_reqs=2,
-        max_model_len=64,
         max_num_batched_tokens=16,
         pin_memory=False,
         device=device,
@@ -308,10 +330,10 @@ def test_common_attention_metadata_matches_vllm_with_hybrid_blocks_and_cp(
     table.add_row(([6, 7, 8, 9], [14, 15, 16, 17]), 1)
     table.commit_block_table(2)
     for group in table.block_tables:
-        group.pcp_world_size = 2
-        group.pcp_rank = 1
-        group.dcp_world_size = 1
-        group.dcp_rank = 0
+        group.pcp_world_size = pcp_size
+        group.pcp_rank = pcp_rank
+        group.dcp_world_size = dcp_size
+        group.dcp_rank = dcp_rank
 
     query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32, device=device)
     positions = torch.zeros(16, dtype=torch.int64, device=device)
@@ -373,7 +395,6 @@ def test_common_attention_metadata_clears_long_context_padded_rows(
     num_actual_reqs = 62
     table = MultiGroupBlockTable(
         max_num_reqs=num_reqs_padded,
-        max_model_len=16512,
         max_num_batched_tokens=16384,
         pin_memory=False,
         device=device,
@@ -440,7 +461,10 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(num_ubatches=1),
     )
-    runner.parallel_config = SimpleNamespace(use_ubatching=False)
+    runner.parallel_config = SimpleNamespace(
+        use_ubatching=False, cp_kv_cache_interleave_size=1
+    )
+    runner.dcp_world_size = 1
     runner.common_metadata_policy = SimpleNamespace(mode="graph")
     runner.scheduler_config = SimpleNamespace(max_num_seqs=4)
     runner.max_num_reqs = 4

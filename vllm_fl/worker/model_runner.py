@@ -6893,7 +6893,7 @@ class ModelRunnerFL(
         if current_platform.is_rocm() or current_platform.is_xpu():
             gc.collect()
             torch.accelerator.empty_cache()
-            torch.accelerator.synchronize()
+            _accelerator_synchronize()
 
     def _cleanup_profiling_kv_cache(self) -> None:
         _accelerator_synchronize()

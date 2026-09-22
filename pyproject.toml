@@ -16,7 +16,7 @@ name = "vllm-plugin-fl"
 dynamic = ["version"]
 description = "A vLLM plugin built on the FlagOS unified multi-chip backend"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "vllm_fl/strict028/models/deepseek_v41/LICENSE.DeepSeek"]
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 classifiers = [

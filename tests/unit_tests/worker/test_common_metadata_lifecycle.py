@@ -82,8 +82,12 @@ def test_input_batch_replacement_clears_graphs_before_releasing_owner(monkeypatc
     runner.num_spec_tokens = 0
     runner.is_pooling_model = False
     runner.vllm_config = SimpleNamespace(reasoning_config=None)
+    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
+    runner.cache_config = SimpleNamespace(use_replayssm=False)
     runner._init_block_sizes = [4]
     runner._init_kernel_block_sizes = [4]
+    runner._init_max_num_blocks = [16]
+    runner._init_slot_mapping_modes = []
     old = SimpleNamespace(logitsprocs=None, logitsprocs_need_output_token_ids=False)
     runner.input_batch = old
     events = []
@@ -104,7 +108,14 @@ def test_input_batch_replacement_clears_graphs_before_releasing_owner(monkeypatc
 
     monkeypatch.setattr(module, "InputBatch", replace)
     config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8))]
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_spec=SimpleNamespace(
+                    block_size=8,
+                    max_num_blocks_per_req=lambda config, length: length // 8,
+                )
+            )
+        ]
     )
     runner.may_reinitialize_input_batch(config, [8])
     assert runner.input_batch is new

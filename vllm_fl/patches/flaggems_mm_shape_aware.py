@@ -229,11 +229,13 @@ def _register_override(library: Any, wrapper: Callable[..., Any]) -> None:
 
 
 def _registration_fingerprint() -> tuple[str, ...] | None:
-    # PyTorch 2.11 has no public kernel identity API. Restrict its diagnostic
-    # registration-stack adapter to the tested ABI; repr/source filenames are
-    # never implementation identity. Other builds can install through the
+    # PyTorch 2.11 and 2.13 have no public kernel identity API. Restrict this
+    # diagnostic registration-stack adapter to tested ABIs (2.13 is shipped
+    # in the official vLLM 0.28 image); repr/source filenames alone are never
+    # implementation identity. Other builds can install through the
     # public API, but repeated initialization cannot verify external ownership.
-    if torch.__version__.split("+", 1)[0].split(".")[:2] != ["2", "11"]:
+    version = tuple(torch.__version__.split("+", 1)[0].split(".")[:2])
+    if version not in {("2", "11"), ("2", "13")}:
         return None
     return tuple(
         line

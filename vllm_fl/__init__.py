@@ -71,24 +71,26 @@ def _patch_flag_gems_triton_import_compat():
         triton.knobs = knobs
 
 
-_patch_flag_gems_triton_import_compat()
+_STRICT028 = os.environ.get("VLLM_FL_STRICT028", "0")
+if _STRICT028 not in {"0", "1"}:
+    raise ValueError("VLLM_FL_STRICT028 must be 0 or 1")
+
+if _STRICT028 == "0":
+    _patch_flag_gems_triton_import_compat()
 
 # torch.float4_e2m1fn_x2 exists only in CUDA builds of PyTorch 2.7+.
 # vllm.ir.tolerances references it at module level, so we inject a sentinel
 # before any vllm.ir import can happen.
-if "torch" in sys.modules:
-    _torch = sys.modules["torch"]
-    if not hasattr(_torch, "float4_e2m1fn_x2"):
-        _torch.float4_e2m1fn_x2 = _torch.uint8
-else:
+if _STRICT028 == "0":
     import torch as _torch
 
     if not hasattr(_torch, "float4_e2m1fn_x2"):
         _torch.float4_e2m1fn_x2 = _torch.uint8
-del _torch
+    del _torch
 
 from . import version as version  # PyTorch-style: vllm_fl.version.git_version
-from vllm_fl.utils import get_op_config as _get_op_config
+if _STRICT028 == "0":
+    from vllm_fl.utils import get_op_config as _get_op_config
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,11 @@ def _init_vendor_device():
 
 def register():
     """Register the FL platform."""
+    if _STRICT028 == "1":
+        from vllm_fl.strict028.bootstrap import register_platform
+
+        return register_platform()
+
     _init_vendor_device()
 
     # PlatformFL is accelerator-shaped. For the standard FlagGems ARM target,
@@ -269,6 +276,11 @@ def _register_gdn_packed_decode_patch() -> bool:
 
 def register_model():
     """Register FL runtime extensions after vLLM model discovery."""
+    if _STRICT028 == "1":
+        from vllm_fl.strict028.bootstrap import register_models
+
+        return register_models()
+
 
     from vllm.platforms import current_platform
 

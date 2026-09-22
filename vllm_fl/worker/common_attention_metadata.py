@@ -63,6 +63,8 @@ class _CommonAttentionMetadataLayout:
     block_table_strides: torch.Tensor
     block_table_widths: torch.Tensor
     block_sizes: torch.Tensor
+    kv_cache_block_sizes: torch.Tensor
+    slot_mapping_enabled: torch.Tensor
     slot_mapping_ptrs: torch.Tensor
     num_groups: int
     max_num_batched_tokens: int
@@ -90,6 +92,8 @@ def _compute_slot_mapping_graph_kernel(
     block_table_strides,
     block_table_widths,
     block_sizes,
+    kv_cache_block_sizes,
+    slot_mapping_enabled,
     slot_mapping_ptrs,
     TOTAL_CP_WORLD_SIZE: tl.constexpr,
     TOTAL_CP_RANK: tl.constexpr,
@@ -104,10 +108,13 @@ def _compute_slot_mapping_graph_kernel(
     block_table_stride = tl.load(block_table_strides + group_idx)
     block_table_width = tl.load(block_table_widths + group_idx)
     block_size = tl.load(block_sizes + group_idx)
+    kv_cache_block_size = tl.load(kv_cache_block_sizes + group_idx)
+    mapping_enabled = tl.load(slot_mapping_enabled + group_idx)
     slot_mapping_ptr = _load_ptr(slot_mapping_ptrs + group_idx, tl.int64)
 
     if req_idx == tl.num_programs(1) - 1:
         actual_num_tokens = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
+        actual_num_tokens = tl.where(mapping_enabled == 0, 0, actual_num_tokens)
         for i in range(actual_num_tokens, max_num_tokens, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
             tl.store(
@@ -137,18 +144,17 @@ def _compute_slot_mapping_graph_kernel(
                 mask=offsets < block_table_width,
             )
 
-    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+    if mapping_enabled == 0:
+        return
+    virtual_block_size = kv_cache_block_size * TOTAL_CP_WORLD_SIZE
+    blocks_per_kv_block = kv_cache_block_size // block_size
     row_offset = req_idx * block_table_stride
     for i in range(start_idx, end_idx, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < end_idx
         pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
-        block_indices = pos // virtual_block_size
-        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(
-            tl.int64
-        )
-
-        virtual_block_offsets = pos - block_indices * virtual_block_size
+        virtual_block_indices = pos // virtual_block_size
+        virtual_block_offsets = pos - virtual_block_indices * virtual_block_size
         is_local = (
             virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
         ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
@@ -158,7 +164,16 @@ def _compute_slot_mapping_graph_kernel(
             virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
         )
 
-        slot_ids = block_numbers * block_size + local_block_offsets
+        block_indices = (
+            virtual_block_indices * blocks_per_kv_block
+            + local_block_offsets // block_size
+        )
+        block_numbers = tl.load(
+            block_table_ptr + row_offset + block_indices,
+            mask=mask & is_local,
+            other=0,
+        ).to(tl.int64)
+        slot_ids = block_numbers * block_size + local_block_offsets % block_size
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
 
@@ -196,19 +211,23 @@ def _make_ptr_tensor(tensors: list[torch.Tensor]) -> torch.Tensor:
 def _create_common_attention_metadata_layout(
     block_table: Any,
 ) -> _CommonAttentionMetadataLayout:
+    from vllm.v1.worker.block_table import SlotMappingMode
+
     tables = block_table.block_tables
     if not tables:
         raise ValueError("Common attention metadata requires a KV cache group")
 
     max_num_batched_tokens = tables[0].max_num_batched_tokens
-    total_cp_world_size = tables[0].pcp_world_size * tables[0].dcp_world_size
-    total_cp_rank = tables[0].pcp_rank * tables[0].dcp_world_size + tables[0].dcp_rank
+    # vLLM 0.28 supplies PCP-local positions. Only DCP interleaves the slots
+    # here; multiplying by PCP again would select and write the wrong pages.
+    total_cp_world_size = tables[0].dcp_world_size
+    total_cp_rank = tables[0].dcp_rank
     cp_kv_cache_interleave_size = tables[0].cp_kv_cache_interleave_size
     device = tables[0].block_table.gpu.device
 
     for table in tables[1:]:
-        table_cp_world_size = table.pcp_world_size * table.dcp_world_size
-        table_cp_rank = table.pcp_rank * table.dcp_world_size + table.dcp_rank
+        table_cp_world_size = table.dcp_world_size
+        table_cp_rank = table.dcp_rank
         if (
             table.block_table.gpu.device != device
             or table.slot_mapping.gpu.device != device
@@ -241,6 +260,19 @@ def _create_common_attention_metadata_layout(
         ),
         block_sizes=torch.tensor(
             [table.block_size for table in tables],
+            dtype=torch.int32,
+            device=device,
+        ),
+        kv_cache_block_sizes=torch.tensor(
+            [table.kv_cache_block_size for table in tables],
+            dtype=torch.int32,
+            device=device,
+        ),
+        slot_mapping_enabled=torch.tensor(
+            [
+                table.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
+                for table in tables
+            ],
             dtype=torch.int32,
             device=device,
         ),
@@ -284,6 +316,8 @@ def compute_common_attention_metadata(
             layout.block_table_strides,
             layout.block_table_widths,
             layout.block_sizes,
+            layout.kv_cache_block_sizes,
+            layout.slot_mapping_enabled,
             layout.slot_mapping_ptrs,
             TOTAL_CP_WORLD_SIZE=layout.total_cp_world_size,
             TOTAL_CP_RANK=layout.total_cp_rank,
@@ -344,6 +378,8 @@ def _buffer_signature(block_table: Any, tensors: tuple) -> tuple:
             _tensor_signature(t.block_table.gpu),
             _tensor_signature(t.slot_mapping.gpu),
             t.block_size,
+            t.kv_cache_block_size,
+            t.slot_mapping_mode,
             t.max_num_batched_tokens,
             t.pcp_world_size,
             t.pcp_rank,
