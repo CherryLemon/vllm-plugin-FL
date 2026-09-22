@@ -47,6 +47,7 @@ class PlatformFL028(Platform):
 
     @classmethod
     def validate_request(cls, processed_inputs, params):
+        from vllm.exceptions import VLLMValidationError
         from vllm.sampling_params import SamplingParams
 
         from .sampling import validate_sampling
@@ -54,8 +55,15 @@ class PlatformFL028(Platform):
         if processed_inputs.get("type") != "token" or not isinstance(
             params, SamplingParams
         ):
-            raise ValueError("FL reference profile accepts text token generation only")
-        validate_sampling(params)
+            raise VLLMValidationError(
+                "FL reference profile accepts text token generation only"
+            )
+        try:
+            validate_sampling(params)
+        except ValueError as error:
+            # AsyncLLM only propagates VLLMClientError as a request failure;
+            # raw ValueError becomes EngineGenerateError and an HTTP 500.
+            raise VLLMValidationError(str(error)) from error
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config):

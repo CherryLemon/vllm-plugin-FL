@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--reference-probe", action="store_true")
     args = parser.parse_args()
     from vllm import LLM, SamplingParams
+    from vllm.exceptions import VLLMValidationError
     from vllm.tokenizers.registry import TokenizerRegistry
 
     begin = time.monotonic()
@@ -55,7 +56,7 @@ def main():
             [{"prompt_token_ids": prompts[0]}],
             SamplingParams(temperature=1, max_tokens=1),
         )
-    except ValueError as error:
+    except VLLMValidationError as error:
         if "temperature != 0" not in str(error):
             raise
     else:

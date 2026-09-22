@@ -56,7 +56,7 @@ No host source patch, module stub or registry dictionary write is used.
   bytes/scales and tested mHC coefficients agree exactly; the random sparse
   attention comparison has maximum absolute error 0.0001220703125.
 - Plugin foundation and state regression: 123 passing tests; greedy sampling
-  admission: 13 tests; aliased reference-buffer regression: 1 test.
+  admission: 14 tests; aliased reference-buffer regression: 1 test.
   Deterministic FP4 allocation/loading: 1 GPU regression.
   FlagGems new-operator suite: 69 tests.
 - Published whole-graph comparison on eight ranks: 12- and 141-token prefill,
@@ -122,7 +122,8 @@ request or another source layer. Prefix caching and chunked prefill are rejected
 
 The profile requires BF16, Eager, a single homogeneous node with TP dividing
 8, and greedy sampling. DP/PP/CP, MTP, PD, LoRA, structured output, sampling
-penalties and logprobs are rejected explicitly. The admission ceiling is 4096
+penalties and logprobs are rejected explicitly. Frontend admission uses the
+host public `VLLMValidationError` so AsyncLLM preserves HTTP 400 responses. The admission ceiling is 4096
 context tokens; the current smoke configuration allocates 256 and allows two
 requests. This does not establish long-context support or a performance SLO.
 
