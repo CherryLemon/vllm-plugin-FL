@@ -75,9 +75,12 @@ The development container is `dsv41-fl-028`; runtime Python is
 `/public-nvme/yjwu/dsv41-fl-028/evidence`. FlagGems changes are in
 `/public-nvme/yjwu/dsv41-fl-028/FlagGems` (`feat/dsv41-mxfp4-indexer`).
 
-Tests currently use source snapshots for development. Rebuilt wheels, a clean
-installed-package audit, final image recipe and delivery manifest remain required
-before this can be called a reproducible deployment.
+Component tests used source snapshots during development. Normal wheels have
+now been built and installed in the isolated environment without `PYTHONPATH`.
+The install audit verifies 2,238 host, 252 plugin and 3,393 FlagGems Python files
+against the frozen sources, confirms no host device extension is active and
+confirms host Worker methods are unchanged by importing FlagGems. A final
+installed-wheel whole-model run and image receipt are still pending.
 
 ## Eager reference profile
 
@@ -121,3 +124,27 @@ New operators require a FlagGems/FlagTree optimization handoff; see
 [strict028-operator-handoff.md](strict028-operator-handoff.md). Current operator
 performance status is **not_profiled**; correctness results do not establish
 throughput, bounded long-context workspace or cross-chip portability.
+
+## Plan coverage and support boundary
+
+| Plan milestone | Current evidence | Open acceptance |
+|---|---|---|
+| P0: unchanged host and environment | Official 0.28.0 empty wheel; independent public registrations; checkpoint audit; normal installed source/Worker audit | One preferred non-NVIDIA SKU and its compatible software stack |
+| P1: full reference model | Complete real weight loading, Engram, TP/EP, Eager generation and repeated-request equality | Final distributed published-reference comparison |
+| P2: FlagGems main path | Explicit low-precision linear, sparse attention, FP4 rounding, MM and Sinkhorn; packed Indexer and clamp component tests | Connect packed Indexer; replace declared Torch compositions; operator profiling/tuning |
+| P3: parallel and PD | Homogeneous single-node TP=8 with local expert ownership; complete scheduler-owned request-state pages | DP/PP/CP, paged/chunked/prefix state, external PD connector and failure injection |
+| P4: performance features | Standalone operator graph replay checks only | Serving graph, MTP/DSpark, group-6 integration, overlap and SLO comparison |
+| P5: production release | Reproducible wheels, build/deployment tooling and optimization handoff in preparation | Target-SKU acceptance, stress/quality/performance and rollback exercise |
+
+Only the eight-H100 text configuration has a real-model execution receipt. The
+256-token number is the allocated context limit of that test, not a tested
+256-token prompt or long-context capacity result. Two requests are interleaved
+by the host scheduler and executed serially inside the reference Runner.
+TP=1/2/4 remain admitted shapes but have no whole-model capacity/collective
+acceptance on this machine. FP16-only devices have not been admitted.
+
+Two complete copies of the currently loaded TP=8 model require approximately
+1.06 TB of parameter storage alone (2 × 8 × 66,153,777,416 bytes). Consequently
+the present eight 80GB cards cannot also provide a like-for-like colocated P/D
+validation with two complete instances. No CPU offload, re-quantization or omitted
+Engram weights are used to bypass that capacity limit.

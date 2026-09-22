@@ -18,13 +18,11 @@ of those names under a build root, alongside `build-deps` and
 Run `commands/provision_build_env.sh`, then export the two artifact versions from
 `image/build.env` and run `commands/build_wheels.sh`. Both scripts work offline.
 
-The runtime build uses the supplied wheels and the official image:
+The runtime build uses the supplied wheels and verifies the official base's
+local image ID before building:
 
 ```bash
-source image/build.env
-docker build --build-arg FL_PLUGIN_VERSION="$FL_PLUGIN_VERSION" \
-  --build-arg FL_GEMS_VERSION="$FL_GEMS_VERSION" \
-  -t local/dsv41-fl:strict028 image
+bash commands/build_image.sh
 ```
 
 Run `commands/audit_install.py --source-manifest /work/source-manifest.json

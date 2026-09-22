@@ -4,6 +4,25 @@
 from pathlib import Path
 
 
+def copy_reference_buffers(source, target):
+    """Materialize every buffer binding, including aliases hidden by deduplication."""
+    source_buffers = dict(source.named_buffers(remove_duplicate=False))
+    target_buffers = dict(target.named_buffers(remove_duplicate=False))
+    if source_buffers.keys() != target_buffers.keys():
+        raise AssertionError("reference buffer structure differs")
+    copies = {}
+    for name, buffer in source_buffers.items():
+        other = target_buffers[name]
+        if buffer.shape != other.shape or buffer.dtype != other.dtype:
+            raise AssertionError(f"reference buffer contract differs: {name}")
+        if id(buffer) not in copies:
+            copies[id(buffer)] = buffer.clone()
+        module_name, _, field = name.rpartition(".")
+        setattr(target.get_submodule(module_name), field, copies[id(buffer)])
+    if any(b.is_meta for b in target.buffers()):
+        raise AssertionError("reference still contains meta buffers")
+
+
 def reference_differential(worker, prompt_ids):
     """Run the published graph on shared immutable weights, independent buffers.
 
@@ -47,9 +66,7 @@ def reference_differential(worker, prompt_ids):
         if isinstance(module, reference.Linear) and module.scale is not None:
             module.weight.scale = module.scale
     worker.model_runner.state.bind(0, reset=True)
-    for name, buffer in model.core.named_buffers():
-        module_name, _, field = name.rpartition(".")
-        setattr(golden.get_submodule(module_name), field, buffer.clone())
+    copy_reference_buffers(model.core, golden)
     captured = {}
     handles = []
 

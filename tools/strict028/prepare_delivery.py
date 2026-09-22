@@ -175,9 +175,13 @@ def main():
         shutil.copy2(work / "evidence" / name, out / "evidence" / name)
     smoke = json.loads((out / "evidence/full-model-smoke.json").read_text())
     audit = json.loads((out / "evidence/installed-audit.json").read_text())
-    if smoke["status"] != "passed" or audit["status"] != "passed":
+    if (
+        smoke["status"] != "passed"
+        or not smoke.get("reference_differential")
+        or audit["status"] != "passed"
+    ):
         raise RuntimeError(
-            "generation and normal-install audits must pass before delivery"
+            "generation, whole-graph differential and normal-install audit must pass before delivery"
         )
     manifest["validation"]["reference_graph_differential"] = bool(
         smoke.get("reference_differential")
@@ -192,6 +196,7 @@ def main():
     for name in (
         "provision_build_env.sh",
         "build_wheels.sh",
+        "build_image.sh",
         "smoke_generate.py",
         "audit_install.py",
         "serve.sh",

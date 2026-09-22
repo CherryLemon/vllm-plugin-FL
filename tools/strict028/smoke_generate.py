@@ -65,7 +65,7 @@ def main():
     if repeated[0].outputs[0].token_ids != result[0].outputs[0].token_ids:
         raise AssertionError("repeated request changed greedy output after cache reuse")
     report = {
-        "status": "passed",
+        "status": "reference_pending" if args.reference_probe else "passed",
         "profile": "fl_dsv41_eager_reference_v1",
         "tp": args.tp,
         "load_seconds": loaded - begin,
@@ -82,6 +82,7 @@ def main():
             "fl_reference_differential", args=(prompts[0],)
         )
         report["reference_differential"] = differential
+        report["status"] = "passed"
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
         print(json.dumps({"reference_differential": differential}, indent=2))
 
