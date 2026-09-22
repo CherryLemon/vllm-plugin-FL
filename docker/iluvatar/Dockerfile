@@ -12,19 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vLLM 0.24 image, layered on the FlagOS-packaged MUSA stack
-# (MUSA 4.3.5 / torch 2.9.0 / torch_musa / vLLM 0.24.0 / plugin 0.3.0).
-# The v0.20.2 image that wrapped Moore Threads' own registry image directly
-# is kept as Dockerfile.v0.20.2.
-ARG MUSA_BASE_IMAGE=harbor.baai.ac.cn/flagrelease-public/flagrelease_mthreads-gmi_vllm024plugin_base:08281629
+# vLLM 0.24 image for Iluvatar BI-V150, layered on the validated CoreX 4.5
+# stack supplied for vLLM 0.24. Keep the packaged vendor software matrix.
+ARG ILUVATAR_BASE_IMAGE=harbor.baai.ac.cn/plugin/iluvatar-corex4.5.0-flagtree0.6.0-triton3.6.0-cxnone-vllm_fl0.24.0:20260909
 
 # ---------- base stage ----------
-FROM ${MUSA_BASE_IMAGE} AS base
+FROM ${ILUVATAR_BASE_IMAGE} AS base
 
-ARG MUSA_BASE_IMAGE
+ARG ILUVATAR_BASE_IMAGE
 ARG VLLM_VERSION=0.24.0
-ARG TORCH_VERSION=2.9.0
-ARG FLAGGEMS_VERSION=5.3.2.post1.dev22+gb1f939eb5
+ARG TORCH_VERSION=2.10.0
+ARG DRIVER_VERSION=4.5.0
 ARG BUILD_DATE=unknown
 ARG VCS_REF=unknown
 ARG IMAGE_VERSION=unknown
@@ -32,26 +30,45 @@ ARG IMAGE_STAGE=dev
 ARG SOURCE_URL=https://github.com/flagos-ai/vllm-plugin-FL
 
 LABEL org.opencontainers.image.title="vllm-plugin-fl" \
-      org.opencontainers.image.description="Moore Threads MUSA image for vllm-plugin-FL (vLLM 0.24)" \
+      org.opencontainers.image.description="Iluvatar BI-V150 image for vllm-plugin-FL (vLLM 0.24)" \
       org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
-      org.opencontainers.image.base.name="${MUSA_BASE_IMAGE}" \
-      io.flagos.accelerator.backend="musa" \
+      org.opencontainers.image.base.name="${ILUVATAR_BASE_IMAGE}" \
+      io.flagos.accelerator.backend="iluvatar" \
       io.flagos.image.stage="${IMAGE_STAGE}" \
       io.flagos.vllm.version="${VLLM_VERSION}" \
       io.flagos.torch.version="${TORCH_VERSION}" \
-      io.flagos.flaggems.version="${FLAGGEMS_VERSION}"
+      io.flagos.driver.version="${DRIVER_VERSION}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    VLLM_PLUGINS=fl
+    VLLM_PLUGINS=fl \
+    GEMS_VENDOR=iluvatar
 
-# Fail early when a wrong vendor base image is supplied: the stack must
-# provide torch + torch_musa + vLLM 0.24 + FlagGems (setup.sh relies on all
-# four at job time). Metadata-only on purpose — importing flag_gems or
-# torch_musa initializes the MUSA driver, which only succeeds on a host with
-# Mthreads GPUs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf "$(command -v python3.12)" /usr/local/bin/python \
+    && python -m pip --version
+
+RUN python -m pip install --no-cache-dir \
+        "setuptools>=77.0.3,<81.0.0" \
+        wheel \
+        setuptools-scm \
+        setuptools-rust \
+        "cloudpickle>=3.1.0" \
+        scikit-build-core==0.11 \
+        pybind11 \
+        ninja \
+        cmake
+
+# Metadata-only validation avoids initializing the CoreX driver during build.
 RUN python - <<'PY'
 from importlib.metadata import PackageNotFoundError, version
 
@@ -65,41 +82,14 @@ def dist(*names):
 
 vllm = dist("vllm")
 torch = dist("torch")
-torch_musa = dist("torch-musa", "torch_musa")
 flag_gems = dist("flag-gems", "flag_gems")
 
-assert vllm.startswith("0.24"), (
-    f"base image carries vLLM {vllm}, expected 0.24.x — wrong MUSA_BASE_IMAGE?"
-)
-assert "empty" in vllm, (
-    f"base image carries vLLM {vllm}, expected the empty-device build "
-    "(the plugin registers the MUSA platform itself)"
-)
-assert torch.startswith("2.9"), (
-    f"base image carries torch {torch}, expected 2.9.x"
-)
-print(f"vLLM {vllm} / torch {torch} / torch_musa {torch_musa} / "
-      f"FlagGems {flag_gems} — base stack OK")
+assert vllm.startswith("0.24"), vllm
+assert "empty" in vllm, vllm
+assert torch.startswith("2.10"), torch
+assert flag_gems.startswith("5.3"), flag_gems
+print(f"vLLM {vllm} / torch {torch} / FlagGems {flag_gems} - base stack OK")
 PY
-
-# Keep the vendor runtime from the base image and add only the tools required
-# to build the checked-out plugin in CI.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        curl \
-        git \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN python -m pip install --no-cache-dir \
-        "setuptools>=77.0.3,<81.0.0" \
-        wheel \
-        setuptools-scm \
-        scikit-build-core==0.11 \
-        pybind11 \
-        ninja \
-        cmake
 
 WORKDIR /workspace
 
@@ -120,7 +110,13 @@ FROM dev AS ci
 
 RUN python -m pip install --no-cache-dir \
         pytest-timeout \
-        pytest-metadata
+        pytest-metadata \
+        requests \
+        openai \
+        pillow \
+        decorator \
+        pyyaml \
+        sqlalchemy
 
 WORKDIR /workspace
 

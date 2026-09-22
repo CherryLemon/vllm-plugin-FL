@@ -563,6 +563,8 @@ class WorkerFL(WorkerBase):
                 f"{current_platform.device_type}:{visible_device_index}"
             )
             current_platform.set_device(self.device)
+            if current_platform.device_type == "musa":
+                self.device_config.device = self.device
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -646,6 +648,18 @@ class WorkerFL(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+
+        if current_platform.device_type == "musa":
+            mismatched = [
+                (name, param.device)
+                for name, param in self.model_runner.model.named_parameters()
+                if param.device.type == "musa" and param.device != self.device
+            ]
+            if mismatched:
+                raise RuntimeError(
+                    f"Rank {self.rank} expected model parameters on {self.device}, "
+                    f"got {mismatched[:3]}"
+                )
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

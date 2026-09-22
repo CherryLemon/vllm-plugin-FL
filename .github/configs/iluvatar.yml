@@ -12,24 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MUSA Hardware Configuration
-# This file defines CI/CD settings for MUSA testing.
+# Iluvatar BI-V150 hardware configuration.
+platform: iluvatar
 
-platform: musa
-
-ci_image: harbor.baai.ac.cn/flagos-dev/vllm-plugin-fl:v0.24.0-musa-ci
+ci_image: harbor.baai.ac.cn/flagos-dev/vllm-plugin-fl:v0.24.0-iluvatar-ci
 
 runner_labels:
-  - mt-cicd-vllm-plugin
+  - iluvatar-cicd-vllm-plugin
 
+# Keep the validated host model directory available at the paths shared by the
+# existing Qwen3.6 cases.
 container_volumes:
-  - /data:/data
+  - /dev:/dev
+  - /lib/modules:/lib/modules
+  - /usr/local/corex-4.5.0/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1
+  - /usr/local/corex-4.5.0/lib64/libixml.so:/usr/local/corex/lib64/libixml.so
+  - /mnt/share/user_homes/models:/data/models/Qwen
 
 container_options: >-
   --hostname vllm-plugin-fl
   --privileged
   --ipc=host
   --shm-size=64g
-  --env GEMS_VENDOR=mthreads
+  --env GEMS_VENDOR=iluvatar
   --env VLLM_PLUGINS=fl
-  --env MTHREADS_VISIBLE_DEVICES=all
+  --env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  --env VLLM_ENGINE_ITERATION_TIMEOUT_S=72000
+  --env VLLM_RPC_TIMEOUT=72000000
+  --env VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=7200

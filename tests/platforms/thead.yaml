@@ -12,44 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-platform: metax
-vendor: metax
+platform: thead
+vendor: thead
 
 device_types:
-  c550:
-    memory_gb: 64
-    tags: [metax, maca, bf16, fp16, fp32]
+  zw810e:
+    compute_capability: "8.0"
+    memory_gb: 96
+    tags: [ppu, bf16, cuda-compatible]
 
+# Default numerical tolerance for result comparison.
 tolerance:
   inference:
-    default:
-      rtol: 1e-3
-      atol: 1e-3
-    bfloat16:
-      rtol: 1e-2
-      atol: 1e-2
+    default: {exact: true}
 
+# Device-level overrides for specific devices or categories.
 device_overrides:
-  c550:
+  zw810e:
     cases:
       - qwen3_6/27b_tp4_eager
       - qwen3_6/27b_tp4_graph
       - qwen3_6/35b_a3b_tp4_eager
       - qwen3_6/35b_a3b_tp4_graph
     llm:
-      gpu_memory_utilization: 0.90
+      gpu_memory_utilization: 0.85
       trust_remote_code: true
     serve:
       startup_retries: 300
 
-env_defaults:
-  GEMS_VENDOR: "metax"
-  VLLM_PLUGINS: "fl"
-  MACA_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
-  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+# Features not supported on this platform.
+# Test cases whose model name contains any of these strings will be skipped.
+# Example: ["flaggems"] would skip "qwen3_flaggems" cases.
+unsupported_features: []
 
-c550:
-  name: "c550"
+zw810e:
+  name: "zw810e"
   tests:
     e2e:
       inference:
@@ -57,7 +54,6 @@ c550:
       serving:
         qwen3_6:
           - "35b_a3b_tp4_eager"
-          - "27b_tp4_graph"
     timeouts:
       e2e:
         serving: 180
@@ -68,6 +64,5 @@ c550:
       include: "*"
       exclude: []
     benchmark:
-      enabled: true
-      config_path: "tests/benchmarks/configs/smoke_metax.yaml"
-      smoke: ["serve"]
+      enabled: false
+      smoke: []
