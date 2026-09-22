@@ -127,27 +127,35 @@ def _initialize_fl_runtime(rank: int) -> None:
     patch_mm_encoder_attention()
     register_oot_ops()
 
-    if not fl_envs.USE_FLAGGEMS:
-        return
-
-    import flag_gems
+    from vllm_fl.flaggems_runtime import configure_flaggems
 
     whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-    should_record = rank == 0
-    common = {
-        "record": should_record,
-        "once": True,
-        "path": fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-    }
-    if whitelist:
-        logger.info("[FlagGems] Enable only the following ops: %s", whitelist)
-        flag_gems.only_enable(include=whitelist, **common)
-    elif blacklist:
-        logger.info("[FlagGems] Disable the following ops: %s", blacklist)
-        flag_gems.enable(unused=blacklist, **common)
-    else:
-        logger.info("[FlagGems] Enable all ops")
-        flag_gems.enable(**common)
+
+    def enable_flaggems(library):
+        import flag_gems
+
+        kwargs = dict(
+            record=rank == 0, once=True,
+            path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+        )
+        if library is not None:
+            kwargs["lib"] = library
+        if whitelist is not None:
+            flag_gems.only_enable(include=whitelist, **kwargs)
+        elif blacklist:
+            flag_gems.enable(unused=blacklist, **kwargs)
+        else:
+            flag_gems.enable(**kwargs)
+
+    mm_status = configure_flaggems(
+        enable_flaggems,
+        use_flaggems=fl_envs.USE_FLAGGEMS,
+        whitelist=whitelist,
+        blacklist=blacklist,
+    )
+    logger.info(
+        "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
+    )
 
 
 _NATIVE_RUNNER_IO_METHODS = ("execute_model", "sample_tokens", "pool")
