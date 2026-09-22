@@ -6,6 +6,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -125,6 +126,15 @@ def main():
             "architecture": "DeepseekV41FlashFLForCausalLM",
             "checkpoint_read_only": True,
             "payload_hash_coverage": "config, index and shard headers; not complete payload",
+            "quantization_contract": {
+                "expert_weights": "E2M1 K-adjacent nibble pairs; per-row K=32 UE8M0 scales",
+                "fp8_weights": "E4M3; 32x32 blocks with UE8M0 scales",
+                "linear_compute": "preserved per-32 E4M3 activation rounding; BF16 dot and FP32 scaled accumulation",
+                "native_fp4_gemm": False,
+                "native_fp8_gemm": False,
+                "cache": "quantization rounding retained in BF16 request-state storage",
+                "packed_indexer_connected": False,
+            },
         },
         "validation": {
             "hardware": "8x NVIDIA H100 80GB",
@@ -160,16 +170,21 @@ def main():
         "full-model-smoke.json",
         "full-model-smoke.log",
         "installed-audit.json",
+        "smoke-install-audit.json",
+        "smoke-source-manifest.json",
         "plugin-foundation-regression.log",
         "sampling-contract-tests.log",
+        "reference-probe-tests.log",
         "flaggems-new-operators.log",
         "mxfp4-moe-clamp-tests.log",
         "real-expert-tp1.json",
         "real-expert-tp8-rank7.json",
         "published-reference-ops.json",
+        "published-reference-ops.log",
         "vllm-empty-build.log",
         "plugin-final-build.log",
         "flaggems-final-build.log",
+        "offline-rebuild.log",
     ]
     for name in required:
         shutil.copy2(work / "evidence" / name, out / "evidence" / name)
@@ -186,6 +201,52 @@ def main():
     manifest["validation"]["reference_graph_differential"] = bool(
         smoke.get("reference_differential")
     )
+    differential = smoke["reference_differential"]
+    if (
+        len(differential) != smoke["tp"]
+        or {row["rank"] for row in differential} != set(range(smoke["tp"]))
+        or any(
+            not row["top1_equal"]
+            or not math.isfinite(row["relative_rms"])
+            or row["relative_rms"] > 0.03
+            for row in differential
+        )
+    ):
+        raise RuntimeError("distributed reference comparison is incomplete or failed")
+    boundary = smoke.get("window_boundary_differential", [])
+    for case in (differential, boundary):
+        if {row["rank"] for row in case} != set(range(smoke["tp"])):
+            raise RuntimeError("missing reference ranks or boundary case")
+        for row in case:
+            if (
+                not row.get("passed")
+                or not row.get("repeated_logits_equal")
+                or len(row.get("decode", [])) != 4
+            ):
+                raise RuntimeError("reference repeat/decode acceptance is incomplete")
+            if any(not step["passed"] for step in row["decode"]):
+                raise RuntimeError("cached decode differential failed")
+    if any(row["prompt_tokens"] <= 128 for row in boundary):
+        raise RuntimeError("the boundary comparison did not cross the attention window")
+    model_sources = json.loads(
+        (out / "evidence/smoke-source-manifest.json").read_text()
+    )["source_sha256"]
+    model_install = json.loads((out / "evidence/smoke-install-audit.json").read_text())
+    runtime_prefixes = ("vllm/vllm/", "plugin/vllm_fl/", "FlagGems/src/flag_gems/")
+    current_runtime = {
+        key: value
+        for key, value in hashes.items()
+        if key.startswith(runtime_prefixes) and key.endswith(".py")
+    }
+    tested_runtime = {
+        key: value
+        for key, value in model_sources.items()
+        if key.startswith(runtime_prefixes) and key.endswith(".py")
+    }
+    if current_runtime != tested_runtime:
+        raise RuntimeError("runtime source changed since the whole-model run; rerun it")
+    manifest["validation"]["full_model_package_versions"] = model_install["packages"]
+    manifest["validation"]["runtime_source_identical_to_model_test"] = True
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (out / "image/deployment-manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"

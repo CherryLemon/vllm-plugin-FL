@@ -10,10 +10,10 @@ import torch
 
 
 def dense_linear(x, weight):
-    import flag_gems
-
-    out = flag_gems.mm(x.reshape(-1, x.shape[-1]), weight.T)
-    return out.reshape(*x.shape[:-1], weight.shape[0])
+    # Preserve the published reduction for unquantized mHC, compressor and
+    # head projections. Small changes amplify at subsequent quantization ties.
+    # This is an explicit reference composition, not a silent dispatch fallback.
+    return torch.nn.functional.linear(x, weight)
 
 
 def lowp_linear(x, weight, scale):
@@ -70,7 +70,7 @@ def sparse_attn(*args):
 
 
 def hc_split_sinkhorn(*args):
-    from flag_gems.fused.mhc.hc_split_sinkhorn import hc_split_sinkhorn as op
+    from flag_gems.fused.dsv41_reference_ops import hc_split_sinkhorn_reference as op
 
     return op(*args)
 
@@ -79,13 +79,13 @@ EXECUTION_PROFILE = {
     "name": "fl_dsv41_eager_reference_v1",
     "flaggems": [
         "block_scaled_lowp_linear",
-        "mm",
         "act_quant_triton",
         "fp4_quantize_reference",
         "sparse_attention_with_sink",
-        "hc_split_sinkhorn",
+        "hc_split_sinkhorn_reference",
     ],
     "torch_reference": [
+        "unquantized projections (mHC, compressor and head)",
         "routing/topk",
         "indexer einsum and score rounding",
         "RoPE",

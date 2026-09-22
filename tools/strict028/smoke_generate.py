@@ -62,15 +62,17 @@ def main():
         }
         for r in result
     ]
-    if repeated[0].outputs[0].token_ids != result[0].outputs[0].token_ids:
-        raise AssertionError("repeated request changed greedy output after cache reuse")
+    repeat_equal = repeated[0].outputs[0].token_ids == result[0].outputs[0].token_ids
     report = {
-        "status": "reference_pending" if args.reference_probe else "passed",
+        "status": "reference_pending"
+        if args.reference_probe
+        else ("passed" if repeat_equal else "failed"),
         "profile": "fl_dsv41_eager_reference_v1",
         "tp": args.tp,
         "load_seconds": loaded - begin,
         "total_seconds": time.monotonic() - begin,
-        "repeat_request_equal": True,
+        "repeat_request_equal": repeat_equal,
+        "repeated_output_ids": repeated[0].outputs[0].token_ids,
         "reference_differential": differential,
         "outputs": rows,
         "scope": "text greedy generation and state reuse; not model-quality or performance acceptance",
@@ -82,9 +84,69 @@ def main():
             "fl_reference_differential", args=(prompts[0],)
         )
         report["reference_differential"] = differential
-        report["status"] = "passed"
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-        print(json.dumps({"reference_differential": differential}, indent=2))
+        boundary_prompt = tok.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": "请用一句话概括："
+                    + "人工智能可以帮助人们分析数据、理解语言和解决问题。" * 12,
+                }
+            ],
+            thinking=False,
+        )
+        if not 128 < len(boundary_prompt) <= 252:
+            raise AssertionError("boundary prompt must cross the 128-token window")
+        boundary_output = llm.generate(
+            [{"prompt_token_ids": boundary_prompt}],
+            SamplingParams(temperature=0, max_tokens=4),
+        )[0].outputs[0]
+        report["window_boundary_output"] = {
+            "prompt_tokens": len(boundary_prompt),
+            "output_ids": boundary_output.token_ids,
+            "text": boundary_output.text,
+            "finish_reason": boundary_output.finish_reason,
+        }
+        boundary = llm.collective_rpc(
+            "fl_reference_differential", args=(boundary_prompt,)
+        )
+        report["reference_differential"] = differential
+        report["window_boundary_differential"] = boundary
+        report["total_seconds"] = time.monotonic() - begin
+        report["status"] = (
+            "passed"
+            if repeat_equal and all(row["passed"] for row in differential + boundary)
+            else "failed"
+        )
+        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        print(
+            json.dumps(
+                {
+                    "status": report["status"],
+                    "reference_cases": [
+                        {
+                            "prompt_tokens": case[0]["prompt_tokens"],
+                            "prefill_max_relative_rms": max(
+                                r["relative_rms"] for r in case
+                            ),
+                            "decode_max_relative_rms": max(
+                                s["relative_rms"] for r in case for s in r["decode"]
+                            ),
+                        }
+                        for case in (differential, boundary)
+                    ],
+                },
+                indent=2,
+            )
+        )
+        if report["status"] != "passed":
+            raise AssertionError(
+                f"whole-graph differential failed; diagnostics: {args.output}"
+            )
+    elif not repeat_equal:
+        raise AssertionError(
+            f"repeated request changed greedy output; diagnostics: {args.output}"
+        )
 
 
 if __name__ == "__main__":

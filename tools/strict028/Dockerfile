@@ -18,6 +18,8 @@ ENV PATH="/opt/fl-venv/bin:${PATH}" \
     VLLM_FL_STRICT028=1 \
     VLLM_PLUGINS=fl \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    VLLM_ENGINE_READY_TIMEOUT_S=1800 \
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
     OMP_NUM_THREADS=4
 RUN /opt/fl-venv/bin/python -c "import importlib.util; from vllm_fl.strict028.bootstrap import validate_host; validate_host(); assert importlib.util.find_spec('vllm._C') is None; assert importlib.util.find_spec('vllm._C_stable_libtorch') is None"
 ENTRYPOINT ["/opt/fl-venv/bin/vllm", "serve"]

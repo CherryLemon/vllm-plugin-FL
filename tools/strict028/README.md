@@ -46,6 +46,8 @@ and mounts the checkpoint read-only. The example requires eight homogeneous H100
 80GB GPUs, Eager execution and greedy sampling (`temperature: 0`). Send short
 text requests within the configured 256-token total context. Cold kernel
 compilation runs during startup and may take several minutes.
+The image allows 1,800 seconds for engine readiness to cover the 510GB checkpoint
+load and cold kernel compilation; this is not a request latency target.
 
 This is a reference integration profile. Consult `reports/migration.md` and
 `reports/operator-optimization-handoff.md` for measured coverage and pending

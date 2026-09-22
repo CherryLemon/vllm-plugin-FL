@@ -1,10 +1,11 @@
 # DeepSeek V4.1 / unmodified vLLM 0.28 migration
 
-Status: implementation in progress. The current milestone validates the empty-build
+Status: Eager reference migration. The current milestone validates the empty-build
 boundary, plugin merge, metadata, tokenizer, streaming whole-model loader, independent Worker/Runner,
 request-state cache and selected FlagGems operators. Eight-rank whole-model
-generation and request-state reuse have passed; whole-graph numerical comparison
-is undergoing acceptance. PD, MTP, multimodal serving and non-NVIDIA execution are
+generation, request-state reuse and published-reference numerical comparison
+have passed in development. Delivery is gated on repeating these checks from
+normally installed wheels. PD, MTP, multimodal serving and non-NVIDIA execution are
 not yet validated.
 
 ## Pinned sources
@@ -16,7 +17,7 @@ not yet validated.
 - Merge main `fd5c727fcdb607bc4354cd11384761bb5d5ecfba`, then PR 544
   `27e798a577622d872f26917105132495b229b851`; merge result `29a0edb`.
 - FlagGems base: `54b28861639fc5df9367aaf3bc8d062efb4f16f7`; implementation
-  `89d5917dea7bd99565427cca58e93584c5496bd5`.
+  `313b4fdd5a2118debcae17089cfb36bee6cc9cea`.
 - Semantic source: CherryLemon/vllm `a9e3d217cce075c77a8041d14dd822307953735e`
   and checkpoint inference code at claimed revision `dba1be0a40aa45a94ad051997016db3960a90277`.
 - Official image supplies Torch `2.13.0+cu129`, Triton `3.7.1`.
@@ -50,11 +51,17 @@ No host source patch, module stub or registry dictionary write is used.
   TP=8/rank=7 shard, 3 cases each, including active clamp; max absolute error 0.
   These are component/shard checks, not an eight-rank distributed model run.
 - Tokenizer: 32 reference cases; actual local tokenizer prompt/EOS checked.
-- New FP4 cache rounding and sparse attention/sink: 10 independent/graph cases;
-  9 additional published TileLang cases. Quantized bytes/scales agree exactly;
-  tested sparse-attention maximum absolute error is 0.0009765625.
+- FP4 cache rounding, sparse attention/sink and precise mHC: 22 independent,
+  repeat and graph cases; 12 additional published TileLang cases. Quantized
+  bytes/scales and tested mHC coefficients agree exactly; the random sparse
+  attention comparison has maximum absolute error 0.0001220703125.
 - Plugin foundation and state regression: 123 passing tests; greedy sampling
-  admission: 10 tests. FlagGems new-operator suite: 57 tests.
+  admission: 10 tests; aliased reference-buffer regression: 1 test.
+  FlagGems new-operator suite: 69 tests.
+- Published whole-graph comparison on eight ranks: 12- and 141-token prefill,
+  followed by four cached decode steps each. All 40 layer outputs, routing
+  selections and final logits matched exactly; repeated logits were identical.
+  The longer case crosses the 128-token sliding window.
 - Real TP=8 Eager generation: two interleaved prompts and an identical repeated
   request passed. The arithmetic answer was `2` followed by the real EOS token.
   This is a generation/state-reuse check, not a model-quality assessment.
@@ -79,8 +86,9 @@ Component tests used source snapshots during development. Normal wheels have
 now been built and installed in the isolated environment without `PYTHONPATH`.
 The install audit verifies 2,238 host, 252 plugin and 3,393 FlagGems Python files
 against the frozen sources, confirms no host device extension is active and
-confirms host Worker methods are unchanged by importing FlagGems. A final
-installed-wheel whole-model run and image receipt are still pending.
+confirms host Worker methods are unchanged by importing FlagGems. Delivery
+contains the installed-wheel whole-model receipt, exact tested package versions
+and a separate fresh-image audit. The image audit is not itself a model run.
 
 ## Eager reference profile
 
@@ -94,6 +102,11 @@ includes Engram and loads vision weights; the serving interface currently
 accepts text only. Its principal low-precision GEMMs, cache rounding, sparse
 attention and Sinkhorn call FlagGems explicitly. Other reference compositions
 are enumerated by `EXECUTION_PROFILE` in the model's `ops.py`.
+Unquantized mHC/compressor/head projections retain Torch `F.linear`. The Hopper
+atomic Split-K reduction caused repeat instability, and even deterministic
+rounding changes amplified through BF16 and expert routing. The Worker enables
+deterministic algorithms. Precise Sinkhorn and sparse attention preserve the
+published arithmetic association, not just a loose per-operator tolerance.
 
 Routed experts use contiguous EP ownership within the homogeneous TP group;
 heads/projections/embedding use TP. Huge Engram tables stream in bounded CPU
@@ -114,8 +127,7 @@ requests. This does not establish long-context support or a performance SLO.
 
 ## Remaining integration work
 
-Finish whole-model numerical acceptance, rebuild normal wheel
-installs and audit the final runtime. Replace declared Torch compositions and
+Replace declared Torch compositions with separately validated operators and
 connect the packed Indexer to the graph. Bounded long-context top-k, paged
 layouts, prefix/chunked-prefill, graph, PD, MTP, multimodal serving and non-NVIDIA
 execution each require separate implementation and acceptance.
@@ -130,15 +142,16 @@ throughput, bounded long-context workspace or cross-chip portability.
 | Plan milestone | Current evidence | Open acceptance |
 |---|---|---|
 | P0: unchanged host and environment | Official 0.28.0 empty wheel; independent public registrations; checkpoint audit; normal installed source/Worker audit | One preferred non-NVIDIA SKU and its compatible software stack |
-| P1: full reference model | Complete real weight loading, Engram, TP/EP, Eager generation and repeated-request equality | Final distributed published-reference comparison |
-| P2: FlagGems main path | Explicit low-precision linear, sparse attention, FP4 rounding, MM and Sinkhorn; packed Indexer and clamp component tests | Connect packed Indexer; replace declared Torch compositions; operator profiling/tuning |
+| P1: full reference model | Complete real weight loading, Engram, TP/EP, Eager generation, request reuse, prefill/decode layer/logit comparisons | Broader quality and workload coverage |
+| P2: FlagGems main path | Explicit low-precision linear, sparse attention, FP4 rounding and Sinkhorn; packed Indexer and clamp component tests | Connect packed Indexer; replace declared Torch compositions; operator profiling/tuning |
 | P3: parallel and PD | Homogeneous single-node TP=8 with local expert ownership; complete scheduler-owned request-state pages | DP/PP/CP, paged/chunked/prefix state, external PD connector and failure injection |
 | P4: performance features | Standalone operator graph replay checks only | Serving graph, MTP/DSpark, group-6 integration, overlap and SLO comparison |
-| P5: production release | Reproducible wheels, build/deployment tooling and optimization handoff in preparation | Target-SKU acceptance, stress/quality/performance and rollback exercise |
+| P5: production release | Reproducible wheels, build/deployment tooling, install/image audits and optimization handoff | Target-SKU acceptance, stress/quality/performance and rollback exercise |
 
 Only the eight-H100 text configuration has a real-model execution receipt. The
-256-token number is the allocated context limit of that test, not a tested
-256-token prompt or long-context capacity result. Two requests are interleaved
+256-token number is the allocated context limit; the longest reference case is
+141 prompt tokens plus four decode steps. This is not a long-context capacity
+result. Two requests are interleaved
 by the host scheduler and executed serially inside the reference Runner.
 TP=1/2/4 remain admitted shapes but have no whole-model capacity/collective
 acceptance on this machine. FP16-only devices have not been admitted.

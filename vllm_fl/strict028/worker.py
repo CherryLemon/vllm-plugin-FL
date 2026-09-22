@@ -3,11 +3,13 @@
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -140,6 +142,10 @@ class ModelRunnerFL028:
 
 class WorkerFL028(WorkerBase):
     def init_device(self):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        # Atomic FP32 Split-K changes mHC mixes between identical requests. The
+        # small rounding differences amplify through BF16 residuals and routing.
+        torch.use_deterministic_algorithms(True)
         self.device = torch.device("cuda", self.local_rank)
         torch.cuda.set_device(self.device)
         torch.manual_seed(self.model_config.seed)

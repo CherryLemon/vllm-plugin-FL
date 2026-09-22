@@ -11,6 +11,7 @@ manifest. No optimization owner or external tracking issue has been assigned.
 | `mxfp4_paged_index_logits`, `mxfp4_workspace_index_logits` | `fused/DSA/mxfp4_mqa_logits.py` | 21 mask/layout/group-6 cases | Standalone operator; not yet selected by the Eager graph | Bounded workspace and fused top-k; backend-specific launches |
 | `fp4_quantize_reference` | `fused/dsv41_reference_ops.py` | Independent packing/rounding cases and published TileLang byte equality for both scale formats | Explicit indexer and compressed-KV rounding | Fused RoPE, packing and cache writes; non-NVIDIA conversion lowering |
 | `sparse_attention_with_sink` | `fused/dsv41_reference_ops.py` | Independent Torch and published TileLang, including empty rows and multiple sparse blocks | Explicit sparse attention in the Eager graph | Split reduction/parallel decode, paged storage and vendor tuning |
+| `hc_split_sinkhorn_reference` | `fused/dsv41_reference_ops.py` | 12 independent/repeat cases and 3 published TileLang exact cases | Explicit four-stream mHC | Retain precise exp/div, fused affine arithmetic and butterfly reduction when optimizing |
 | Marlin MXFP4 clamp extension | `fused/fused_marlin_moe.py` | 8 BF16/FP16 clamp/empty-token cases | Separate W4A16 component, not the V4.1 reference expert contract | Fuse clamp with preserved rounding; add activation-quantization/expert mapping contracts before using for V4.1 |
 
 ## Contracts and acceptance
@@ -50,6 +51,17 @@ unnormalized probabilities round to BF16 before PV, matching the published
 reference. Workspace does not allocate a dense Q×KV matrix. D=64/128/256/512
 and at most 64 local heads are admitted; tested shapes are in the evidence.
 Priority P1: validate reduction/sink equivalence after split or paged rewrites.
+The 16-head path preserves adjacent-pair, eight-group, then four-pair summation.
+PV accumulates directly into the rescaled FP32 accumulator across sparse blocks.
+Precise exponentials/division and the published sink normalization are required:
+even a single BF16 rounding difference can affect subsequent quantization.
+
+The original Hopper atomic FP32 Split-K path caused repeat-request differences.
+Worker initialization enables deterministic algorithms and a cuBLAS workspace.
+Unquantized mHC/compressor/head projections explicitly retain Torch `F.linear`:
+both FP32 reduction changes and BF16 compressor rounding were observed to amplify
+through the graph. These projections are pending FlagGems integration. The
+quantized dense/expert projections remain on `block_scaled_lowp_linear`.
 
 The Marlin extension preserves its existing W4A16 contract. It does not acquire
 FP8 activation semantics merely because clamp is now available. Its Hopper
@@ -65,7 +77,7 @@ establish distributed graph correctness. Throughput and long-context SLOs are
 not measured.
 
 The FL Eager graph explicitly records Torch reference compositions for
-Indexer/top-k, routing, Engram, RoPE, norms/residuals, compressor softmax,
+unquantized projections, Indexer/top-k, routing, Engram, RoPE, norms/residuals, compressor softmax,
 FP8-cache dequantization and vision. These are open migration items, not silent
 fallbacks. The production tuning path must replace them deliberately and retain
 the real-checkpoint layer/logit differential.

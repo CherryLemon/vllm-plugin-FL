@@ -24,22 +24,24 @@ def copy_reference_buffers(source, target):
 
 
 def reference_differential(worker, prompt_ids):
-    """Run the published graph on shared immutable weights, independent buffers.
+    """Compare published prefill and cached decode on shared immutable weights.
 
-    RPC transports only scalar diagnostics. No vLLM function is replaced and no
-    second copy of the 500GB checkpoint is made. Meta construction avoids a
-    transient full duplicate of every weight; all derived buffers are copied
-    from the equivalent graph after reset and recorded as this probe's scope.
+    The reference is constructed on meta to avoid duplicating the 500GB weights.
+    Every static/state buffer is independently materialized from the reset graph.
+    This probe observes the installed implementation; it changes no operator
+    bindings, backend settings or vLLM objects. RPC returns scalar diagnostics.
     """
     import dataclasses
     import hashlib
     import importlib.util
+    import math
     import sys
 
     import torch
     from transformers import AutoTokenizer
 
     model = worker.get_model()
+    state = worker.model_runner.state
     source_dir = Path(worker.model_config.model) / "inference"
     sys.path.insert(0, str(source_dir))
     try:
@@ -52,9 +54,7 @@ def reference_differential(worker, prompt_ids):
     finally:
         sys.path.remove(str(source_dir))
     args = dataclasses.asdict(model.args)
-    args["dspark_block_size"] = (
-        0  # The published generation loop also does not call MTP.
-    )
+    args["dspark_block_size"] = 0
     tok = AutoTokenizer.from_pretrained(
         worker.model_config.model, local_files_only=True
     )
@@ -65,7 +65,7 @@ def reference_differential(worker, prompt_ids):
     for module in golden.modules():
         if isinstance(module, reference.Linear) and module.scale is not None:
             module.weight.scale = module.scale
-    worker.model_runner.state.bind(0, reset=True)
+    state.bind(0, reset=True)
     copy_reference_buffers(model.core, golden)
     captured = {}
     handles = []
@@ -73,20 +73,70 @@ def reference_differential(worker, prompt_ids):
     def capture(tag):
         def hook(module, inputs, output):
             captured[tag] = output[0].detach().clone()
+            captured[tag + "_mix"] = output[1].detach().clone()
 
         return hook
 
-    for number in (0, 1, 2, 14, 20, 39):
-        handles.append(
-            model.core.layers[number].register_forward_hook(capture(f"fl_{number}"))
-        )
-        handles.append(
-            golden.layers[number].register_forward_hook(capture(f"ref_{number}"))
-        )
+    def capture_router(tag):
+        def hook(module, inputs, output):
+            captured[tag] = output[1].detach().clone()
+
+        return hook
+
+    for number in range(len(model.core.layers)):
+        for prefix, core in (("fl", model.core), ("ref", golden)):
+            handles.append(
+                core.layers[number].register_forward_hook(capture(f"{prefix}_{number}"))
+            )
+            handles.append(
+                core.layers[number].ffn.gate.register_forward_hook(
+                    capture_router(f"{prefix}_route_{number}")
+                )
+            )
+
+    def rrms(a, b):
+        return (
+            (a.float() - b.float()).square().mean().sqrt()
+            / b.float().square().mean().sqrt().clamp_min(1e-30)
+        ).item()
+
+    def layer_diagnostics():
+        diagnostics = {}
+        for number in range(len(model.core.layers)):
+            a, e = captured[f"fl_{number}"], captured[f"ref_{number}"]
+            routes_a = torch.sort(captured[f"fl_route_{number}"], dim=-1).values
+            routes_e = torch.sort(captured[f"ref_route_{number}"], dim=-1).values
+            diagnostics[str(number)] = {
+                "max_abs": (a.float() - e.float()).abs().max().item(),
+                "relative_rms": rrms(a, e),
+                "last_token_relative_rms": rrms(a[:, -1], e[:, -1]),
+                "mix_relative_rms": rrms(
+                    captured[f"fl_{number}_mix"], captured[f"ref_{number}_mix"]
+                ),
+                "router_different_sets": int(
+                    (routes_a != routes_e).any(-1).sum().item()
+                ),
+            }
+        return diagnostics
+
+    def logits_diagnostics(actual, expected):
+        relative = rrms(actual, expected)
+        top_match = torch.equal(actual.argmax(-1), expected.argmax(-1))
+        return {
+            "passed": math.isfinite(relative) and relative <= 0.03 and top_match,
+            "relative_rms": relative,
+            "max_abs": (actual.float() - expected.float()).abs().max().item(),
+            "top1_equal": top_match,
+            "top1_id": actual.argmax(-1).item(),
+            "layers": layer_diagnostics(),
+        }
+
     try:
         ids = torch.tensor(prompt_ids, device=worker.device, dtype=torch.long).view(
             1, -1
         )
+        if ids.shape[1] + 4 > model.args.max_seq_len:
+            raise ValueError("reference probe requires room for four decode tokens")
         with (
             torch.inference_mode(),
             torch.device(worker.device),
@@ -94,39 +144,49 @@ def reference_differential(worker, prompt_ids):
         ):
             actual = model(ids, start_pos=0)
             _, expected, _ = golden(ids, 0)
-        diagnostics = {}
-        for number in (0, 1, 2, 14, 20, 39):
-            a, e = captured[f"fl_{number}"].float(), captured[f"ref_{number}"].float()
-            diagnostics[str(number)] = {
-                "max_abs": (a - e).abs().max().item(),
-                "relative_rms": (
-                    (a - e).square().mean().sqrt() / e.square().mean().sqrt()
-                ).item(),
+            report = logits_diagnostics(actual, expected)
+            state.bind(0, reset=True)
+            repeated = model(ids, start_pos=0)
+            repeat_equal = torch.equal(actual, repeated)
+            # Reinitialize both graphs before walking identical teacher-forced
+            # decode tokens. State page 0 is reserved and never a live request.
+            state.bind(0, reset=True)
+            copy_reference_buffers(model.core, golden)
+            model(ids, start_pos=0)
+            _, expected_step, _ = golden(ids, 0)
+            decode = []
+            for step in range(4):
+                position = ids.shape[1] + step
+                token = expected_step.argmax(-1).view(1, 1)
+                state.bind(0, reset=False)
+                actual_step = model(token, start_pos=position)
+                _, expected_step, _ = golden(token, position)
+                decode.append(
+                    {
+                        "position": position,
+                        **logits_diagnostics(actual_step, expected_step),
+                    }
+                )
+        report.update(
+            {
+                "passed": report["passed"]
+                and repeat_equal
+                and all(row["passed"] for row in decode),
+                "rank": worker.rank,
+                "prompt_tokens": len(prompt_ids),
+                "repeated_logits_equal": repeat_equal,
+                "decode": decode,
+                "reference_model_sha256": hashlib.sha256(
+                    (source_dir / "model.py").read_bytes()
+                ).hexdigest(),
+                "scope": "real-weight prefill and four cached decode steps; shared immutable weights and equivalent static buffers",
             }
-        error = actual.float() - expected.float()
-        relative = (
-            error.square().mean().sqrt() / expected.float().square().mean().sqrt()
-        ).item()
-        top_match = actual.argmax(-1).tolist() == expected.argmax(-1).tolist()
-        if relative > 0.03 or not top_match:
-            raise AssertionError(
-                f"whole-graph differential failed: relative_rms={relative}, top1={top_match}, layers={diagnostics}"
-            )
-        return {
-            "rank": worker.rank,
-            "relative_rms": relative,
-            "max_abs": error.abs().max().item(),
-            "top1_equal": top_match,
-            "top1_id": actual.argmax(-1).item(),
-            "layers": diagnostics,
-            "reference_model_sha256": hashlib.sha256(
-                (source_dir / "model.py").read_bytes()
-            ).hexdigest(),
-            "scope": "real-weight prefill graph; shared immutable weights and equivalent static buffers",
-        }
+        )
+        return report
     finally:
         for handle in handles:
             handle.remove()
+        state.bind(0, reset=True)
         del golden
         captured.clear()
         torch.cuda.empty_cache()

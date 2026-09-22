@@ -18,13 +18,16 @@ for relative, expected in manifest['source_sha256'].items():
     if actual!=expected:
         raise RuntimeError(f'Source integrity mismatch: {relative}')
 PY
-mkdir -p "$task_root/wheels"
+mkdir -p "$task_root/wheels" "$task_root/evidence"
 cd "$task_root/vllm"
 VLLM_TARGET_DEVICE=empty SETUPTOOLS_SCM_PRETEND_VERSION=0.28.0 \
-  uv build --wheel --no-build-isolation --python "$host_python" --out-dir "$task_root/wheels"
+  uv build --wheel --no-build-isolation --python "$host_python" --out-dir "$task_root/wheels" \
+  2>&1 | tee "$task_root/evidence/vllm-empty-build.log"
 cd "$task_root/FlagGems"
 SETUPTOOLS_SCM_PRETEND_VERSION="${FL_GEMS_VERSION:?set the pinned FlagGems artifact version}" \
-  uv build --wheel --no-build-isolation --python "$gems_python" --out-dir "$task_root/wheels"
+  uv build --wheel --no-build-isolation --python "$gems_python" --out-dir "$task_root/wheels" \
+  2>&1 | tee "$task_root/evidence/flaggems-final-build.log"
 cd "$task_root/plugin"
 SETUPTOOLS_SCM_PRETEND_VERSION="${FL_PLUGIN_VERSION:?set the pinned plugin artifact version}" \
-  uv build --wheel --no-build-isolation --python "$host_python" --out-dir "$task_root/wheels"
+  uv build --wheel --no-build-isolation --python "$host_python" --out-dir "$task_root/wheels" \
+  2>&1 | tee "$task_root/evidence/plugin-final-build.log"

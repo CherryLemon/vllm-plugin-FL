@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 from flag_gems.fused.dsv41_reference_ops import (
     fp4_quantize_reference,
+    hc_split_sinkhorn_reference,
     sparse_attention_with_sink,
 )
 
@@ -29,6 +30,17 @@ def main():
     sys.modules[spec.name] = reference
     spec.loader.exec_module(reference)
     records = []
+    for rows in (1, 7, 33):
+        mixes = torch.randn(1, rows, 24, dtype=torch.float32, device="cuda") * 4
+        scales = torch.randn(3, dtype=torch.float32, device="cuda")
+        bases = torch.randn(24, dtype=torch.float32, device="cuda")
+        actual = hc_split_sinkhorn_reference(mixes, scales, bases)
+        expected = reference.hc_split_sinkhorn(mixes, scales, bases)
+        for a, e in zip(actual, expected):
+            torch.testing.assert_close(a, e, atol=0, rtol=0)
+        records.append(
+            {"op": "hc_split_sinkhorn_reference", "rows": rows, "max_abs_error": 0}
+        )
     for group, sfmt in ((32, "e8m0"), (16, "e4m3")):
         sdtype = torch.float8_e8m0fnu if sfmt == "e8m0" else torch.float8_e4m3fn
         for rows in (1, 7, 33):
