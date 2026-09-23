@@ -194,6 +194,11 @@ def reference_differential(worker, prompt_ids):
 
 
 class ReferenceProbeExtension:
+    def fl_tp_stats(self):
+        from .collectives import tp_collective_stats
+
+        return {"rank": self.rank, **tp_collective_stats()}
+
     def fl_reference_differential(self, prompt_ids):
         if isinstance(prompt_ids, str):
             import json

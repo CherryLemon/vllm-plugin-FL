@@ -14,6 +14,7 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from .cache import RequestState
+from .collectives import init_tp_collectives, requested_backend
 from .model_loader import FLDeepseekV41Loader
 from .sampling import validate_sampling
 
@@ -186,14 +187,20 @@ class WorkerFL028(WorkerBase):
         torch.cuda.set_device(self.device)
         torch.manual_seed(self.model_config.seed)
         torch.backends.cuda.matmul.allow_tf32 = False
+        tp_backend = requested_backend()
         if self.parallel_config.world_size > 1:
-            dist.init_process_group(
-                "nccl",
+            pg_kwargs = dict(
                 init_method=self.distributed_init_method,
                 rank=self.rank,
                 world_size=self.parallel_config.world_size,
-                device_id=self.device,
             )
+            if tp_backend == "flagcx":
+                # Gloo carries the FlagCX unique ID; device tensors use FlagCX.
+                dist.init_process_group("gloo", **pg_kwargs)
+            else:
+                dist.init_process_group("nccl", device_id=self.device, **pg_kwargs)
+        init_tp_collectives(self.device)
+        logger.warning("FL rank %d TP collective backend: %s", self.rank, tp_backend)
 
     def load_model(self, *, load_dummy_weights=False):
         if load_dummy_weights:

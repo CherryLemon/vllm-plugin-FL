@@ -40,7 +40,11 @@ class PlatformFL028(Platform):
     device_name = "cuda"
     device_type = "cuda"
     dispatch_key = "CUDA"
-    dist_backend = "nccl"
+    dist_backend = (
+        "gloo"
+        if os.environ.get("VLLM_FL_TP_BACKEND", "nccl").lower() == "flagcx"
+        else "nccl"
+    )
     ray_device_key = "GPU"
     device_control_env_var = "CUDA_VISIBLE_DEVICES"
     torch_device_fn = torch.cuda

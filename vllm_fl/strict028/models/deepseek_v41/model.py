@@ -25,6 +25,7 @@ from .ops import (
     sparse_attn,
 )
 from .vision import Aligner, ViT
+from vllm_fl.strict028.collectives import all_gather_last, all_reduce_
 
 # Set once by Transformer.__init__; one model per process, so layers just read them.
 world_size = 1
@@ -190,7 +191,7 @@ class ParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if world_size > 1:
             y[mask] = 0
-            dist.all_reduce(y)
+            all_reduce_(y)
         return y
 
 
@@ -291,7 +292,7 @@ class RowParallelLinear(Linear):
         y = linear(x, self.weight, None)
         if world_size > 1:
             y = y.float()
-            dist.all_reduce(y)
+            all_reduce_(y)
         if self.bias is not None:
             y += self.bias
         return y.type_as(x)
@@ -348,7 +349,7 @@ class ParallelEngramEmbedding(nn.Module):
         values = values.masked_fill(mask.unsqueeze(-1), 0)
 
         if world_size > 1:
-            dist.all_reduce(values)
+            all_reduce_(values)
         return values
 
 
@@ -640,7 +641,7 @@ class Indexer(torch.nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
-            dist.all_reduce(index_score)
+            all_reduce_(index_score)
 
         # how many compressed positions each query can see: a block becomes visible once the query
         # has passed its last token. One query per decode step, so there it is just a number.
@@ -1020,7 +1021,7 @@ class MoE(nn.Module):
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx], weights[idx, top, None])
         if world_size > 1:
-            dist.all_reduce(y)
+            all_reduce_(y)
         y += self.shared_experts(x)
         return y.type_as(x).view(shape)
 
@@ -1156,9 +1157,7 @@ class ParallelHead(nn.Module):
             x = x[:, -1]
         logits = dense_linear(x.float(), self.weight)
         if world_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
-            dist.all_gather(all_logits, logits)
-            logits = torch.cat(all_logits, dim=-1)
+            logits = all_gather_last(logits)
         return logits
 
 
