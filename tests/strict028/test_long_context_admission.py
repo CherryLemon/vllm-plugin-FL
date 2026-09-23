@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm  # noqa: F401 - initialize the host before importing its plugin platform
+
 from vllm_fl.strict028.platform import PlatformFL028
 
 

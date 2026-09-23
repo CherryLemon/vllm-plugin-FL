@@ -1155,6 +1155,19 @@ class Block(nn.Module):
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor):
         """Collapse the hc copies into one, weighted by pre_mix. [b,s,hc,d] x [b,s,hc] -> [b,s,d]"""
+        if x.size(1) > 4096:
+            # A full 32K BF16 stream expands to several GiB in FP32. Keep the
+            # reduction order intact while bounding its temporary per slice.
+            y = torch.empty(
+                x.size(0), x.size(1), x.size(3), device=x.device, dtype=x.dtype
+            )
+            for begin in range(0, x.size(1), 256):
+                end = min(begin + 256, x.size(1))
+                y[:, begin:end] = torch.sum(
+                    pre_mix[:, begin:end].unsqueeze(-1) * x[:, begin:end].float(),
+                    dim=2,
+                ).to(x.dtype)
+            return y
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2)
         return y.to(x.dtype)
 
@@ -1167,6 +1180,22 @@ class Block(nn.Module):
     ):
         """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
         x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]"""
+        if x.size(1) > 4096:
+            # The broadcast product [b,s,hc,hc,d] would exceed the H100's
+            # remaining memory at the 32K prompt. Slices preserve the original
+            # per-token arithmetic and only retain the BF16 result.
+            y = torch.empty_like(residual)
+            for begin in range(0, x.size(1), 256):
+                end = min(begin + 256, x.size(1))
+                y[:, begin:end] = (
+                    post[:, begin:end].unsqueeze(-1) * x[:, begin:end].unsqueeze(-2)
+                    + torch.sum(
+                        comb[:, begin:end].unsqueeze(-1)
+                        * residual[:, begin:end].unsqueeze(-2),
+                        dim=2,
+                    )
+                ).to(x.dtype)
+            return y
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
             comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2
         )
