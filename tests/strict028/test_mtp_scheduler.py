@@ -146,3 +146,31 @@ def test_batched_verification_masks_each_rejected_prefix_independently(monkeypat
     proposals = runner.take_draft_token_ids()
     assert proposals.req_ids == req_ids
     assert all(len(ids) == 5 for ids in proposals.draft_token_ids)
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_dp_rejection_or_idle_lane_keeps_remote_verification_aligned(monkeypatch, idle):
+    monkeypatch.setenv("VLLM_FL_DECODE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_FL_BATCHED_DECODE", "1")
+    runner = ModelRunnerFL028(Target(), NS(), "cpu")
+    runner.data_parallel = True
+    runner.graphs = BatchedOracle()
+    output = NS(num_scheduled_tokens={}, scheduled_spec_decode_tokens={})
+    if not idle:
+        runner.requests["a"] = Request([10, 11, 12, 13], 1, 3)
+        output = scheduled([99, 99, 99, 99, 99])
+    local_activity = []
+    remote_activity = iter([True, True, True, False])
+
+    def control_reduce(flag, op):
+        assert flag.device.type == "cpu"
+        local_activity.append(bool(flag))
+        flag.fill_(next(remote_activity))
+
+    monkeypatch.setattr("vllm_fl.strict028.worker.dist.all_reduce", control_reduce)
+    result = runner.execute_decode_batch(output)
+    assert len(runner.graphs.calls) == 3
+    assert local_activity == ([False] * 4 if idle else [True, False, False, False])
+    assert result.sampled_token_ids == ([] if idle else [[14]])
+    assert runner.graphs.commits == ({} if idle else {1: [(3, 13)]})
+    assert runner.spec_stats["target_forward_calls"] == (0 if idle else 1)

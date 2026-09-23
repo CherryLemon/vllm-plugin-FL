@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -15,7 +16,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from .cache import RequestState
-from .collectives import init_tp_collectives, requested_backend
+from .collectives import init_tp_collectives, parallel_layout, requested_backend
 from .model_loader import FLDeepseekV41Loader
 from .pd_connector import DeepseekV41FLConnector
 from .sampling import validate_sampling
@@ -36,6 +37,7 @@ class ModelRunnerFL028:
         self.state = state
         self.device = device
         self.pd_enabled = pd_enabled
+        self.data_parallel = parallel_layout().data_size > 1
         self.requests = {}
         self.drafting_enabled = model.speculative_config is not None
         self.draft_token_ids = None
@@ -100,6 +102,10 @@ class ModelRunnerFL028:
                     "FL reference profile accepts token-only requests without LoRA"
                 )
             computed = item.num_computed_tokens
+            if self.data_parallel and computed == 0:
+                raise ValueError(
+                    "mixed-axis Decode requires a completed remote Prefill"
+                )
             if computed and (
                 not self.pd_enabled or computed != len(item.prompt_token_ids) - 1
             ):
@@ -174,9 +180,7 @@ class ModelRunnerFL028:
             ):
                 last_token = torch.tensor([generated[-1]], device=self.device)
                 if self.graph_enabled:
-                    result = self.graphs.draft(
-                        last_token, hidden, request.computed - 1
-                    )
+                    result = self.graphs.draft(last_token, hidden, request.computed - 1)
                 else:
                     result = self.model.propose_draft(
                         last_token, hidden, request.computed - 1
@@ -221,16 +225,29 @@ class ModelRunnerFL028:
                 or len(request.tokens) != request.computed + 1
             ):
                 raise ValueError(f"invalid scheduled decode span for {req_id}")
-        pages = torch.tensor([r.block for r in requests], device=self.device)
-        starts = torch.tensor([r.computed for r in requests], device=self.device)
-        inputs = torch.tensor([r.tokens[r.computed] for r in requests], device=self.device)
+        pages = torch.tensor(
+            [r.block for r in requests], device=self.device, dtype=torch.long
+        )
+        starts = torch.tensor(
+            [r.computed for r in requests], device=self.device, dtype=torch.long
+        )
+        inputs = torch.tensor(
+            [r.tokens[r.computed] for r in requests],
+            device=self.device,
+            dtype=torch.long,
+        )
         active_host = [True] * len(requests)
         active = torch.ones(len(requests), device=self.device, dtype=torch.bool)
         samples = [[] for _ in requests]
         last_hidden = None
         last_tokens = inputs.clone()
-        for offset in range(1 + max(map(len, drafts))):
-            if not any(active_host):
+        max_steps = (
+            (6 if self.drafting_enabled else 1)
+            if self.data_parallel
+            else 1 + max(map(len, drafts), default=0)
+        )
+        for offset in range(max_steps):
+            if not self.any_decode_active(any(active_host)):
                 break
             positions = torch.where(active, starts + offset, 0)
             logits, hidden = self.graphs.target_batch(inputs, pages, positions, active)
@@ -262,13 +279,19 @@ class ModelRunnerFL028:
                 self.spec_stats["draft_tokens"] += len(draft)
                 self.spec_stats["accepted_tokens"] += accepted
                 self.spec_stats["accepted_prefix_histogram"][accepted] += 1
-        if self.drafting_enabled:
-            can_draft = [r.computed + 5 <= self.model.args.max_seq_len for r in requests]
-            if any(can_draft):
+        if self.drafting_enabled and last_hidden is not None:
+            can_draft = [
+                r.computed + 5 <= self.model.args.max_seq_len for r in requests
+            ]
+            if any(can_draft) or self.data_parallel:
                 active.copy_(torch.tensor(can_draft, device=self.device))
                 positions = torch.tensor(
-                    [r.computed - 1 if enabled else 0 for r, enabled in zip(requests, can_draft)],
+                    [
+                        r.computed - 1 if enabled else 0
+                        for r, enabled in zip(requests, can_draft)
+                    ],
                     device=self.device,
+                    dtype=torch.long,
                 )
                 ids, logits, confidence = self.graphs.draft_batch(
                     last_tokens, last_hidden, pages, positions, active
@@ -281,15 +304,29 @@ class ModelRunnerFL028:
                 for i, (enabled, row) in enumerate(zip(can_draft, ids.tolist())):
                     if enabled:
                         if len(row) != 6 or row[0] != samples[i][-1]:
-                            raise ValueError("DSpark must return bonus plus five drafts")
+                            raise ValueError(
+                                "DSpark must return bonus plus five drafts"
+                            )
                         next_drafts[i] = row[1:]
                         self.spec_stats["draft_steps"] += 1
-        self.draft_token_ids = DraftTokenIds(req_ids, next_drafts) if self.drafting_enabled else None
+        self.draft_token_ids = (
+            DraftTokenIds(req_ids, next_drafts) if self.drafting_enabled else None
+        )
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={req: i for i, req in enumerate(req_ids)},
             sampled_token_ids=samples,
         )
+
+    def any_decode_active(self, local_active):
+        if not self.data_parallel:
+            return local_active
+        # EngineCore synchronizes DP iterations, but speculative rejection can
+        # stop different groups at different positions within one iteration.
+        # This control reduction keeps their EP kernel sequence aligned.
+        flag = torch.tensor(int(local_active), dtype=torch.int32, device="cpu")
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
 
 
 class WorkerFL028(WorkerBase):
@@ -299,23 +336,43 @@ class WorkerFL028(WorkerBase):
         # Atomic FP32 Split-K changes mHC mixes between identical requests. The
         # small rounding differences amplify through BF16 residuals and routing.
         torch.use_deterministic_algorithms(True)
+        parallel = self.parallel_config
+        if parallel.data_parallel_size > 1:
+            dp_local_rank = parallel.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel.data_parallel_index
+            self.local_rank += dp_local_rank * parallel.tensor_parallel_size
         self.device = torch.device("cuda", self.local_rank)
         torch.cuda.set_device(self.device)
         torch.manual_seed(self.model_config.seed)
         torch.backends.cuda.matmul.allow_tf32 = False
         tp_backend = requested_backend()
-        if self.parallel_config.world_size > 1:
+        world_size = parallel.world_size
+        init_method = self.distributed_init_method
+        if parallel.data_parallel_size > 1:
+            if tp_backend != "flagcx":
+                raise ValueError(
+                    "mixed-axis Decode currently requires FlagCX and Gloo control"
+                )
+            from vllm.utils.network_utils import get_distributed_init_method
+
+            self.rank += parallel.data_parallel_rank * world_size
+            world_size = parallel.world_size_across_dp
+            init_method = get_distributed_init_method(
+                parallel.data_parallel_master_ip, parallel.get_next_dp_init_port()
+            )
+        if world_size > 1:
             pg_kwargs = dict(
-                init_method=self.distributed_init_method,
+                init_method=init_method,
                 rank=self.rank,
-                world_size=self.parallel_config.world_size,
+                world_size=world_size,
             )
             if tp_backend == "flagcx":
                 # Gloo carries the FlagCX unique ID; device tensors use FlagCX.
                 dist.init_process_group("gloo", **pg_kwargs)
             else:
                 dist.init_process_group("nccl", device_id=self.device, **pg_kwargs)
-        init_tp_collectives(self.device)
+        init_tp_collectives(self.device, tensor_size=parallel.tensor_parallel_size)
         logger.warning("FL rank %d TP collective backend: %s", self.rank, tp_backend)
 
     def load_model(self, *, load_dummy_weights=False):
@@ -358,7 +415,12 @@ class WorkerFL028(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def execute_dummy_batch(self):
-        # DP is disabled and there are no unmatched rank-local collectives.
+        if self.model_runner.data_parallel:
+            self.model_runner.execute_decode_batch(
+                SimpleNamespace(
+                    num_scheduled_tokens={}, scheduled_spec_decode_tokens={}
+                )
+            )
         return None
 
     def reset_encoder_cache(self):
@@ -388,7 +450,12 @@ class WorkerFL028(WorkerBase):
                 from .batched_graph import BatchedDecodeGraphs
 
                 self.model_runner.graphs = BatchedDecodeGraphs(
-                    self.get_model(), self.model_runner.state, self.device
+                    self.get_model(),
+                    self.model_runner.state,
+                    self.device,
+                    batch_capacity=self.scheduler_config.max_num_seqs
+                    if self.model_runner.data_parallel
+                    else None,
                 )
             else:
                 from .decode_graph import DecodeGraphs
@@ -435,6 +502,21 @@ class WorkerFL028(WorkerBase):
                     self.get_model().propose_draft(logits.argmax(-1), hidden, count)
         torch.cuda.synchronize(self.device)
         state.bind(0, reset=True)
+        if self.model_runner.data_parallel:
+            # Capture one bounded bucket before the API admits PD transfers.
+            # No live request state is present; all lanes are masked off.
+            count = self.scheduler_config.max_num_seqs
+            tokens = torch.zeros(count, device=self.device, dtype=torch.long)
+            active = torch.zeros(count, device=self.device, dtype=torch.bool)
+            with torch.inference_mode():
+                _, hidden = self.model_runner.graphs.target_batch(
+                    tokens, tokens, tokens, active
+                )
+                if self.model_runner.drafting_enabled:
+                    self.model_runner.graphs.draft_batch(
+                        tokens, hidden, tokens, tokens, active
+                    )
+            torch.cuda.synchronize(self.device)
         elapsed = time.monotonic() - begin
         logger.warning("FL rank %d Eager warmup finished in %.1fs", self.rank, elapsed)
         return CompilationTimes(elapsed, 0.0)
