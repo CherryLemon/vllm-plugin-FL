@@ -26,7 +26,7 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
                 name,
                 kind,
                 tuple(
-                    x[:1].detach().clone()
+                    x.detach().clone()
                     for x in values
                     if isinstance(x, torch.Tensor) and x.ndim
                 ),
@@ -74,6 +74,7 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
                 continue
             expected = lookup[key][index]
             for part, (a, e) in enumerate(zip(actual, expected)):
+                a, e = a[:1], e[:1]
                 if a.shape != e.shape or not torch.equal(a, e):
                     row = {
                         "module": name,
@@ -90,11 +91,31 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
                     result.append(row)
             if len(result) >= 24:
                 break
+        statistics = []
+        for name, kind, actual in recorded:
+            if kind != "input" or len(name.split(".")) != 2 or not actual:
+                continue
+            expected = lookup[(name, kind)][0]
+            if not torch.equal(actual[0][:1], expected[0]):
+                continue
+            stream = actual[0].flatten(2).float().square()
+            serial_mean = stream[:1].mean(-1, keepdim=True)
+            batch_mean = stream.mean(-1, keepdim=True)[:1]
+            statistics.append(
+                {
+                    "module": name,
+                    "input_equal": True,
+                    "serial_mean": float(serial_mean.flatten()[0]),
+                    "batch_mean": float(batch_mean.flatten()[0]),
+                    "mean_equal": torch.equal(serial_mean, batch_mean),
+                }
+            )
         return {
             "scope": f"first {layers} layers, first request, eager serial vs batch",
             "first_differences": result,
             "serial_events": len(serial),
             "batch_events": len(recorded),
+            "hc_statistics": statistics,
         }
     finally:
         for handle in handles:

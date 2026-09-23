@@ -48,6 +48,27 @@ def dense_linear(x, weight):
     return torch.nn.functional.linear(x, weight)
 
 
+def decode_mean(x, dim, keepdim=False):
+    """Preserve the reference reduction geometry for each decode request.
+
+    ATen can change the number of reduction CTAs when the output row count
+    grows. Sub-ULP FP32 changes in mHC statistics can become BF16 residual
+    differences, then alter routing. Keep the scalar request's geometry while
+    the surrounding low-precision GEMMs and state access remain batched.
+    """
+    if _decode_batch_size > 1:
+        if x.shape[0] % _decode_batch_size:
+            raise ValueError("decode reduction must retain its request grouping")
+        return torch.cat(
+            [
+                part.mean(dim=dim, keepdim=keepdim)
+                for part in x.chunk(_decode_batch_size, dim=0)
+            ],
+            dim=0,
+        )
+    return x.mean(dim=dim, keepdim=keepdim)
+
+
 def lowp_linear(x, weight, scale):
     from flag_gems.fused.block_scaled_lowp_linear import block_scaled_lowp_linear
 

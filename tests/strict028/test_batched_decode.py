@@ -17,6 +17,7 @@ from vllm_fl.strict028.models.deepseek_v41.model import (
     Transformer,
     set_dtype,
 )
+from vllm_fl.strict028.models.deepseek_v41.ops import decode_dense_batch, decode_mean
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -278,3 +279,15 @@ def test_layer_probe_restores_state_and_removes_hooks():
     assert not any(
         m._forward_hooks or m._forward_pre_hooks for m in model.core.modules()
     )
+
+
+@pytest.mark.parametrize("width", [512, 1280, 5120, 20480])
+def test_decode_statistics_preserve_real_dimension_reduction(width):
+    torch.manual_seed(41)
+    values = (
+        torch.randn(20, 1, width, device="cuda", dtype=torch.bfloat16).float().square()
+    )
+    reference = torch.cat([row.mean(-1, keepdim=True) for row in values.split(1)])
+    with decode_dense_batch(20):
+        actual = decode_mean(values, -1, keepdim=True)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)

@@ -18,6 +18,7 @@ from .engram import EngramLayout, NgramHashState
 from .image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
 from .ops import (
     act_quant,
+    decode_mean,
     dense_linear,
     fp4_act_quant,
     hc_split_sinkhorn,
@@ -308,7 +309,7 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor):
         dtype = x.dtype
         x = x.float()
-        var = x.square().mean(-1, keepdim=True)
+        var = decode_mean(x.square(), -1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
         return (self.weight * x).to(dtype)
 
@@ -412,8 +413,8 @@ class Engram(nn.Module):
         )  # only ever used as a product
         h, eps = x.float(), self.eps
         # normalized per (token, hc copy) over `dim`, NOT jointly over the copies
-        rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
-            key.square().mean(-1) + eps
+        rstd = torch.rsqrt(decode_mean(h.square(), -1) + eps) * torch.rsqrt(
+            decode_mean(key.square(), -1) + eps
         )
         dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
         # signed sqrt before the sigmoid, matching the training kernel
@@ -1252,7 +1253,7 @@ class Block(nn.Module):
                 self.hc_eps,
             )
         x = x.flatten(2).float()
-        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        rsqrt = torch.rsqrt(decode_mean(x.square(), -1, keepdim=True) + self.norm_eps)
         mixes = dense_linear(x, hc_fn) * rsqrt
         return hc_split_sinkhorn(
             mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
@@ -1657,7 +1658,7 @@ class Transformer(nn.Module):
                 )
             # the MTP head reads the attention input of its target layers, not their output
             if i in self.target_layer_ids:
-                main_hiddens.append(h.mean(dim=2))
+                main_hiddens.append(decode_mean(h, dim=2))
             h, pre_mix = layer(h, start_pos, pre_mix, image_mask)
         h = layer.hc_pre(h, pre_mix)
         logits = self.head(self.norm(h))
