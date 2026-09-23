@@ -175,7 +175,9 @@ class ChunkPrefill:
         ref.apply_rotary_emb(out[..., -rd:], frequencies, inverse=True)
         out = out.view(1, self.count, attn.n_local_groups, -1)
         weight = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
-        return attn.wo_b(grouped_output_projection(out, weight).flatten(2))
+        return attn.wo_b(
+            prefill_grouped_projection(out, weight, self.prompt_length).flatten(2)
+        )
 
     def store_draft_context(self, attn, hidden):
         kv = attn.kv_norm(attn.wkv(hidden))
@@ -184,3 +186,18 @@ class ChunkPrefill:
         )
         act_quant(kv, inplace=True)
         self.commit_ring(attn.window_kv_cache, kv)
+
+
+def prefill_grouped_projection(x, weight, prompt_length):
+    """Keep small chunks on the complete prefix's BF16 GEMM geometry.
+
+    On H100, M=32/128 and M>=256 select different accumulation paths. Real
+    wo_a weights expose BF16 rounding ties, which amplify in later layers.
+    Zero rows do not contribute to other outputs. Long chunks already use
+    the large-prefix path, so this adds at most 255 padding rows.
+    """
+    count = x.shape[1]
+    rows = min(prompt_length, 256)
+    if count < rows:
+        x = torch.cat([x, x.new_zeros((x.shape[0], rows - count, *x.shape[2:]))], dim=1)
+    return grouped_output_projection(x, weight)[:, :count]
