@@ -39,8 +39,48 @@ positions already represented by the transferred state. The client stitches
 Prefill's first output token with Decode's output tokens. If Prefill emits EOS,
 the client returns immediately without a Decode request.
 
+Run the real-weight acceptance client from `.13` after both `/health` endpoints
+return HTTP 200:
+
+```bash
+python tools/strict028/smoke_pd_api.py \
+  --prefill-url http://127.0.0.1:18031 \
+  --decode-url http://10.8.2.68:18032 \
+  --prompts /public-nvme/yjwu/dsv41-fl-028/delivery-mtp-992e72c/evidence/prompts.json \
+  --baseline /public-nvme/yjwu/dsv41-fl-028/evidence/flagcx-mtp-api.json \
+  --output /public-nvme/yjwu/dsv41-fl-028/evidence/flagcx-pd2-api.json
+```
+
 This is an Eager correctness profile: TP=8, max context 256, at most two live
 sequences, DSpark five-token greedy MTP, no prefix caching, chunked prefill,
 async scheduling, cross-vendor PD, or performance claim. `fl_pd_stats` reports
 per-rank page counts and bytes for admission. A production router, load testing,
 failure injection, and longer-context validation remain separate milestones.
+
+## Verified deployment (2026-09-23)
+
+The tested plugin commit is `e1acff9d9fb8d00ff6338493db3de30db7f598e6`.
+Both hosts use the official `vllm/vllm-openai:v0.28.0-cu129` base with the
+`vllm==0.28.0+empty` wheel and the same plugin wheel (SHA-256
+`4947799e826b81d924557d43e23f21e75c024f5878f5b8b232a3a51b9fc0b229`).
+The image tag is `local/dsv41-fl:pd-e1acff9`; the image IDs differ because
+`.13` installs the offline wheels with `uv` and `.68` uses `pip` for compatibility
+with its older Docker daemon. The pinned deployment manifest is at
+`/public-nvme/yjwu/dsv41-fl-028/image-stage-pd2/deployment-manifest.json`.
+
+The API admission report is
+`/public-nvme/yjwu/dsv41-fl-028/evidence/flagcx-pd2-api.json`. All three
+prompts (11, 16, and 141 tokens) produced 12 stitched output token IDs each,
+matching the single-node FlagCX MTP baseline exactly. A separate first-request
+smoke is recorded in `flagcx-pd2-short0.json`. After both runs, every Prefill
+rank had sent four 6,481,920-byte pages, every Decode rank had received four,
+and every Decode rank had accepted 27 MTP draft tokens. No rank reported a
+transfer error. The service logs are `flagcx-pd2-p13.log` and
+`flagcx-pd2-d68.log` in the same evidence directory. The strict vLLM 0.28
+unit suite passed 82 tests against this source revision.
+The `flagcx-pd2-tp-stats.json` report confirms `flagcx` on all eight ranks of
+both engines; per rank the Prefill engine recorded 558 all-reduces and 12
+all-gathers, and the Decode engine recorded 4,814 and 182, respectively.
+The installed package versions and host-specific image IDs are recorded in
+`flagcx-pd2-images.json`. Both test containers were stopped after acceptance;
+all 16 GPUs were idle when checked afterward.
