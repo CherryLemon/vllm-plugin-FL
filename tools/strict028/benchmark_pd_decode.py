@@ -136,15 +136,11 @@ def admit_deployment(opener, p_url, d_url, prompt_tokens, output_tokens, smoke):
         cards[url] = {"max_model_len": models[0]["max_model_len"]}
     with opener.open(d_url + "/metrics", timeout=60) as response:
         metrics = response.read().decode()
+    # Running gauges are created only for engines that have served a request.
+    # Startup counters expose every configured DP engine, including idle ones.
     decode_groups = re.findall(
-        r"^vllm:num_requests_running\{[^}]*\}\s+(\S+)", metrics, re.M
+        r"^vllm:num_preemptions_total\{[^}]*\}\s+(\S+)", metrics, re.M
     )
-    # Idle Prometheus gauges have no children until the first scheduling step.
-    # Counters already expose the configured engine labels at service startup.
-    if not decode_groups:
-        decode_groups = re.findall(
-            r"^vllm:num_preemptions_total\{[^}]*\}\s+(\S+)", metrics, re.M
-        )
     if not decode_groups:
         raise AssertionError("Decode exposes no DP engine metrics")
     if not smoke and len(decode_groups) != 4:
