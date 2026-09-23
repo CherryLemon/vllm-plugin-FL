@@ -10,7 +10,7 @@ import torch
 
 from .collectives import all_reduce_
 from .models.deepseek_v41 import model as ref
-from .models.deepseek_v41.ops import act_quant, fp4_act_quant
+from .models.deepseek_v41.ops import act_quant, fp4_act_quant, grouped_output_projection
 
 
 def rotary(x, frequencies, inverse=False):
@@ -186,7 +186,7 @@ class DecodeBatch:
         rotary(out[..., -rd:], frequencies, inverse=True)
         out = out.view(b, s, attn.n_local_groups, -1)
         weight = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
-        return attn.wo_b(torch.einsum("bsgd,grd->bsgr", out, weight).flatten(2))
+        return attn.wo_b(grouped_output_projection(out, weight).flatten(2))
 
     def store_draft_context(self, attn, hidden):
         frequencies = attn.freqs_cis[self.positions]
@@ -221,4 +221,4 @@ class DecodeBatch:
         rotary(out[..., -rd:], frequencies, inverse=True)
         out = out.view(b, block, attn.n_local_groups, -1)
         weight = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
-        return attn.wo_b(torch.einsum("bsgd,grd->bsgr", out, weight).flatten(2))
+        return attn.wo_b(grouped_output_projection(out, weight).flatten(2))

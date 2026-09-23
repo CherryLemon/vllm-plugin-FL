@@ -55,6 +55,17 @@ def dense_linear(x, weight):
     return torch.nn.functional.linear(x, weight)
 
 
+def grouped_output_projection(x, weight):
+    """Preserve each request's cuBLAS M for the BF16 grouped wo_a product."""
+    if _decode_batch_size > 1:
+        if x.shape[0] != _decode_batch_size:
+            raise ValueError("grouped decode output must retain its request axis")
+        return torch.cat(
+            [torch.einsum("bsgd,grd->bsgr", part, weight) for part in x.split(1)], dim=0
+        )
+    return torch.einsum("bsgd,grd->bsgr", x, weight)
+
+
 def decode_mean(x, dim, keepdim=False):
     """Preserve the reference reduction geometry for each decode request.
 

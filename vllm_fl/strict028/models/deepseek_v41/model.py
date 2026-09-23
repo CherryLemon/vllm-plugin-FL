@@ -22,6 +22,7 @@ from .ops import (
     dense_linear,
     fp4_act_quant,
     gathered_decode_batch,
+    grouped_output_projection,
     hc_split_sinkhorn,
     lowp_linear,
     sparse_attn,
@@ -992,7 +993,7 @@ class Attention(nn.Module):
         # Linear. convert.py dequantizes it to bf16; an fp8 grouped GEMM would halve the memory.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        o = grouped_output_projection(o, wo_a)
         x = self.wo_b(o.flatten(2))
         return x
 
@@ -1449,7 +1450,7 @@ class DSparkAttention(Attention):
 
         o = o.view(bsz, block_size, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        o = grouped_output_projection(o, wo_a)
         x = self.wo_b(o.flatten(2))
         return x
 

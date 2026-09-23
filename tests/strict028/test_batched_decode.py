@@ -21,6 +21,7 @@ from vllm_fl.strict028.models.deepseek_v41.ops import (
     decode_dense_batch,
     decode_mean,
     decode_sum,
+    grouped_output_projection,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -311,6 +312,27 @@ def test_engram_dot_sum_preserves_request_reduction(batch):
     with decode_dense_batch(batch):
         actual = decode_sum(values, -1)
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("batch", [3, 20])
+def test_five_token_woa_preserves_reference_matmul_on_graph_replay(batch):
+    torch.manual_seed(17)
+    x = torch.randn(batch, 5, 1, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(1, 1024, 4096, device="cuda", dtype=torch.bfloat16) * 0.02
+    with decode_dense_batch(batch):
+        grouped_output_projection(x, weight)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = grouped_output_projection(x, weight)
+    for _ in range(3):
+        x.normal_()
+        reference = torch.cat(
+            [torch.einsum("bsgd,grd->bsgr", part, weight) for part in x.split(1)]
+        )
+        graph.replay()
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @torch.inference_mode()
