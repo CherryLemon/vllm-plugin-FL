@@ -6,6 +6,25 @@ from pathlib import Path
 import torch
 
 
+def global_rank_report(report):
+    """Idle validation RPCs must survive DPLB returning only the first TP engine.
+
+    The public DPLB RPC broadcasts to all engines. Its result retains only the
+    first engine, so collect the scalar diagnostics before returning. Call on
+    an idle service; this control collective must not race Decode collectives.
+    """
+    from .collectives import parallel_layout
+
+    layout = parallel_layout()
+    if layout.data_size == 1:
+        return report
+    import torch.distributed as dist
+
+    reports = [None] * layout.world_size
+    dist.all_gather_object(reports, report)
+    return {"all_ranks": reports}
+
+
 def copy_reference_buffers(source, target):
     """Materialize every buffer binding, including aliases hidden by deduplication."""
     source_buffers = dict(source.named_buffers(remove_duplicate=False))
@@ -175,7 +194,7 @@ def reference_differential(worker, prompt_ids):
                 "passed": report["passed"]
                 and repeat_equal
                 and all(row["passed"] for row in decode),
-                "rank": worker.rank,
+                "rank": worker.global_rank,
                 "prompt_tokens": len(prompt_ids),
                 "repeated_logits_equal": repeat_equal,
                 "decode": decode,
@@ -196,15 +215,109 @@ def reference_differential(worker, prompt_ids):
 
 
 class ReferenceProbeExtension:
+    def fl_profile_decode(self, options):
+        import os
+
+        from .decode_profiler import DecodeProfiler
+
+        runner = self.model_runner
+        if not runner.batched_decode_enabled:
+            raise ValueError("Decode profiling requires the batched Graph runner")
+        if (
+            previous := getattr(runner, "decode_profiler", None)
+        ) is not None and not previous.done:
+            raise ValueError("a Decode profile is already armed")
+        label = options["label"]
+        if Path(label).name != label or label in (".", ".."):
+            raise ValueError("profile label must be one path component")
+        directory = Path(os.environ["FL_PROFILE_DIR"]) / label
+        runner.decode_profiler = DecodeProfiler(
+            directory,
+            self.global_rank,
+            steps=options.get("steps", 10),
+            active=options.get("active", 20),
+        )
+        return dict(rank=self.global_rank, armed=True, directory=str(directory))
+
+    @torch.inference_mode()
+    def fl_chunked_prefill_differential(self, options):
+        """Compare real weights on the same prefix with and without chunking."""
+        from .models.deepseek_v41.model import set_dtype
+
+        runner, model = self.model_runner, self.get_model()
+        if runner.requests:
+            raise ValueError("chunked Prefill differential needs an idle service")
+        ids = torch.tensor(options["prompt_ids"], device=self.device, dtype=torch.long)
+        chunk_size = int(options["chunk_size"])
+        if not 0 < chunk_size < len(ids) < model.args.max_seq_len - 4:
+            raise ValueError("invalid chunked Prefill probe shape")
+        state = runner.state
+        saved = state.storage[1:3].clone()
+        previous = state.active_block
+
+        def compare(actual, expected):
+            delta = (actual.float() - expected.float()).square().mean().sqrt()
+            scale = expected.float().square().mean().sqrt().clamp_min(1e-30)
+            rrms = float(delta / scale)
+            top1 = torch.equal(actual.argmax(-1), expected.argmax(-1))
+            return dict(
+                relative_rms=rrms, top1_equal=top1, passed=rrms <= 0.03 and top1
+            )
+
+        try:
+            with torch.device(self.device), set_dtype(torch.bfloat16):
+                state.bind(1, reset=True)
+                reference, hidden = model.forward_with_aux(ids, start_pos=0)
+                model.store_draft_context(hidden, 0)
+                state.bind(2, reset=True)
+                for start in range(0, len(ids), chunk_size):
+                    actual, _ = model.forward_prefill_chunk(
+                        ids[start : start + chunk_size], start, len(ids)
+                    )
+                prefill = compare(actual, reference)
+                fields = {}
+                for field in state.fields:
+                    a = state.storage[
+                        2, field.offset : field.offset + field.nbytes
+                    ].view(field.dtype)
+                    b = state.storage[
+                        1, field.offset : field.offset + field.nbytes
+                    ].view(field.dtype)
+                    if not torch.equal(a, b):
+                        fields[f"{field.module}.{field.name}"] = dict(
+                            different=int((a != b).sum()),
+                            max_abs=float((a.float() - b.float()).abs().max()),
+                        )
+                decode = []
+                for position in range(len(ids), len(ids) + 3):
+                    token = reference.argmax(-1)
+                    state.bind(1)
+                    reference, _ = model.forward_with_aux(token, start_pos=position)
+                    state.bind(2)
+                    actual, _ = model.forward_with_aux(token, start_pos=position)
+                    decode.append(compare(actual, reference))
+                return dict(
+                    rank=self.global_rank,
+                    prefill=prefill,
+                    decode=decode,
+                    state_differences=fields,
+                    prompt_tokens=len(ids),
+                    chunk_size=chunk_size,
+                    passed=prefill["passed"] and all(row["passed"] for row in decode),
+                )
+        finally:
+            state.storage[1:3].copy_(saved)
+            state.bind(0 if previous is None else previous)
+
     def fl_pd_stats(self):
         if self.pd_connector is None:
-            return {"rank": self.rank, "enabled": False}
-        return {"enabled": True, **self.pd_connector.stats()}
+            return {"rank": self.global_rank, "enabled": False}
+        return global_rank_report({"enabled": True, **self.pd_connector.stats()})
 
     def fl_tp_stats(self):
         from .collectives import tp_collective_stats
 
-        return {"rank": self.rank, **tp_collective_stats()}
+        return global_rank_report({"rank": self.global_rank, **tp_collective_stats()})
 
     def fl_reference_differential(self, prompt_ids):
         if isinstance(prompt_ids, str):
@@ -227,17 +340,21 @@ class ReferenceProbeExtension:
             raise ValueError("this model was loaded without DSpark weights")
         runner.drafting_enabled = enabled
         runner.draft_token_ids = None
-        return {"rank": self.rank, "enabled": enabled}
+        return {"rank": self.global_rank, "enabled": enabled}
 
     def fl_mtp_stats(self):
-        return {"rank": self.rank, **self.model_runner.spec_stats}
+        return global_rank_report(
+            {"rank": self.global_rank, **self.model_runner.spec_stats}
+        )
 
     def fl_graph_stats(self):
         graphs = self.model_runner.graphs
-        return {
-            "rank": self.rank,
-            **(graphs.stats() if graphs is not None else {"enabled": False}),
-        }
+        return global_rank_report(
+            {
+                "rank": self.global_rank,
+                **(graphs.stats() if graphs is not None else {"enabled": False}),
+            }
+        )
 
     @torch.inference_mode()
     def fl_batched_decode_differential(self, prompt_ids):
@@ -266,18 +383,24 @@ class ReferenceProbeExtension:
             raise ValueError("the probe needs three request pages plus the null page")
         saved = state.storage[1:4].clone()
         previous = state.active_block
-        report = {"rank": self.rank, "passes": []}
+        report = {"rank": self.global_rank, "passes": []}
         try:
             lengths = [len(prompt_ids) - 2, len(prompt_ids) - 1, len(prompt_ids)]
             with torch.device(self.device), set_dtype(torch.bfloat16):
                 for page, length in zip((1, 2, 3), lengths):
                     state.bind(page, reset=True)
-                    _, _, hidden = model.core(torch.tensor([prompt_ids[:length]], device=self.device), 0)
+                    _, _, hidden = model.core(
+                        torch.tensor([prompt_ids[:length]], device=self.device), 0
+                    )
                     model.core.store_spec_context(hidden, 0)
                 for order in ((1, 2, 3), (3, 1, 2)):
                     pages = torch.tensor(order, device=self.device)
-                    positions = torch.tensor([lengths[p - 1] for p in order], device=self.device)
-                    tokens = torch.tensor([prompt_ids[-p] for p in order], device=self.device)
+                    positions = torch.tensor(
+                        [lengths[p - 1] for p in order], device=self.device
+                    )
+                    tokens = torch.tensor(
+                        [prompt_ids[-p] for p in order], device=self.device
+                    )
                     active = torch.ones(3, dtype=torch.bool, device=self.device)
                     if diagnose_layers and "layer_diagnostics" not in report:
                         from .batch_diagnostics import compare_model_layers
@@ -289,26 +412,36 @@ class ReferenceProbeExtension:
                     serial_logits, serial_hidden = [], []
                     for i, page in enumerate(order):
                         state.bind(page)
-                        _, logits, hidden = model.core(tokens[i:i + 1, None], lengths[page - 1])
+                        _, logits, hidden = model.core(
+                            tokens[i : i + 1, None], lengths[page - 1]
+                        )
                         model.core.store_spec_context(hidden, lengths[page - 1])
                         serial_logits.append(logits)
                         serial_hidden.append(hidden)
                     expected = state.storage[1:4].clone()
                     state.storage[1:4].copy_(initial)
-                    logits, hidden = runner.graphs.target_batch(tokens, pages, positions, active)
-                    golden_logits, golden_hidden = torch.cat(serial_logits), torch.cat(serial_hidden)
+                    logits, hidden = runner.graphs.target_batch(
+                        tokens, pages, positions, active
+                    )
+                    golden_logits, golden_hidden = (
+                        torch.cat(serial_logits),
+                        torch.cat(serial_hidden),
+                    )
                     row = {
                         "positions": positions.tolist(),
                         "logits_equal": torch.equal(logits, golden_logits),
                         "hidden_equal": torch.equal(hidden, golden_hidden),
-                        "token_ids_equal": torch.equal(logits.argmax(-1), golden_logits.argmax(-1)),
+                        "token_ids_equal": torch.equal(
+                            logits.argmax(-1), golden_logits.argmax(-1)
+                        ),
                         "logits_max_abs": float((logits - golden_logits).abs().max()),
                         "state_equal": torch.equal(state.storage[1:4], expected),
                         "different_fields": [
-                            f"{f.module}.{f.name}" for f in state.fields
+                            f"{f.module}.{f.name}"
+                            for f in state.fields
                             if not torch.equal(
-                                state.storage[1:4, f.offset:f.offset + f.nbytes],
-                                expected[:, f.offset:f.offset + f.nbytes],
+                                state.storage[1:4, f.offset : f.offset + f.nbytes],
+                                expected[:, f.offset : f.offset + f.nbytes],
                             )
                         ],
                     }
@@ -321,18 +454,36 @@ class ReferenceProbeExtension:
                     serial_draft = []
                     for i, page in enumerate(order):
                         state.bind(page)
-                        serial_draft.append(model.core.forward_spec(bonus[i:i + 1], hidden[i:i + 1], lengths[page - 1]))
+                        serial_draft.append(
+                            model.core.forward_spec(
+                                bonus[i : i + 1], hidden[i : i + 1], lengths[page - 1]
+                            )
+                        )
                     expected.copy_(state.storage[1:4])
                     state.storage[1:4].copy_(initial)
-                    draft = runner.graphs.draft_batch(bonus, hidden, pages, positions, active)
+                    draft = runner.graphs.draft_batch(
+                        bonus, hidden, pages, positions, active
+                    )
                     row["draft_equal"] = [
                         torch.equal(actual, torch.cat([r[c] for r in serial_draft]))
                         for c, actual in enumerate(draft)
                     ]
                     row["draft_errors"] = [
                         {
-                            "max_abs": float((actual.float() - torch.cat([r[c] for r in serial_draft]).float()).abs().max()),
-                            "close_1e4": torch.allclose(actual.float(), torch.cat([r[c] for r in serial_draft]).float(), rtol=1e-4, atol=1e-4),
+                            "max_abs": float(
+                                (
+                                    actual.float()
+                                    - torch.cat([r[c] for r in serial_draft]).float()
+                                )
+                                .abs()
+                                .max()
+                            ),
+                            "close_1e4": torch.allclose(
+                                actual.float(),
+                                torch.cat([r[c] for r in serial_draft]).float(),
+                                rtol=1e-4,
+                                atol=1e-4,
+                            ),
                         }
                         for c, actual in enumerate(draft)
                     ]
@@ -412,7 +563,7 @@ class ReferenceProbeExtension:
                     )
                     matches.append(bool(torch.equal(graph_logits, reference_logits)))
                 return {
-                    "rank": self.rank,
+                    "rank": self.global_rank,
                     "position": position,
                     "graph_replay_count": len(matches),
                     "logits_exact_match": matches,
@@ -559,7 +710,7 @@ def mtp_differential(worker, prompt_ids):
             and prefill["hidden"]["equal"]
         )
         return {
-            "rank": worker.rank,
+            "rank": worker.global_rank,
             "passed": passed,
             "prompt_tokens": len(prompt_ids),
             "prefill": prefill,

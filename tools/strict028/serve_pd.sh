@@ -20,7 +20,7 @@ esac
 test -f "$model_path/config.json"
 
 docker_args=(
-  --rm --name "${FL_CONTAINER_NAME:-dsv41-fl-${role}}"
+  --name "${FL_CONTAINER_NAME:-dsv41-fl-${role}}"
   --gpus all --ipc=host --network=host
   --device=/dev/infiniband --ulimit memlock=-1:-1
   --cap-add IPC_LOCK --security-opt seccomp=unconfined
@@ -68,6 +68,11 @@ if [[ "${FL_PD_EXPLICIT_DEVICES:-0}" == 1 ]]; then
     docker_args+=(-v "/lib/x86_64-linux-gnu/$lib:/driver/$lib:ro")
   done
   docker_args+=(-e LD_LIBRARY_PATH=/driver:/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib:/usr/local/cuda/lib64)
+fi
+
+if [[ -n "${FL_PROFILE_DIR:-}" ]]; then
+  mkdir -p "$FL_PROFILE_DIR"
+  docker_args+=(-v "$FL_PROFILE_DIR:/profiles" -e FL_PROFILE_DIR=/profiles)
 fi
 
 server_args=()

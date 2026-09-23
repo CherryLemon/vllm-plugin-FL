@@ -244,6 +244,13 @@ class ModelRunnerFL028:
         )
 
     def execute_decode_batch(self, output):
+        profiler = getattr(self, "decode_profiler", None)
+        if profiler is None:
+            return self._execute_decode_batch(output)
+        with profiler.step(self, output):
+            return self._execute_decode_batch(output)
+
+    def _execute_decode_batch(self, output):
         """Verify request prefixes together, masking a lane after rejection.
 
         Target verification remains sequential across draft positions for now;
@@ -382,6 +389,7 @@ class WorkerFL028(WorkerBase):
         torch.backends.cuda.matmul.allow_tf32 = False
         tp_backend = requested_backend()
         world_size = parallel.world_size
+        self.global_rank = self.rank
         init_method = self.distributed_init_method
         if parallel.data_parallel_size > 1:
             if tp_backend != "flagcx":
@@ -390,7 +398,9 @@ class WorkerFL028(WorkerBase):
                 )
             from vllm.utils.network_utils import get_distributed_init_method
 
-            self.rank += parallel.data_parallel_rank * world_size
+            # WorkerBase.rank belongs to the local TP executor's message queue.
+            # Only the explicit device/control communicator uses global rank.
+            self.global_rank += parallel.data_parallel_rank * world_size
             world_size = parallel.world_size_across_dp
             init_method = get_distributed_init_method(
                 parallel.data_parallel_master_ip, parallel.get_next_dp_init_port()
@@ -398,7 +408,7 @@ class WorkerFL028(WorkerBase):
         if world_size > 1:
             pg_kwargs = dict(
                 init_method=init_method,
-                rank=self.rank,
+                rank=self.global_rank,
                 world_size=world_size,
             )
             if tp_backend == "flagcx":
@@ -407,7 +417,9 @@ class WorkerFL028(WorkerBase):
             else:
                 dist.init_process_group("nccl", device_id=self.device, **pg_kwargs)
         init_tp_collectives(self.device, tensor_size=parallel.tensor_parallel_size)
-        logger.warning("FL rank %d TP collective backend: %s", self.rank, tp_backend)
+        logger.warning(
+            "FL rank %d TP collective backend: %s", self.global_rank, tp_backend
+        )
 
     def load_model(self, *, load_dummy_weights=False):
         if load_dummy_weights:
@@ -426,7 +438,7 @@ class WorkerFL028(WorkerBase):
         )
         logger.warning(
             "FL rank %d loaded in %.1fs: %s; execution=%s",
-            self.rank,
+            self.global_rank,
             time.monotonic() - begin,
             json.dumps(model.load_manifest),
             json.dumps(model.profile),
@@ -513,7 +525,7 @@ class WorkerFL028(WorkerBase):
         # Use the official startup phase, whose RPC is not limited by the
         # request execution timeout. Cold FlagGems autotuning can take minutes.
         begin = time.monotonic()
-        logger.warning("FL rank %d starting Eager kernel warmup", self.rank)
+        logger.warning("FL rank %d starting Eager kernel warmup", self.global_rank)
         state = self.model_runner.state
         state.bind(0, reset=True)
         limit = self.model_config.max_model_len
@@ -552,7 +564,9 @@ class WorkerFL028(WorkerBase):
                     )
             torch.cuda.synchronize(self.device)
         elapsed = time.monotonic() - begin
-        logger.warning("FL rank %d Eager warmup finished in %.1fs", self.rank, elapsed)
+        logger.warning(
+            "FL rank %d Eager warmup finished in %.1fs", self.global_rank, elapsed
+        )
         return CompilationTimes(elapsed, 0.0)
 
     def get_cache_block_size_bytes(self):

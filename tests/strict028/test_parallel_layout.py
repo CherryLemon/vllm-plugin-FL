@@ -82,3 +82,47 @@ def test_target_axes_and_checkpoint_slices(tmp_path, monkeypatch, rank):
 def test_invalid_layout_is_rejected(tp, dp, rank):
     with pytest.raises(ValueError):
         ParallelLayout(tp, dp, rank)
+
+
+@pytest.mark.parametrize("global_rank", range(8))
+def test_worker_preserves_executor_rank_for_local_message_queue(
+    monkeypatch, global_rank
+):
+    from types import SimpleNamespace
+
+    from vllm_fl.strict028.worker import WorkerFL028
+
+    calls = []
+    tp_rank, dp_rank = global_rank % 2, global_rank // 2
+    worker = SimpleNamespace(
+        rank=tp_rank,
+        local_rank=tp_rank,
+        model_config=SimpleNamespace(seed=0),
+        distributed_init_method="tcp://127.0.0.1:1",
+        parallel_config=SimpleNamespace(
+            data_parallel_size=4,
+            data_parallel_rank=dp_rank,
+            data_parallel_rank_local=dp_rank,
+            tensor_parallel_size=2,
+            world_size=2,
+            world_size_across_dp=8,
+            data_parallel_master_ip="127.0.0.1",
+            get_next_dp_init_port=lambda: 29570,
+        ),
+    )
+    monkeypatch.setattr("vllm_fl.strict028.worker.requested_backend", lambda: "flagcx")
+    monkeypatch.setattr(
+        "vllm_fl.strict028.worker.torch.cuda.set_device", lambda *a: None
+    )
+    monkeypatch.setattr(
+        "vllm_fl.strict028.worker.dist.init_process_group",
+        lambda backend, **kw: calls.append(kw),
+    )
+    monkeypatch.setattr(
+        "vllm_fl.strict028.worker.init_tp_collectives", lambda *a, **kw: None
+    )
+    WorkerFL028.init_device(worker)
+    assert worker.rank == tp_rank  # vLLM's TP-local MessageQueue.create_from_handle.
+    assert worker.global_rank == global_rank
+    assert worker.device.index == global_rank
+    assert calls[0]["rank"] == global_rank and calls[0]["world_size"] == 8

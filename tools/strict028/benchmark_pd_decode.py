@@ -113,7 +113,10 @@ def rpc(opener, url, method, timeout):
         {"method": method, "args": [], "timeout": timeout},
         timeout,
     ) as response:
-        return json.load(response)["results"]
+        results = json.load(response)["results"]
+        if results and "all_ranks" in results[0]:
+            results = results[0]["all_ranks"]
+        return sorted(results, key=lambda row: row["rank"])
 
 
 def admit_deployment(opener, p_url, d_url, prompt_tokens, output_tokens, smoke):
@@ -314,7 +317,8 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
         monitor_thread.join(timeout=10)
     active = [sum(s.get("running", [])) for s in samples]
     steady_samples = [
-        s for s in samples
+        s
+        for s in samples
         if len(s.get("running", [])) == 4
         and min(s["running"]) >= 20
         and len(s.get("waiting", [])) == 4
@@ -372,7 +376,8 @@ def main():
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument(
-        "--smoke", action="store_true",
+        "--smoke",
+        action="store_true",
         help="label an explicitly smaller functional run; never report it as steady performance",
     )
     args = parser.parse_args()
@@ -399,8 +404,12 @@ def main():
     p_url = args.prefill_url.rstrip("/")
     d_url = args.decode_url.rstrip("/")
     admission = admit_deployment(
-        opener, p_url, d_url,
-        args.target_prompt_tokens, args.output_tokens, args.smoke,
+        opener,
+        p_url,
+        d_url,
+        args.target_prompt_tokens,
+        args.output_tokens,
+        args.smoke,
     )
     encode, encoder_sha = prompt_encoder(args.model_path)
     prefix, repetitions, padding = calibrate_prompt(encode, args.target_prompt_tokens)
@@ -414,7 +423,9 @@ def main():
     if max(map(len, prompts)) + args.output_tokens > args.max_model_len:
         raise ValueError("a request variant exceeds max_model_len")
     metadata = {
-        "measurement_scope": "functional_smoke" if args.smoke else "steady_decode_80_active",
+        "measurement_scope": "functional_smoke"
+        if args.smoke
+        else "steady_decode_80_active",
         "workload": "shared-prefix weighted-interval coding, fixed output length",
         "reference_method": "SGLang-FL docker/dsv41/PROFILE_STEADY_DECODE.md",
         "deployment": "flagcx_pd",
@@ -431,7 +442,9 @@ def main():
         "measured_rounds_per_concurrency": args.rounds,
         "concurrency": args.concurrency,
         "required_active_decode_requests": None if args.smoke else 80,
-        "required_decode_topology": None if args.smoke else "attention TP2 x DP4; global TP8/EP8",
+        "required_decode_topology": None
+        if args.smoke
+        else "attention TP2 x DP4; global TP8/EP8",
         "deployment_admission": admission,
         "decode_tps_definition": "(Decode completion_tokens - 1)/(last_content - first_content)",
         "aggregate_decode_tps_definition": "sum(Decode completion_tokens - 1)/(last_content_any - first_content_any)",
@@ -524,21 +537,39 @@ def main():
             "decode_graph": rpc(opener, d_url, "fl_graph_stats", args.timeout),
         }
         expected = sum((args.warmups + args.rounds) * c for c in args.concurrency)
-        for role, counter in (
-            ("prefill_pd", "sent_pages"),
-            ("decode_pd", "received_pages"),
+        p_before = report["before"]["prefill_pd"]
+        p_after = report["after"]["prefill_pd"]
+        d_before = report["before"]["decode_pd"]
+        d_after = report["after"]["decode_pd"]
+        for role, before, after in (
+            ("prefill", p_before, p_after),
+            ("decode", d_before, d_after),
         ):
-            before = report["before"][role]
-            after = report["after"][role]
-            if len(before) != 8 or len(after) != 8:
-                raise AssertionError(f"{role} missing TP ranks")
-            if any(
-                end[counter] - begin[counter] != expected or end["fatal_error"]
-                for begin, end in zip(before, after)
-            ):
+            if [r["rank"] for r in before] != list(range(8)) or [
+                r["rank"] for r in after
+            ] != list(range(8)):
+                raise AssertionError(f"{role} missing global ranks")
+            if any(r["fatal_error"] for r in after):
+                raise AssertionError(f"{role} reported a transfer failure")
+        for begin, end in zip(p_before, p_after):
+            completed = sum(
+                end.get(k, 0) - begin.get(k, 0)
+                for k in ("sent_pages", "released_pages")
+            )
+            if completed != expected or end["pending_sends"]:
                 raise AssertionError(
-                    f"{role} did not transfer exactly {expected} pages"
+                    f"Prefill rank {end['rank']} retained or lost requests"
                 )
+        received = [
+            e["received_pages"] - b["received_pages"] for b, e in zip(d_before, d_after)
+        ]
+        tp_size = d_after[0]["tp_size"]
+        if sum(received) != expected * tp_size or any(
+            len(set(received[i : i + tp_size])) != 1 for i in range(0, 8, tp_size)
+        ):
+            raise AssertionError(
+                f"Decode TP groups lost or duplicated pages: {received}"
+            )
         if any(row["backend"] != "flagcx" for row in report["after"]["decode_tp"]):
             raise AssertionError("Decode did not use FlagCX TP")
         for begin, end in zip(
