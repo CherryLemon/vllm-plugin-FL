@@ -59,7 +59,29 @@ this first-use interval is not steady performance.
 - The model's one-entry LRU caches for window and DSpark index tensors can
   evict a GPU tensor while a captured graph still retains its raw address.
   Graph-owned references to those tensors and a cross-position GPU regression
-  test have been added; online repeatability is still under validation.
+  test have been added. The targeted Graph/request-state/PD/MTP suite passed
+  22 tests in the new runtime image.
+- Eager Decode with the same Prefill node, checkpoint, FlagCX transfer, and
+  128/16 prompt returned identical 15-token sequences in three rounds:
+  `/public-nvme/yjwu/dsv41-fl-028/evidence/decode-eager-repeat-tokens-128x16.json`.
+  Its text hash matches the first cold-capture Graph request. This confines the
+  later drift to the Graph path rather than the shared Prefill state.
+- The corrected Graph image `local/dsv41-fl:decode-graph-4870e10` passed three
+  identical PD requests starting from an empty graph cache. All 15 Decode
+  token IDs and the text hash match the Eager receipt in every round. The
+  eight-rank service captured 15 target and four draft graphs and replayed
+  them 45 and 12 times. Receipt:
+  `/public-nvme/yjwu/dsv41-fl-028/evidence/decode-graph-lru-fixed-repeat-tokens-128x16.json`.
+  Three later C=1 functional rounds reused these graphs with no capture; a
+  C=4 functional round reached four active Decode requests and transferred
+  exactly four FlagCX pages on every rank. Receipts:
+  `decode-graph-lru-fixed-smoke-c1-r3.json` and
+  `decode-graph-lru-fixed-smoke-c4.json` in the same evidence directory.
+- The actual 80×128K/8192 benchmark was rejected before prompt preparation.
+  Both servers advertise max context 33792 and Decode exposes one DP metric
+  group. Receipt:
+  `/public-nvme/yjwu/dsv41-fl-028/evidence/steady-decode-80x128k8192-admission.json`.
+  No comparable 80-way performance number was produced.
 
 The next performance milestone requires a paged request-state layout at 128K,
 batched Decode for 20 requests in each of four attention TP2 groups with
