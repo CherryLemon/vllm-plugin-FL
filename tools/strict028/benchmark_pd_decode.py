@@ -97,11 +97,11 @@ def calibrate_prompt(encode, target):
     return prefix, lo, low
 
 
-def post(opener, url, body, timeout):
+def post(opener, url, body, timeout, headers=None):
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     return opener.open(request, timeout=timeout)
 
@@ -187,7 +187,9 @@ def prepare_one(opener, url, prompt_ids, timeout):
     }
 
 
-def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
+def decode_one(
+    opener, url, prepared, index, barrier, timeout, output_tokens, dp_rank=0
+):
     barrier.wait(timeout=60)
     start = time.perf_counter()
     body = {
@@ -207,7 +209,13 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
     usage = None
     finish_reason = None
     done = False
-    with post(opener, url + "/v1/completions", body, timeout) as response:
+    with post(
+        opener,
+        url + "/v1/completions",
+        body,
+        timeout,
+        {"X-data-parallel-rank": str(dp_rank)},
+    ) as response:
         for line in response:
             if not line.startswith(b"data:"):
                 continue
@@ -247,6 +255,7 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
         )
     return {
         "index": index,
+        "data_parallel_rank": dp_rank,
         "token_arrivals": arrivals,
         "prefill_prompt_tokens": len(prepared["prompt_ids"]),
         "decode_prompt_tokens": usage["prompt_tokens"],
@@ -289,7 +298,7 @@ def longest_steady_window(samples):
 
 
 def run_burst(
-    opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None
+    opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1
 ):
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
@@ -362,6 +371,7 @@ def run_burst(
                     barrier,
                     timeout,
                     output_tokens,
+                    i % dp_size,
                 )
                 for i in range(concurrency)
             ]
@@ -558,6 +568,7 @@ def main():
                     args.timeout,
                     args.output_tokens,
                     args.profile_label,
+                    admission["decode_dp_metric_groups"],
                 )
                 result.update(round=round_index, warmup=round_index < 0)
                 report["rounds"].append(result)
