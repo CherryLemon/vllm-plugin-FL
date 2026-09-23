@@ -301,6 +301,32 @@ def longest_steady_window(samples):
     return longest
 
 
+def measure_steady_window(samples, requests, origin):
+    if not samples:
+        return None
+    # Engine gauges update less often than stream events. Bound them by the
+    # interval in which every client has started and none has finished.
+    begin = max(samples[0]["time_s"], max(r["token_arrivals"][0][0] for r in requests))
+    end = min(samples[-1]["time_s"], min(r["token_arrivals"][-1][0] for r in requests))
+    if end <= begin:
+        return None
+    emitted = [
+        sum(n for t, n in row["token_arrivals"] if begin < t <= end)
+        for row in requests
+    ]
+    return dict(
+        start_s=begin - origin,
+        end_s=end - origin,
+        duration_s=end - begin,
+        boundary_source="intersection of 4x20 metrics and all request token streams",
+        tokens_per_request=emitted,
+        aggregate_tps=sum(emitted) / (end - begin),
+        median_request_tps=statistics.median(emitted) / (end - begin),
+        min_request_tps=min(emitted) / (end - begin),
+        max_request_tps=max(emitted) / (end - begin),
+    )
+
+
 def run_burst(
     opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1
 ):
@@ -391,30 +417,7 @@ def run_burst(
     start = min(row["start_offset_s"] for row in requests)
     end = max(row["end_offset_s"] for row in requests)
     rates = [row["decode_tps"] for row in requests]
-    steady_rate = None
-    if steady_samples:
-        steady_start = steady_samples[0]["time_s"]
-        steady_end = steady_samples[-1]["time_s"]
-        if steady_end > steady_start:
-            emitted = [
-                sum(
-                    n
-                    for t, n in row["token_arrivals"]
-                    if steady_start <= t <= steady_end
-                )
-                for row in requests
-            ]
-            steady_rate = dict(
-                start_s=steady_start - start,
-                end_s=steady_end - start,
-                duration_s=steady_end - steady_start,
-                tokens_per_request=emitted,
-                aggregate_tps=sum(emitted) / (steady_end - steady_start),
-                median_request_tps=statistics.median(emitted)
-                / (steady_end - steady_start),
-                min_request_tps=min(emitted) / (steady_end - steady_start),
-                max_request_tps=max(emitted) / (steady_end - steady_start),
-            )
+    steady_rate = measure_steady_window(steady_samples, requests, start)
     for row in requests:
         row["token_arrivals"] = [[t - start, n] for t, n in row["token_arrivals"]]
         for key in (
@@ -581,7 +584,10 @@ def main():
                 result.update(round=round_index, warmup=round_index < 0)
                 report["rounds"].append(result)
                 save()
-                if not args.smoke and result["steady_c80_dp4_samples"] < 5:
+                if not args.smoke and (
+                    result["steady_c80_dp4_samples"] < 5
+                    or result["steady_window"] is None
+                ):
                     raise AssertionError(
                         "80 active Decode requests across four DP groups with "
                         "zero waiting were not sustained for five metric samples"
