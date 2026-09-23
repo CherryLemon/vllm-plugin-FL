@@ -192,7 +192,8 @@ def prepare_one(opener, url, prompt_ids, timeout):
 
 
 def decode_one(
-    opener, url, prepared, index, barrier, timeout, output_tokens, dp_rank=0
+    opener, url, prepared, index, barrier, timeout, output_tokens, dp_rank=0,
+    profile_stop=None,
 ):
     barrier.wait(timeout=60)
     start = time.perf_counter()
@@ -222,6 +223,8 @@ def decode_one(
         {"X-data-parallel-rank": str(dp_rank)},
     ) as response:
         for line in response:
+            if profile_stop is not None and profile_stop.is_set():
+                break
             if not line.startswith(b"data:"):
                 continue
             payload = line[5:].strip()
@@ -246,16 +249,23 @@ def decode_one(
                 if choice.get("finish_reason") is not None:
                     finish_reason = choice["finish_reason"]
     end = time.perf_counter()
-    if not done or not usage or not content or finish_reason != "length":
+    cancelled = profile_stop is not None and profile_stop.is_set() and not done
+    if cancelled:
+        # Profiling ends after all eight ten-step traces exist. These counts
+        # describe the observed stream, not a completed 8192-token request.
+        usage = dict(prompt_tokens=len(body["prompt"]), completion_tokens=len(generated_ids))
+    elif not done or not usage or finish_reason != "length":
         raise RuntimeError(
             f"incomplete Decode request {index}: {done=} {usage=} {finish_reason=}"
         )
+    if not content or len(arrivals) < 2:
+        raise RuntimeError(f"Decode request {index} has no measurable token stream")
     tokens = usage["completion_tokens"]
     if sum(n for _, n in arrivals) != tokens:
         raise RuntimeError(
             f"streamed token IDs disagree with completion usage: {index}"
         )
-    if tokens != output_tokens - 1 or last <= first:
+    if (not cancelled and tokens != output_tokens - 1) or last <= first:
         raise RuntimeError(
             f"unexpected Decode output {index}: {tokens=} {first=} {last=}"
         )
@@ -269,6 +279,9 @@ def decode_one(
         "decode_completion_tokens": tokens,
         "full_completion_tokens": tokens + 1,
         "finish_reason": finish_reason,
+        "client_stop_reason": "profile_window_complete" if cancelled else None,
+        "server_reported_usage": not cancelled,
+        "requested_full_completion_tokens": output_tokens,
         "content_sha256": hashlib.sha256("".join(content).encode()).hexdigest(),
         "token_ids_sha256": hashlib.sha256(
             json.dumps(generated_ids, separators=(",", ":")).encode()
@@ -334,7 +347,7 @@ def measure_steady_window(samples, requests, origin):
 
 def run_burst(
     opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1,
-    sample_path=None,
+    sample_path=None, profile_directory=None,
 ):
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
@@ -354,10 +367,14 @@ def run_burst(
     samples = []
     monitor_stop = threading.Event()
     profile_events = []
+    profile_stop = threading.Event() if profile_label else None
+    profile_errors = []
+    profile_started = time.perf_counter()
     if sample_path is not None:
         sample_path.write_text("")
 
     def monitor():
+        warmup_generation = None
         while not monitor_stop.is_set():
             stamp = time.perf_counter()
             sample_begin = len(samples)
@@ -381,14 +398,36 @@ def run_burst(
                     )
                 )
                 samples.append({"time_s": stamp, "preemptions": preemptions, **values})
+                generation = [
+                    float(v) for v in re.findall(
+                        r"^vllm:generation_tokens_total\{[^}]*\}\s+(\S+)",
+                        metrics, re.M,
+                    )
+                ]
                 steady = len(samples) >= 5 and all(
                     s.get("running") == [20.0] * 4
                     and s.get("waiting") == [0.0] * 4
                     and s.get("preemptions") == preemptions
                     for s in samples[-5:]
                 )
-                if profile_label and steady and not profile_events:
-                    profile_events.append({"armed_at_s": time.perf_counter()})
+                if profile_label and not profile_events:
+                    if not steady:
+                        warmup_generation = None
+                    elif warmup_generation is None:
+                        warmup_generation = generation
+                # At most six tokens per request per DSpark step: 1200 new
+                # tokens per DP group guarantees at least ten warmup steps.
+                warmed = warmup_generation is not None and len(generation) == 4 and all(
+                    end - begin >= 20 * 6 * 10
+                    for begin, end in zip(warmup_generation, generation)
+                )
+                if profile_label and steady and warmed and not profile_events:
+                    profile_events.append({
+                        "armed_at_s": time.perf_counter(),
+                        "warmup_generation_before": warmup_generation,
+                        "warmup_generation_after": generation,
+                        "minimum_warmup_steps": 10,
+                    })
                     profile_events[-1]["response"] = rpc(
                         opener,
                         d_url,
@@ -396,8 +435,32 @@ def run_burst(
                         120,
                         [dict(label=profile_label, steps=10, active=20)],
                     )
+                if profile_events and not profile_stop.is_set():
+                    receipts = [
+                        profile_directory / f"rank{rank}.receipt.json"
+                        for rank in range(8)
+                    ]
+                    if all(p.exists() for p in receipts):
+                        rows = [json.loads(p.read_text()) for p in receipts]
+                        if any(
+                            r["rank"] != rank or r["steps"] != 10
+                            or r["required_active"] != 20
+                            or not (profile_directory / f"rank{rank}.json.gz").exists()
+                            for rank, r in enumerate(rows)
+                        ):
+                            raise RuntimeError("incomplete eight-rank profiling receipts")
+                        profile_events[-1].update(
+                            completed_at_s=time.perf_counter(),
+                            receipts=[str(p) for p in receipts],
+                        )
+                        profile_stop.set()
+                if profile_label and time.perf_counter() - profile_started > 900:
+                    raise TimeoutError("bounded Decode profiling exceeded 900 seconds")
             except Exception as error:
                 samples.append({"time_s": stamp, "error": repr(error)})
+                if profile_label:
+                    profile_errors.append(repr(error))
+                    profile_stop.set()
             if sample_path is not None:
                 with sample_path.open("a") as journal:
                     for sample in samples[sample_begin:]:
@@ -419,6 +482,7 @@ def run_burst(
                     timeout,
                     output_tokens,
                     i % dp_size,
+                    profile_stop,
                 )
                 for i in range(concurrency)
             ]
@@ -427,6 +491,27 @@ def run_burst(
     finally:
         monitor_stop.set()
         monitor_thread.join(timeout=10)
+    if profile_label:
+        if not profile_stop.is_set():
+            raise RuntimeError("requests ended before all eight ten-step traces existed")
+        # Closing streams aborts these profiling requests through the ordinary
+        # API path. Wait for every engine to drain before idle-only stats RPCs.
+        for _ in range(240):
+            with opener.open(d_url + "/metrics", timeout=5) as response:
+                metrics = response.read().decode()
+            values = [
+                [float(v) for v in re.findall(
+                    rf"^vllm:num_requests_{name}\{{[^}}]*\}}\s+(\S+)", metrics, re.M
+                )]
+                for name in ("running", "waiting")
+            ]
+            if values == [[0.0] * 4, [0.0] * 4]:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("Decode did not drain after bounded profiling")
+        if profile_errors:
+            raise RuntimeError(f"bounded Decode profiling failed: {profile_errors}")
     active = [sum(s.get("running", [])) for s in samples]
     steady_samples = longest_steady_window(samples)
     first = min(row["first_offset_s"] for row in requests)
@@ -492,7 +577,11 @@ def main():
     )
     parser.add_argument(
         "--profile-label",
-        help="capture 10 steps per rank after C80 occupancy is steady; run separately from throughput",
+        help="capture 10 steps per rank at C80, then cancel profiling requests; run separately from throughput",
+    )
+    parser.add_argument(
+        "--profile-directory", type=Path,
+        help="shared trace directory; defaults to OUTPUT/../../profiles/LABEL",
     )
     parser.add_argument(
         "--smoke",
@@ -521,6 +610,12 @@ def main():
 
     if args.profile_label and (args.rounds != 1 or args.warmups or args.smoke):
         parser.error("profiling requires one target round without warmups")
+    if args.profile_label:
+        args.profile_directory = args.profile_directory or (
+            args.output.parent.parent / "profiles" / args.profile_label
+        )
+        if args.profile_directory.exists() and any(args.profile_directory.iterdir()):
+            parser.error("profile directory must not contain receipts from an earlier run")
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     p_url = args.prefill_url.rstrip("/")
@@ -547,9 +642,12 @@ def main():
     metadata = {
         "profiler_enabled": bool(args.profile_label),
         "throughput_comparable": not args.smoke and not args.profile_label,
-        "measurement_scope": "functional_smoke"
-        if args.smoke
-        else "steady_decode_80_active",
+        "measurement_scope": "functional_smoke" if args.smoke else (
+            "ten_profiled_decode_steps_80_active" if args.profile_label
+            else "steady_decode_80_active"
+        ),
+        "request_completion_policy": "cancel_after_all_eight_traces"
+        if args.profile_label else "complete_fixed_output_length",
         "workload": "shared-prefix weighted-interval coding, fixed output length",
         "reference_method": "SGLang-FL docker/dsv41/PROFILE_STEADY_DECODE.md",
         "deployment": "flagcx_pd",
@@ -610,6 +708,7 @@ def main():
                     args.profile_label,
                     admission["decode_dp_metric_groups"],
                     args.output.with_suffix(f".c{concurrency}.r{round_index}.metrics.jsonl"),
+                    args.profile_directory,
                 )
                 result.update(round=round_index, warmup=round_index < 0)
                 report["rounds"].append(result)

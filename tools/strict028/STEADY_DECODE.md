@@ -1,11 +1,12 @@
 # DeepSeek V4.1 Flash steady Decode validation
 
-Status at 2026-09-23 14:54 UTC: target-capacity Decode passed real-weight
-checks on all eight ranks. Two full 128K PD functional requests completed with
-identical greedy output. Their actual Prefill chunk was 4092 tokens, which
-subsequently failed numerical admission. The producer is restarting with an
-explicit 4096-token schedule and candidate prefix state cache `f800f8d`.
-Target-workload throughput is not yet measured.
+Status at 2026-09-23 15:40 UTC: all eight ranks passed the corrected 4096-token
+Prefill schedule and repeated full 128K PD/cache validation. The target C80
+long benchmark was stopped at the user's request because progress was slow.
+A five-minute server-counter interval measured 72.09 aggregate token/s,
+or 0.901 mean token/s per active request, with no waiting or preemption.
+This is an interim rate, not a completed 8192-token benchmark. Bounded
+eight-rank profiling is now running against the same target request shape.
 
 ## Workload and measurement
 
@@ -25,9 +26,14 @@ continuous metric samples. The report includes aggregate and per-request
 rates for this interval, plus complete streaming token counts.
 
 Run unprofiled throughput and profiling separately. `--profile-label LABEL`
-requires one target round and arms CPU+CUDA profiling after five steady
-occupancy samples. Every rank records ten Decode steps with stack and shape
-information. Validate the eight traces and receipts with:
+requires one target round. After five steady occupancy samples, it waits for
+at least 1200 additional generated tokens in each DP group. Since each group
+can emit at most 20 x 6 tokens per step, this guarantees at least ten warmup
+steps. Every rank then records ten Decode steps with stack and shape
+information. Once all eight traces and receipts exist, the client closes the
+streams and waits for all engines to drain. Partial streams are explicitly
+labeled; profiled rates are not comparable throughput results. The Decode
+profiling phase has a 900-second deadline. Validate the traces with:
 
 ```bash
 python tools/strict028/summarize_decode_profiles.py \
@@ -115,10 +121,13 @@ Artifacts are under `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`.
   is preserved. One cache entry plus in-flight references is retained.
   Twenty-one CPU/CUDA tests passed, including exact state/logits and three
   subsequent Decode outputs for different tails and a partial compressor group.
-  Real-model repeated PD/cache admission is pending.
+  `benchmark/real-chunked-f800f8d-8192-4096.json` passed on all eight ranks.
+  `benchmark/pd-f800f8d-prefix-cache-128k16-c1-r2.json` passed repeated 128K
+  PD/cache validation: actual chunks were all 4096, 126976 cached tokens
+  were reused, and both greedy output token hashes were identical.
 
-Next acceptance is the corrected real Prefill schedule plus repeated full-length
-PD/cache validation, then the exact C80 workload and a separate eight-rank profile.
+Next is the bounded C80 eight-rank profile and hotspot diagnosis. The incomplete
+long benchmark is retained as `cancelled_by_user`; no full-length run is queued.
 Use `benchmark_pd_decode.py --prefill-cache` to record cache and chunk counters.
 Decode remains on admitted `c01ebde`; the new producer does not change its kernels.
 Detailed chronological evidence is in `humanize/model-loop-checkpoint.md`,
