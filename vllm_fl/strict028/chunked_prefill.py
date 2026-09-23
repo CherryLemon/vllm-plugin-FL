@@ -73,7 +73,11 @@ class ChunkPrefill:
         length = self.end // ratio
         if indexer.owns_k:
             if latent is not None:
-                key = indexer.k_norm(indexer.wk(latent))
+                key = indexer.k_norm(
+                    prefill_linear(
+                        latent, indexer.wk.weight, self.prompt_length // ratio
+                    )
+                )
                 ref.apply_rotary_emb(
                     key[..., -rd:], self.compressed_frequencies(attn, key.shape[1])
                 )
@@ -87,7 +91,9 @@ class ChunkPrefill:
         )
         ref.apply_rotary_emb(q[..., -rd:], attn.freqs_cis[self.start : self.end])
         fp4_act_quant(q, inplace=True)
-        weights = indexer.weights_proj(x) * (
+        weights = prefill_linear(
+            x, indexer.weights_proj.weight, self.prompt_length
+        ) * (
             indexer.softmax_scale * indexer.n_heads**-0.5
         )
         visible = (self.positions + 1) // ratio

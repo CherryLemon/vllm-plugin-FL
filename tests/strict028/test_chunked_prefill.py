@@ -61,14 +61,18 @@ def test_chunked_prefix_matches_full_prefix_and_next_decode(sizes):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("dtype,outputs", [(torch.float32, 384), (torch.bfloat16, 512)])
-def test_chunked_projection_preserves_full_prefix_and_resets_context(dtype, outputs):
+@pytest.mark.parametrize("dtype,outputs,length,chunk", [
+    (torch.float32, 384, 128, 32),
+    (torch.bfloat16, 512, 128, 32),
+    (torch.bfloat16, 4, 8192, 4096),
+])
+def test_chunked_projection_preserves_full_prefix_and_resets_context(dtype, outputs, length, chunk):
     torch.manual_seed(732)
-    x = torch.randn(128, 5120, device="cuda", dtype=torch.bfloat16).to(dtype)
+    x = torch.randn(length, 5120, device="cuda", dtype=torch.bfloat16).to(dtype)
     weight = torch.randn(outputs, 5120, device="cuda", dtype=torch.bfloat16).to(dtype)
     expected = torch.nn.functional.linear(x, weight)
-    with prefill_geometry(128):
-        actual = torch.cat([prefill_linear(part, weight) for part in x.split(32)])
+    with prefill_geometry(length):
+        actual = torch.cat([prefill_linear(part, weight) for part in x.split(chunk)])
     assert torch.equal(actual, expected)
     # A following Decode retains its own M, including after an exception.
     with pytest.raises(RuntimeError, match="probe"):
