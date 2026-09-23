@@ -3,9 +3,10 @@
 
 The reference model specializes cache slices and compressor branches on a
 Python position. Each position therefore has its own graph. All graphs share
-one scratch state page and graph memory pool; request pages are copied in and
-out around replay. This keeps the scheduler's state ownership and FlagCX PD
-transfers unchanged while moving the target and DSpark GPU work onto graphs.
+one scratch state page; request pages are copied in and out around replay.
+Each graph has a separate allocator pool because DSpark acceptance changes the
+replay order of target and draft positions. This keeps scheduler state
+ownership and FlagCX PD transfers unchanged.
 """
 
 import time
@@ -37,7 +38,6 @@ class DecodeGraphs:
         self.model = model
         self.state = state
         self.device = device
-        self.pool = torch.cuda.graph_pool_handle()
         self.targets: dict[int, _TargetGraph] = {}
         self.drafts: dict[int, _DraftGraph] = {}
         self.target_replays = 0
@@ -92,9 +92,7 @@ class DecodeGraphs:
             torch.cuda.synchronize(self.device)
             self._copy_in(page)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(
-                graph, pool=self.pool, capture_error_mode="thread_local"
-            ):
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 logits, hidden = forward()
         finally:
             self.state.bind(block)
@@ -135,9 +133,7 @@ class DecodeGraphs:
             torch.cuda.synchronize(self.device)
             self._copy_in(page)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(
-                graph, pool=self.pool, capture_error_mode="thread_local"
-            ):
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 result = forward()
         finally:
             self.state.bind(block)

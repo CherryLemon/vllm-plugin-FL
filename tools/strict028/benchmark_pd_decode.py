@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Measure streamed Decode TPS for the full-state FlagCX PD profile.
+"""Measure streamed Decode TPS for the 80-way 128K/8192 FlagCX PD profile.
 
-The workload and first/last-content metric follow SGLang-FL's
-docker/dsv41/benchmark_decode.py. Prefill for every request finishes before a
-Decode burst starts, so its time and PD handoff do not enter the decode rate.
+The target is SGLang-FL's PROFILE_STEADY_DECODE.md, including 80 *active*
+Decode requests, DSpark block 5, and CUDA Graph. A small functional run must
+be explicitly labeled --smoke; it is not a performance comparison. Prefill
+and PD handoff finish before the Decode burst and are excluded from the rate.
 """
 
 import argparse
 import hashlib
 import importlib.util
 import json
+import re
 import statistics
 import threading
 import time
@@ -236,22 +238,60 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
         )
     prefill_end = time.perf_counter()
     barrier = threading.Barrier(concurrency + 1)
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [
-            pool.submit(
-                decode_one,
-                opener,
-                d_url,
-                prepared[i],
-                i,
-                barrier,
-                timeout,
-                output_tokens,
-            )
-            for i in range(concurrency)
-        ]
-        barrier.wait(timeout=60)
-        requests = [future.result() for future in futures]
+    samples = []
+    monitor_stop = threading.Event()
+
+    def monitor():
+        while not monitor_stop.is_set():
+            stamp = time.perf_counter()
+            try:
+                with opener.open(d_url + "/metrics", timeout=5) as response:
+                    metrics = response.read().decode()
+                values = {}
+                for name in ("running", "waiting"):
+                    values[name] = [
+                        float(v)
+                        for v in re.findall(
+                            rf"^vllm:num_requests_{name}\{{[^}}]*\}}\s+(\S+)",
+                            metrics,
+                            re.M,
+                        )
+                    ]
+                samples.append({"time_s": stamp, **values})
+            except Exception as error:
+                samples.append({"time_s": stamp, "error": repr(error)})
+            monitor_stop.wait(0.5)
+
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [
+                pool.submit(
+                    decode_one,
+                    opener,
+                    d_url,
+                    prepared[i],
+                    i,
+                    barrier,
+                    timeout,
+                    output_tokens,
+                )
+                for i in range(concurrency)
+            ]
+            barrier.wait(timeout=60)
+            requests = [future.result() for future in futures]
+    finally:
+        monitor_stop.set()
+        monitor_thread.join(timeout=10)
+    active = [sum(s.get("running", [])) for s in samples]
+    steady_samples = [
+        s for s in samples
+        if len(s.get("running", [])) == 4
+        and min(s["running"]) >= 20
+        and len(s.get("waiting", [])) == 4
+        and sum(s.get("waiting", [])) == 0
+    ]
     first = min(row["first_offset_s"] for row in requests)
     last = max(row["last_offset_s"] for row in requests)
     start = min(row["start_offset_s"] for row in requests)
@@ -284,6 +324,9 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
         "prefill_prompt_token_counts": sorted(
             {row["prefill_prompt_tokens"] for row in requests}
         ),
+        "peak_active_decode_requests": max(active, default=0),
+        "steady_c80_dp4_samples": len(steady_samples),
+        "occupancy_samples": samples,
     }
 
 
@@ -293,21 +336,36 @@ def main():
     parser.add_argument("--decode-url", required=True)
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--target-prompt-tokens", type=int, default=32637)
-    parser.add_argument("--max-model-len", type=int, default=33792)
-    parser.add_argument("--output-tokens", type=int, default=512)
-    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 16])
-    parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--rounds", type=int, default=10)
-    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--target-prompt-tokens", type=int, default=131072)
+    parser.add_argument("--max-model-len", type=int, default=139264)
+    parser.add_argument("--output-tokens", type=int, default=8192)
+    parser.add_argument("--concurrency", type=int, nargs="+", default=[80])
+    parser.add_argument("--warmups", type=int, default=0)
+    parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="label an explicitly smaller functional run; never report it as steady performance",
+    )
     args = parser.parse_args()
     if (
         args.target_prompt_tokens < 1
         or args.output_tokens < 3
         or args.target_prompt_tokens + args.output_tokens > args.max_model_len
-        or any(c < 1 or c > 16 for c in args.concurrency)
+        or any(c < 1 or c > 80 for c in args.concurrency)
+        or args.rounds < 1
+        or args.warmups < 0
     ):
         parser.error("invalid benchmark shape or concurrency")
+    if not args.smoke and (
+        args.target_prompt_tokens != 131072
+        or args.output_tokens != 8192
+        or args.concurrency != [80]
+    ):
+        parser.error(
+            "steady Decode performance requires exactly 131072 input, "
+            "8192 output, and 80 active requests; use --smoke for a smaller functional run"
+        )
 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     p_url = args.prefill_url.rstrip("/")
@@ -315,11 +373,18 @@ def main():
     encode, encoder_sha = prompt_encoder(args.model_path)
     prefix, repetitions, padding = calibrate_prompt(encode, args.target_prompt_tokens)
     prompts = [encode(request_prompt(prefix, i)) for i in range(max(args.concurrency))]
+    if max(map(len, prompts)) > args.target_prompt_tokens:
+        raise ValueError("a request variant exceeds target_prompt_tokens")
+    pad_id = encode(" note")[-1]
+    prompts = [
+        ids + [pad_id] * (args.target_prompt_tokens - len(ids)) for ids in prompts
+    ]
     if max(map(len, prompts)) + args.output_tokens > args.max_model_len:
         raise ValueError("a request variant exceeds max_model_len")
     metadata = {
+        "measurement_scope": "functional_smoke" if args.smoke else "steady_decode_80_active",
         "workload": "shared-prefix weighted-interval coding, fixed output length",
-        "reference_method": "SGLang-FL docker/dsv41/benchmark_decode.py",
+        "reference_method": "SGLang-FL docker/dsv41/PROFILE_STEADY_DECODE.md",
         "deployment": "flagcx_pd",
         "model": str(args.model_path),
         "prompt_sha256": hashlib.sha256(prefix.encode()).hexdigest(),
@@ -333,6 +398,8 @@ def main():
         "warmups_per_concurrency": args.warmups,
         "measured_rounds_per_concurrency": args.rounds,
         "concurrency": args.concurrency,
+        "required_active_decode_requests": None if args.smoke else 80,
+        "required_decode_topology": None if args.smoke else "attention TP2 x DP4; global TP8/EP8",
         "decode_tps_definition": "(Decode completion_tokens - 1)/(last_content - first_content)",
         "aggregate_decode_tps_definition": "sum(Decode completion_tokens - 1)/(last_content_any - first_content_any)",
         "prefill_phase_excluded": True,
@@ -348,6 +415,27 @@ def main():
         for url in (p_url, d_url):
             with opener.open(url + "/health", timeout=60):
                 pass
+            with opener.open(url + "/v1/models", timeout=60) as response:
+                models = json.load(response)["data"]
+            if len(models) != 1 or models[0]["max_model_len"] < (
+                args.target_prompt_tokens + args.output_tokens
+            ):
+                raise AssertionError(
+                    f"{url} does not admit the requested prompt plus output length"
+                )
+        if not args.smoke:
+            with opener.open(d_url + "/metrics", timeout=60) as response:
+                metrics = response.read().decode()
+            decode_groups = re.findall(
+                r"^vllm:num_requests_running\{[^}]*\}\s+(\S+)",
+                metrics,
+                re.M,
+            )
+            if len(decode_groups) != 4:
+                raise AssertionError(
+                    f"Decode exposes {len(decode_groups)} DP metric groups; "
+                    "the 80-way steady profile requires four"
+                )
         report["before"] = {
             "prefill_pd": rpc(opener, p_url, "fl_pd_stats", args.timeout),
             "decode_pd": rpc(opener, d_url, "fl_pd_stats", args.timeout),
@@ -371,6 +459,11 @@ def main():
                 result.update(round=round_index, warmup=round_index < 0)
                 report["rounds"].append(result)
                 save()
+                if not args.smoke and result["steady_c80_dp4_samples"] < 5:
+                    raise AssertionError(
+                        "80 active Decode requests across four DP groups with "
+                        "zero waiting were not sustained for five metric samples"
+                    )
                 print(
                     json.dumps(
                         {

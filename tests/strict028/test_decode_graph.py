@@ -77,7 +77,7 @@ def test_graphs_replay_across_positions_and_request_pages():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_target_and_draft_graphs_share_pool_without_cross_request_state():
+def test_target_and_draft_graphs_replay_out_of_capture_order():
     pages = _Pages()
     graphs = DecodeGraphs(_DraftModel(pages), pages, torch.device("cuda"))
     expected = [[0, 0], [0, 0]]
