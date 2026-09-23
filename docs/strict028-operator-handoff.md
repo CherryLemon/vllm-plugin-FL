@@ -71,10 +71,11 @@ P2: select it only after a separately validated semantic mode is defined.
 ## Coverage and integration boundaries
 
 Only H100/CUDA 12.9/Torch 2.13/Triton 3.7 execution is measured. Other chips,
-FP16-only backends, PD, graph capture of the serving graph, MTP and multimodal
-serving require separate acceptance. Standalone kernel graph checks do not
-establish distributed graph correctness. Throughput and long-context SLOs are
-not measured.
+FP16-only backends, graph capture of the serving graph and multimodal serving
+require separate acceptance. MTP and two-host FlagCX PD correctness are
+documented in `strict028-mtp-and-triton.md` and `strict028-flagcx-pd.md`;
+their acceptance does not establish distributed graph correctness. Throughput
+and long-context SLOs are not measured.
 
 The FL Eager graph explicitly records Torch reference compositions for
 unquantized projections, Indexer/top-k, routing, Engram, RoPE, norms/residuals, compressor softmax,
