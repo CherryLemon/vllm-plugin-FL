@@ -27,7 +27,7 @@ def main():
     layout = parallel_layout()
     assert layout.world_size == 8
     model, state = make_model(parallel=layout)
-    graph = BatchedDecodeGraphs(model, state, device)
+    graph = BatchedDecodeGraphs(model, state, device, batch_capacity=3)
     for page, length in ((1, 7), (2, 8), (3, 127)):
         state.bind(page, reset=True)
         with torch.device(device), set_dtype(torch.bfloat16):
@@ -70,6 +70,25 @@ def main():
             )
         torch.testing.assert_close(state.storage, expected_state, rtol=0, atol=0)
         reports.append({"positions": positions_list, "passed": True})
+    # Uneven occupancy includes a completely idle DP group. Every group still
+    # uses the same graph and EP collectives; only active request pages change.
+    count = layout.data_rank
+    positions += 1
+    initial = state.storage.clone()
+    expected_logits, expected_hidden = serial_target(
+        model, state, tokens, pages, positions, active
+    )
+    expected_state = state.storage.clone()
+    for page in pages[count:].tolist():
+        expected_state[page].copy_(initial[page])
+    state.storage.copy_(initial)
+    logits, hidden = graph.target_batch(
+        tokens[:count], pages[:count], positions[:count], active[:count]
+    )
+    torch.testing.assert_close(logits, expected_logits[:count], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(hidden, expected_hidden[:count], rtol=0, atol=0)
+    torch.testing.assert_close(state.storage, expected_state, rtol=0, atol=0)
+    reports.append({"local_requests": count, "idle_padding_passed": True})
     rows = [None] * 8
     dist.all_gather_object(
         rows,

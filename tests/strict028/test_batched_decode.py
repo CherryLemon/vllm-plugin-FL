@@ -291,3 +291,37 @@ def test_decode_statistics_preserve_real_dimension_reduction(width):
     with decode_dense_batch(20):
         actual = decode_mean(values, -1, keepdim=True)
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_fixed_capacity_graph_masks_padding_and_participates_when_idle():
+    model, state = make_model()
+    state.bind(1, reset=True)
+    with torch.device("cuda"), set_dtype(torch.bfloat16):
+        _, _, prefix_hidden = model.core(torch.tensor([[3, 2, 1]], device="cuda"), 0)
+        model.core.store_spec_context(prefix_hidden, 0)
+    initial = state.storage.clone()
+    graph = BatchedDecodeGraphs(model, state, torch.device("cuda"), batch_capacity=3)
+    tokens = torch.tensor([2], device="cuda")
+    pages = torch.tensor([1], device="cuda")
+    positions = torch.tensor([3], device="cuda")
+    active = torch.tensor([True], device="cuda")
+    expected_logits, expected_hidden = serial_target(
+        model, state, tokens, pages, positions, active
+    )
+    expected_state = state.storage.clone()
+    state.storage.copy_(initial)
+    logits, hidden = graph.target_batch(tokens, pages, positions, active)
+    torch.testing.assert_close(logits, expected_logits, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(hidden, expected_hidden, rtol=0, atol=0)
+    torch.testing.assert_close(state.storage, expected_state, rtol=0, atol=0)
+    # Empty DP lanes execute the same captured kernels and collectives, but
+    # return no samples and cannot modify either null or live request pages.
+    empty = tokens[:0]
+    idle_logits, idle_hidden = graph.target_batch(empty, empty, empty, active[:0])
+    assert idle_logits.shape[0] == idle_hidden.shape[0] == 0
+    torch.testing.assert_close(state.storage, expected_state, rtol=0, atol=0)
+    graph.draft_batch(empty, hidden[:0], empty, empty, active[:0])
+    torch.testing.assert_close(state.storage, expected_state, rtol=0, atol=0)
+    assert graph.stats()["target_batch_sizes"] == [3]
+    assert graph.stats()["draft_batch_sizes"] == [3]

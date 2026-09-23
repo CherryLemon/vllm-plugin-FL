@@ -35,8 +35,11 @@ class _Graph:
 
 
 class BatchedDecodeGraphs:
-    def __init__(self, model, state, device):
+    def __init__(self, model, state, device, *, batch_capacity=None):
+        if batch_capacity is not None and batch_capacity < 1:
+            raise ValueError("a fixed graph batch must have positive capacity")
         self.model, self.state, self.device = model, state, device
+        self.batch_capacity = batch_capacity
         self.targets, self.drafts = {}, {}
         self.target_replays = self.draft_replays = 0
         self.capture_seconds = 0.0
@@ -53,6 +56,7 @@ class BatchedDecodeGraphs:
             "draft_replays": self.draft_replays,
             "capture_seconds": self.capture_seconds,
             "page_copy_bytes": 0,
+            "batch_capacity": self.batch_capacity,
         }
 
     def _forward(self, token, context, hidden):
@@ -109,7 +113,22 @@ class BatchedDecodeGraphs:
                 "expected equally sized device token/page/position/activity vectors"
             )
         cache = self.targets if hidden is None else self.drafts
-        batch = tokens.numel()
+        real_batch = tokens.numel()
+        batch = real_batch if self.batch_capacity is None else self.batch_capacity
+        if real_batch > batch or not batch:
+            raise ValueError("request batch exceeds the configured graph capacity")
+        if real_batch < batch:
+            # Every DP rank enters equal-sized EP collectives, including idle
+            # ranks. Page zero is reserved, and inactive lanes never write it.
+            def pad(value, tail_shape=()):
+                output = value.new_zeros((batch, *tail_shape))
+                output[:real_batch].copy_(value.reshape(real_batch, *tail_shape))
+                return output
+
+            tokens, pages = pad(tokens), pad(pages)
+            positions, active = pad(positions), pad(active)
+            if hidden is not None:
+                hidden = pad(hidden, hidden.shape[1:])
         record = cache.get(batch)
         if record is None:
             record = self._capture(tokens, pages, positions, active, hidden)
@@ -125,7 +144,7 @@ class BatchedDecodeGraphs:
             self.target_replays += 1
         else:
             self.draft_replays += 1
-        return record.result
+        return tuple(value[:real_batch] for value in record.result)
 
     def target_batch(self, tokens, pages, positions, active):
         return self._replay(tokens, pages, positions, active)
