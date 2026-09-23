@@ -219,6 +219,8 @@ class ReferenceProbeExtension:
         if not isinstance(enabled, bool):
             raise ValueError("drafting mode must be a boolean")
         runner = self.model_runner
+        if runner.graph_enabled:
+            raise ValueError("drafting mode is fixed while Decode Graph is enabled")
         if enabled and not len(self.get_model().core.mtp):
             raise ValueError("this model was loaded without DSpark weights")
         runner.drafting_enabled = enabled
@@ -227,6 +229,13 @@ class ReferenceProbeExtension:
 
     def fl_mtp_stats(self):
         return {"rank": self.rank, **self.model_runner.spec_stats}
+
+    def fl_graph_stats(self):
+        graphs = self.model_runner.graphs
+        return {
+            "rank": self.rank,
+            **(graphs.stats() if graphs is not None else {"enabled": False}),
+        }
 
     def fl_mtp_differential(self, prompt_ids):
         if isinstance(prompt_ids, str):

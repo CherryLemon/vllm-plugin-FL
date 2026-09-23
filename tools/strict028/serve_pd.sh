@@ -37,6 +37,9 @@ fi
 if [[ "${VLLM_FL_EXPERIMENTAL_LONG_CONTEXT:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_EXPERIMENTAL_LONG_CONTEXT=1)
 fi
+if [[ "${VLLM_FL_DECODE_GRAPH:-0}" == 1 ]]; then
+  docker_args+=(-e VLLM_FL_DECODE_GRAPH=1)
+fi
 
 # The Docker daemon on 10.8.2.68 records --gpus all without injecting devices.
 # Explicit mappings mirror the verified GPU preflight on that host.

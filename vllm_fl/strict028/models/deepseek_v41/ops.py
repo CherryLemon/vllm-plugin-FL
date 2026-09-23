@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Explicit FL calls for the Eager compatibility profile.
+"""Explicit FL calls for the reference Prefill and Graph Decode profiles.
 
 The composition in model.py still uses PyTorch for routing, index selection,
 RoPE, Engram lookup/gating and residual arithmetic. This is a declared reference
@@ -78,9 +78,14 @@ def hc_split_sinkhorn(*args):
 
 
 EXECUTION_PROFILE = {
-    "name": "fl_dsv41_eager_reference_v1",
+    "name": (
+        "fl_dsv41_decode_graph_v1"
+        if os.environ.get("VLLM_FL_DECODE_GRAPH") == "1"
+        else "fl_dsv41_eager_reference_v1"
+    ),
     "flaggems": [
         "block_scaled_lowp_linear",
+        "block_scaled_mxfp4_moe",
         "act_quant_triton",
         "fp4_quantize_reference",
         "sparse_attention_with_sink",

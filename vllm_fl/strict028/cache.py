@@ -105,6 +105,7 @@ class RequestState:
         )
         self.storage = None
         self.active_block = None
+        self.graph_scratch = None
 
     def allocate(self, kv_cache_config, device):
         if len(kv_cache_config.kv_cache_groups) != 1:
@@ -130,10 +131,22 @@ class RequestState:
         # whose allocation, ownership and reuse are managed by the host scheduler.
         self.bind(0, reset=True)
 
+    def allocate_graph_scratch(self):
+        if self.storage is None:
+            raise ValueError("request-state pages must be allocated before graph scratch")
+        self.graph_scratch = torch.empty_like(self.storage[0])
+
+    def bind_graph_scratch(self):
+        if self.graph_scratch is None:
+            raise ValueError("graph scratch has not been allocated")
+        self._bind_page(self.graph_scratch, None, reset=False)
+
     def bind(self, block_id, *, reset=False):
         if self.storage is None or not 0 <= block_id < self.storage.shape[0]:
             raise ValueError("invalid request-state block")
-        page = self.storage[block_id]
+        self._bind_page(self.storage[block_id], block_id, reset=reset)
+
+    def _bind_page(self, page, block_id, *, reset):
         if reset:
             # PD copies the whole page, including alignment gaps. Never expose
             # bytes left by the previous request that owned this block.

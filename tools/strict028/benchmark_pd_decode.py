@@ -352,7 +352,10 @@ def main():
             "prefill_pd": rpc(opener, p_url, "fl_pd_stats", args.timeout),
             "decode_pd": rpc(opener, d_url, "fl_pd_stats", args.timeout),
             "decode_mtp": rpc(opener, d_url, "fl_mtp_stats", args.timeout),
+            "decode_graph": rpc(opener, d_url, "fl_graph_stats", args.timeout),
         }
+        if any(not row["enabled"] for row in report["before"]["decode_graph"]):
+            raise AssertionError("Decode Graph is not enabled on every rank")
         save()
         for concurrency in args.concurrency:
             measured = []
@@ -409,6 +412,7 @@ def main():
             "decode_pd": rpc(opener, d_url, "fl_pd_stats", args.timeout),
             "decode_mtp": rpc(opener, d_url, "fl_mtp_stats", args.timeout),
             "decode_tp": rpc(opener, d_url, "fl_tp_stats", args.timeout),
+            "decode_graph": rpc(opener, d_url, "fl_graph_stats", args.timeout),
         }
         expected = sum((args.warmups + args.rounds) * c for c in args.concurrency)
         for role, counter in (
@@ -428,6 +432,16 @@ def main():
                 )
         if any(row["backend"] != "flagcx" for row in report["after"]["decode_tp"]):
             raise AssertionError("Decode did not use FlagCX TP")
+        for begin, end in zip(
+            report["before"]["decode_graph"], report["after"]["decode_graph"]
+        ):
+            if (
+                end["target_replays"] <= begin["target_replays"]
+                or end["draft_replays"] <= begin["draft_replays"]
+                or end["target_graphs"] == 0
+                or end["draft_graphs"] == 0
+            ):
+                raise AssertionError("Decode or DSpark did not actually replay a graph")
         report["status"] = "passed"
     except Exception as error:
         report.update(status="failed", error=repr(error))

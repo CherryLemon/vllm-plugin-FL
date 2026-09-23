@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM 0.28 Worker and sequential Eager Runner for the FL reference graph."""
+"""vLLM 0.28 Worker for FL reference Prefill and explicit Decode Graph replay."""
 
 import json
 import logging
@@ -39,6 +39,8 @@ class ModelRunnerFL028:
         self.requests = {}
         self.drafting_enabled = model.speculative_config is not None
         self.draft_token_ids = None
+        self.graph_enabled = os.environ.get("VLLM_FL_DECODE_GRAPH") == "1"
+        self.graphs = None
         self.spec_stats = {
             "draft_steps": 0,
             "draft_tokens": 0,
@@ -54,12 +56,15 @@ class ModelRunnerFL028:
 
     def target_forward(self, tokens, position):
         ids = torch.tensor(tokens, device=self.device, dtype=torch.long)
-        logits, hidden = self.model.forward_with_aux(ids, start_pos=position)
+        if position and self.graph_enabled:
+            logits, hidden = self.graphs.target(ids, position)
+        else:
+            logits, hidden = self.model.forward_with_aux(ids, start_pos=position)
         logits = self.model.compute_logits(logits)
         if not bool(torch.isfinite(logits).all().item()):
             raise FloatingPointError("non-finite target logits")
         self.spec_stats["target_forward_calls"] += 1
-        if self.drafting_enabled:
+        if self.drafting_enabled and not (position and self.graph_enabled):
             self.model.store_draft_context(hidden, position)
         return int(logits[0].argmax().item()), hidden
 
@@ -157,11 +162,15 @@ class ModelRunnerFL028:
                 and start > 0
                 and request.computed + 5 <= self.model.args.max_seq_len
             ):
-                result = self.model.propose_draft(
-                    torch.tensor([generated[-1]], device=self.device),
-                    hidden,
-                    request.computed - 1,
-                )
+                last_token = torch.tensor([generated[-1]], device=self.device)
+                if self.graph_enabled:
+                    result = self.graphs.draft(
+                        last_token, hidden, request.computed - 1
+                    )
+                else:
+                    result = self.model.propose_draft(
+                        last_token, hidden, request.computed - 1
+                    )
                 ids, logits, confidence = result
                 if not (
                     bool(torch.isfinite(logits).all().item())
@@ -278,6 +287,13 @@ class WorkerFL028(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config):
         self.model_runner.state.allocate(kv_cache_config, self.device)
+        if self.model_runner.graph_enabled:
+            from .decode_graph import DecodeGraphs
+
+            self.model_runner.state.allocate_graph_scratch()
+            self.model_runner.graphs = DecodeGraphs(
+                self.get_model(), self.model_runner.state, self.device
+            )
         if self.vllm_config.kv_transfer_config is not None:
             # The strict FL Worker owns its TP collectives. vLLM's global KV
             # initializer assumes its own model-parallel TP group exists.

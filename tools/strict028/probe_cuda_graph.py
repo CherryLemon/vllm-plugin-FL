@@ -44,7 +44,13 @@ def main():
         raise
     finally:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps({k: v for k, v in report.items() if k != "results"}))
+        print(json.dumps({
+            "status": report["status"],
+            "endpoint": args.url,
+            "prompt_length": args.prompt_length,
+            "result_ranks": len(report.get("results", [])),
+            "error": report.get("error"),
+        }))
 
 
 if __name__ == "__main__":
