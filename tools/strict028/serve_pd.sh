@@ -75,6 +75,12 @@ if [[ -n "${FL_PROFILE_DIR:-}" ]]; then
   docker_args+=(-v "$FL_PROFILE_DIR:/profiles" -e FL_PROFILE_DIR=/profiles)
 fi
 
+if [[ -n "${FL_TRITON_CACHE_DIR:-}" ]]; then
+  mkdir -p "$FL_TRITON_CACHE_DIR"
+  docker_args+=(-v "$FL_TRITON_CACHE_DIR:/root/.triton/cache"
+                -e TRITON_CACHE_DIR=/root/.triton/cache)
+fi
+
 server_args=()
 if [[ "${VLLM_FL_CHUNKED_PREFILL:-0}" == 1 ]]; then
   server_args+=(--enable-chunked-prefill)
