@@ -93,9 +93,13 @@ class PlatformFL028(Platform):
             raise ValueError(
                 "the FL reference profile requires dtype=bfloat16 and enforce_eager=True"
             )
-        if model.max_model_len > 4096:
+        if model.max_model_len > 4096 and (
+            os.environ.get("VLLM_FL_EXPERIMENTAL_LONG_CONTEXT") != "1"
+            or model.max_model_len > 33792
+        ):
             raise ValueError(
-                "the FL reference profile is limited to 4096 tokens pending long-context validation"
+                "FL long-context admission requires "
+                "VLLM_FL_EXPERIMENTAL_LONG_CONTEXT=1 and max_model_len<=33792"
             )
         if (
             parallel.pipeline_parallel_size != 1

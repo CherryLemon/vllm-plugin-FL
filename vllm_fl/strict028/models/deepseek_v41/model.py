@@ -638,6 +638,50 @@ class Indexer(torch.nn.Module):
 
         index_k = shared_attn.index_k[:bsz, : end_pos // ratio]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        if start_pos == 0 and seqlen > 4096:
+            # The published whole-prefill einsum materializes [B,S,H,S/r],
+            # which exceeds H100 memory at the 32K benchmark shape. Score
+            # bounded query-row slices while keeping the same visibility,
+            # candidate-block and top-k decisions for each row.
+            chunks = []
+            candidate_chunks = []
+            width = index_k.size(1)
+            topk = min(self.index_topk, width)
+            key_positions = torch.arange(width, device=x.device)
+            for begin in range(0, seqlen, 256):
+                end = min(begin + 256, seqlen)
+                score = torch.einsum("bshd,btd->bsht", q[:, begin:end], index_k)
+                score = (score.relu_() * weights[:, begin:end].unsqueeze(-1)).sum(dim=2)
+                if world_size > 1:
+                    all_reduce_(score)
+                visible = (
+                    torch.arange(begin + 1, end + 1, device=x.device) // ratio
+                ).unsqueeze(-1)
+                score.masked_fill_(key_positions >= visible, -torch.inf)
+                if self.is_candidate_source:
+                    candidate_chunks.append(
+                        select_candidate_blocks(
+                            score,
+                            visible,
+                            self.candidate_topk_blocks,
+                            self.candidate_block_size,
+                            packed=True,
+                        )
+                    )
+                elif self.uses_candidates:
+                    candidates = shared_attn.candidates[:, begin:end]
+                    score.masked_fill_(
+                        ~expand_candidate_blocks(
+                            candidates, width, self.candidate_block_size
+                        ),
+                        -torch.inf,
+                    )
+                ids = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                chunks.append(torch.where(ids < visible, ids + offset, -1).int())
+            if candidate_chunks:
+                shared_attn.candidates = torch.cat(candidate_chunks, dim=1)
+            return torch.cat(chunks, dim=1)
+
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if world_size > 1:
@@ -678,6 +722,8 @@ def select_candidate_blocks(
     compress_lens: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
+    *,
+    packed: bool = False,
 ) -> torch.Tensor:
     """Level one of the two-level top-k: keep the `topk_blocks` highest-scoring blocks per query.
 
@@ -700,11 +746,34 @@ def select_candidate_blocks(
     )
 
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    if packed:
+        # Each row stores only chosen block IDs. -1 marks unreachable blocks;
+        # later Indexers expand one bounded row slice at a time.
+        return torch.where(top.values > -torch.inf, top.indices, -1).int()
     # fewer reachable blocks than topk_blocks means leftover picks came back -inf: drop them
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def expand_candidate_blocks(
+    block_ids: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """Reconstruct a row slice of the original candidate mask."""
+    num_blocks = (width + block_size - 1) // block_size
+    counts = torch.zeros(
+        *block_ids.shape[:-1],
+        num_blocks,
+        device=block_ids.device,
+        dtype=torch.int16,
+    )
+    counts.scatter_add_(
+        -1,
+        block_ids.clamp_min(0).long(),
+        (block_ids >= 0).to(torch.int16),
+    )
+    return counts.ne(0).repeat_interleave(block_size, dim=-1)[..., :width]
 
 
 class Attention(nn.Module):

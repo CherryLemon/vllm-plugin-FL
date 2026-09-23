@@ -8,6 +8,9 @@ host_ip="${FL_PD_HOST_IP:?set the routable host IP}"
 model_path="${FL_MODEL_PATH:?set the checkpoint path}"
 image="${FL_RUNTIME_IMAGE:?set the pinned runtime image}"
 port="${FL_PD_API_PORT:?set the API port}"
+max_model_len="${FL_MAX_MODEL_LEN:-256}"
+max_num_seqs="${FL_MAX_NUM_SEQS:-2}"
+max_num_batched_tokens="${FL_MAX_NUM_BATCHED_TOKENS:-256}"
 case "$role" in
   kv_producer|kv_consumer) ;;
   *) echo "invalid FL_PD_ROLE: $role" >&2; exit 2 ;;
@@ -28,6 +31,9 @@ docker_args=(
   -e OMP_NUM_THREADS=1
   -v "$model_path:/models/DeepSeek-V4.1-Flash:ro"
 )
+if [[ "${VLLM_FL_EXPERIMENTAL_LONG_CONTEXT:-0}" == 1 ]]; then
+  docker_args+=(-e VLLM_FL_EXPERIMENTAL_LONG_CONTEXT=1)
+fi
 
 # The Docker daemon on 10.8.2.68 records --gpus all without injecting devices.
 # Explicit mappings mirror the verified GPU preflight on that host.
@@ -73,7 +79,8 @@ exec docker run "${docker_args[@]}" "$image" /models/DeepSeek-V4.1-Flash \
   --load-format fl_dsv41 --dtype bfloat16 \
   --generation-config vllm --override-generation-config '{"temperature":0}' \
   --tensor-parallel-size 8 --distributed-executor-backend mp \
-  --max-model-len 256 --max-num-seqs 2 --max-num-batched-tokens 256 \
+  --max-model-len "$max_model_len" --max-num-seqs "$max_num_seqs" \
+  --max-num-batched-tokens "$max_num_batched_tokens" \
   --gpu-memory-utilization 0.95 --enforce-eager \
   --no-enable-prefix-caching --no-enable-chunked-prefill --no-async-scheduling \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
