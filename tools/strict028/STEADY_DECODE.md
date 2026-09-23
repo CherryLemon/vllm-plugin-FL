@@ -1,9 +1,9 @@
 # DeepSeek V4.1 Flash steady Decode validation
 
-Status at 2026-09-23 13:22 UTC: the target Decode topology and capacity have
-passed real-weight CUDA Graph differential checks on all eight ranks.
-Chunked Prefill is still under numerical validation. No target-workload
-throughput has been measured yet.
+Status at 2026-09-23 14:29 UTC: chunked Prefill and target-capacity Decode
+have passed real-weight differential checks on all eight ranks, using runtime
+`c01ebde`. Full-length PD validation is retrying after moving the compiler
+cache to node-local storage. Target-workload throughput is not yet measured.
 
 ## Workload and measurement
 
@@ -46,7 +46,7 @@ The host source is unchanged. Runtime wheels use FlagGems `b459958`, FlagTree
 `648a6c489d2d54870d173926eda2d0ea0771b39d`. Each image stage contains a
 `deployment-manifest.json` with wheel/library hashes.
 
-Decode plugin `18f3d9b` admits max length 139264 and 20 requests per DP group.
+Decode plugin `c01ebde` admits max length 139264 and 20 requests per DP group.
 It pre-captures one fixed bucket of 20 lanes for target and draft; positions,
 page IDs and lane activity are device inputs. FlagGems kernels access each
 request's state directly, without whole-page copies during replay.
@@ -75,7 +75,7 @@ prefixes to be prepared without retaining 80 GPU pages on Prefill.
 
 Artifacts are under `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`.
 
-- `benchmark/real-target-batch-18f3d9b.json`: all eight ranks passed two real
+- `benchmark/real-target-batch-c01ebde.json`: all eight ranks passed two real
   Graph replay passes, with exact target logits/hidden/IDs and persistent
   state, and exact DSpark IDs/logits/confidence/state.
 - `benchmark/dp-b16aa3d-c1-repeat-v2.json` and `dp-b16aa3d-c8-routed.json`:
@@ -84,16 +84,20 @@ Artifacts are under `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`.
   snapshots were released. These are not target performance results.
 - `benchmark/reference-prompt-crosscheck.json`: reference prompt hash and
   131072-token lengths verified for multiple request variants.
-- `benchmark/real-chunked-18f3d9b-128-32.json` and
-  `real-chunked-18f3d9b-8192-4096.json`: chunked Prefill failed the existing
-  0.03 relative-RMS threshold, despite equal top-1 tokens. Earliest remaining
-  divergence is in FP32 router projection geometry; isolated real-weight
-  evidence is in `kernel/gate-geometry-real-weights.json`.
-- Prefill candidate `b341282` preserves complete-prefix FP32 projection
-  geometry and long-prefix mHC slicing. Five CUDA tests passed. Real-weight
-  deployment validation is pending; do not treat this candidate as admitted.
+- `benchmark/real-chunked-c01ebde-{128-32,512-128,8192-4096}.json`:
+  all eight ranks passed. The 512/128 and 8192/4096 partitions produce exact
+  logits, next three Decode outputs and persistent state. The 128/32 case
+  remains within the existing 0.03 relative-RMS threshold with equal top-1.
+  Prefill preserves complete-prefix projection geometry for router,
+  compressor and indexer projections; short grouped projections retain the
+  reference row geometry. These changes do not affect Decode graph inputs.
+- The first full-length PD attempt encountered a FlagTree cache cleanup
+  `EBUSY` on the shared filesystem. The same runtime now uses node-local
+  Docker volumes selected by `FL_TRITON_CACHE_VOLUME`. Eight concurrent
+  cache writers completed 800 writes successfully. Shared cache directories
+  serve only as seeds/archives; live compilation uses the local volume.
 
-Next acceptance is corrected real-weight Prefill, a full-length PD functional
-run, then the exact C80 unprofiled workload and a separate eight-rank profile.
+Next acceptance is a repeated full-length PD functional run, then the exact
+C80 unprofiled workload and a separate eight-rank profile.
 Detailed chronological evidence is in `humanize/model-loop-checkpoint.md`,
 `analysis/root-cause.md` and `history/attempts.jsonl` in the campaign directory.
