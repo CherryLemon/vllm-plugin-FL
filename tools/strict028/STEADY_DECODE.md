@@ -1,12 +1,17 @@
 # DeepSeek V4.1 Flash steady Decode validation
 
-Status at 2026-09-23 15:40 UTC: all eight ranks passed the corrected 4096-token
+Status at 2026-09-23 16:37 UTC: all eight ranks passed the corrected 4096-token
 Prefill schedule and repeated full 128K PD/cache validation. The target C80
 long benchmark was stopped at the user's request because progress was slow.
 A five-minute server-counter interval measured 72.09 aggregate token/s,
 or 0.901 mean token/s per active request, with no waiting or preemption.
 This is an interim rate, not a completed 8192-token benchmark. Bounded
-eight-rank profiling is now running against the same target request shape.
+eight-rank profiling has passed against the same target request shape: ten steps
+per rank, each with six target and one draft CUDA Graph replay. Median GPU span
+is 5523.503 ms/step. Routed MoE and FP32 AllReduce account for about 88.34% of
+kernel time; cross-rank evidence identifies substantial MoE imbalance and EP
+waiting. See [the profiling report](PROFILE_STEADY_DECODE.md) for source mapping,
+timestamp limitations and the next optimization priorities. All streams drained.
 
 ## Workload and measurement
 
@@ -66,7 +71,8 @@ The host source is unchanged. Runtime wheels use FlagGems `b459958`, FlagTree
 `648a6c489d2d54870d173926eda2d0ea0771b39d`. Each image stage contains a
 `deployment-manifest.json` with wheel/library hashes.
 
-Decode plugin `c01ebde` admits max length 139264 and 20 requests per DP group.
+Decode plugin `0f62694` retains the `c01ebde` numerical/Graph path and adds early
+CUPTI host-buffer configuration. It admits max length 139264 and 20 requests per DP group.
 It pre-captures one fixed bucket of 20 lanes for target and draft; positions,
 page IDs and lane activity are device inputs. FlagGems kernels access each
 request's state directly, without whole-page copies during replay.
@@ -81,8 +87,8 @@ two launches per step. Do not equate their per-step kernel counts.
 Each rank holds 21 state pages of 452419584 bytes (including the inactive
 page). Target-capacity startup and Graph capture succeeded. Physical free
 memory after numerical checks was about 212 MiB on rank 0, with additional
-unused Torch reserve. Live transfer/request/profiling peaks remain to be
-validated. Differential probes use CPU snapshots to avoid cloning several
+unused Torch reserve. C80 live transfer and bounded profiling subsequently passed
+with CUPTI pinned-host activity buffers. Differential probes use CPU snapshots to avoid cloning several
 GiB of live state on the GPU.
 
 Prefill has four GPU slots and 80 independent pinned-host snapshot slots per
@@ -138,9 +144,12 @@ Artifacts are under `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`.
   PD/cache validation: actual chunks were all 4096, 126976 cached tokens
   were reused, and both greedy output token hashes were identical.
 
-Next is the bounded C80 eight-rank profile and hotspot diagnosis. The incomplete
+The bounded C80 eight-rank profile and hotspot diagnosis are complete. Next
+prioritize grouped routed MoE in FlagGems/FlagTree and batched MTP verification,
+with numerical/state admission before repeating the bounded profile. The incomplete
 long benchmark is retained as `cancelled_by_user`; no full-length run is queued.
 Use `benchmark_pd_decode.py --prefill-cache` to record cache and chunk counters.
-Decode remains on admitted `c01ebde`; the new producer does not change its kernels.
+Decode is on `0f62694` for profiling reliability; its kernels retain the admitted
+`c01ebde` path. The producer's prefix cache does not change Decode kernels.
 Detailed chronological evidence is in `humanize/model-loop-checkpoint.md`,
 `analysis/root-cause.md` and `history/attempts.jsonl` in the campaign directory.
