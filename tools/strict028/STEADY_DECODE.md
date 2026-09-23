@@ -1,117 +1,99 @@
-# DeepSeek V4.1 Flash steady Decode admission
+# DeepSeek V4.1 Flash steady Decode validation
 
-2026-09-23 follow-up: `VLLM_FL_BATCHED_DECODE=1` (also requires
-`VLLM_FL_DECODE_GRAPH=1`) selects the new device-position batch graph. Graphs
-are keyed by actual batch size; page IDs, positions and lane activity are
-device inputs. FlagGems reads window/compressed/index state directly from
-request pages. Replay copies no whole state page. Target verification currently
-advances draft positions sequentially while batching requests; this is an
-intermediate engineering step, not the final two-graph parallel DSpark path.
+Status at 2026-09-23 13:22 UTC: the target Decode topology and capacity have
+passed real-weight CUDA Graph differential checks on all eight ranks.
+Chunked Prefill is still under numerical validation. No target-workload
+throughput has been measured yet.
 
-Focused tests under pinned FlagTree: 33 passed, including actual model
-compositions at batch 3 and 20, target/draft replay across position/page changes,
-exact persistent state, inactive-lane preservation, all six acceptance lengths,
-and previous request-state/PD/Graph tests. The dense FP32 compatibility path
-preserves per-request projection shape to avoid cuBLAS reduction changes.
-Real 8-rank checks on `79243d3` passed C1 PD repetition with the same 15 token
-IDs as the admitted serial reference. The heterogeneous 3-request differential
-did **not** pass: persistent-state differences first appear at layer 5 and
-the second target step selects a different token. Do not use this candidate's
-multi-request output for performance acceptance. `449965f` adds an optional
-eager activation probe (`diagnose_layers` in the differential RPC) to locate
-the first difference without changing model bindings. Its state restoration
-and hook cleanup passed a focused test.
+## Workload and measurement
 
-Real 8-rank acceptance and target topology/long-context work are tracked in
-`/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`. Unit tests do not establish
-target-workload throughput. Existing admission limits remain in force.
+The reference is `/root/sglang-plugin-FL/docker/dsv41/PROFILE_STEADY_DECODE.md`
+and `FLAGCX_PD.md`: 80 active requests, each with exactly 131072 input tokens
+and 8192 generated tokens, greedy sampling and `ignore_eos=True`. The coding
+prompt hash matches the reference. Prefill uses TP8/EP8 on `.13`; Decode uses
+attention TP2 × DP4 and global EP8 on eight H100 80GB cards on `.68`.
+DSpark proposes five tokens. Decode must use actual CUDA Graph replay.
 
-The reference workload is the SGLang-FL `PROFILE_STEADY_DECODE.md` run, not the
-older 32K/512 single-node benchmark: 80 concurrent requests, exactly 131072
-input tokens and 8192 generated tokens each (`ignore_eos=True`). Prefill runs
-on a separate TP8/EP8 node. Decode uses eight H100 80GB cards with global
-EP8, attention TP2 × DP4, DSpark block 5 and CUDA Graph. A valid steady window
-has 20 running requests in each DP group, no waiting or state transfer, and
-Graph enabled. The reference profiler sampled ten Decode forward steps per
-rank after reaching that state; throughput used separate, unprofiled rounds.
+`benchmark_pd_decode.py` defaults to this workload. Smaller functional runs
+require `--smoke` and cannot be reported as comparable performance. Requests
+are routed evenly across the four Decode groups. Prefill and FlagCX handoff
+are excluded from the steady rate. The common measured interval requires
+20 running requests per group, zero waiting, stable preemption counts, and
+continuous metric samples. The report includes aggregate and per-request
+rates for this interval, plus complete streaming token counts.
 
-`benchmark_pd_decode.py` now defaults to this shape. A smaller request requires
-`--smoke` and is labeled functional only. Before tokenizing 80 long prompts,
-the script checks both servers' admitted context and four Decode DP metric
-groups. During the burst it samples running and waiting requests, and rejects
-a result without at least five samples showing all four groups at 20 active
-requests and zero waiting. This prevents 80 queued clients from being reported
-as 80-way steady Decode.
+Run unprofiled throughput and profiling separately. `--profile-label LABEL`
+requires one target round and arms CPU+CUDA profiling after five steady
+occupancy samples. Every rank records ten Decode steps with stack and shape
+information. Validate the eight traces and receipts with:
 
-## Current 0.28.0 plugin admission
+```bash
+python tools/strict028/summarize_decode_profiles.py \
+  /public-nvme/yjwu/dsv41-fl-028/campaign-steady/profiles/LABEL \
+  --output /public-nvme/yjwu/dsv41-fl-028/campaign-steady/profiles/LABEL-summary.json
+```
 
-The `.13` Prefill / `.68` Decode deployment currently has max context 33792,
-`max_num_seqs=16`, and TP8/DP1 on Decode. Its Worker executes one request at a
-time across all eight ranks. The platform explicitly rejects DP>1 and context
-above 33792. Therefore it cannot admit the reference workload, irrespective
-of client concurrency.
+The summary checks actual launch counts against per-step replay counters.
+It reports kernel sums, overlapping-kernel union time and GPU span separately;
+these are not interchangeable with unprofiled token throughput.
 
-The request-state allocation makes the capacity limit quantitative. The
-plugin's meta-device `Transformer` plus `RequestState` computes 114065408 bytes
-(108.78 MiB) per rank at the deployed 33792 context, exactly matching the live
-FlagCX page size. At the required 139264 total-token context it computes
-452419584 bytes (431.46 MiB) per request per rank. Eighty live pages plus the
-scheduler's null page and one Graph scratch page would require 34.55 GiB per
-rank. The real-weight loader reports 67366074352 bytes (62.74 GiB) of local
-parameters per rank; these two allocations alone total 97.29 GiB per rank,
-before activations, communication, Graph storage, and safety margin. They
-cannot fit an H100 80GB card in TP8/DP1.
+## Implemented deployment
 
-Attention TP2 × DP4 would reduce request pages to 20 per rank, but is not a
-launch-flag change in this implementation. Model weight and activation shards,
-FlagCX collective groups, the request-state manager, PD transfer mapping, and
-the Worker scheduler all currently assume one homogeneous TP8 group. The
-Decode runner also captures one graph per absolute sequence position, which
-does not scale to an 8192-token output. The 128-input/16-output functional
-request initially captured 15 target and four draft graphs in 21.05 seconds;
-this first-use interval is not steady performance.
+The base is `vllm/vllm-openai:v0.28.0-cu129`, with official vLLM commit
+`2cf0a6915ce544dc493a0990f2ea38d81601128a` installed as `0.28.0+empty`.
+The host source is unchanged. Runtime wheels use FlagGems `b459958`, FlagTree
+`dbf184230982e2f7cbe6b91fa3ca1ea069833d21`, and FlagCX
+`648a6c489d2d54870d173926eda2d0ea0771b39d`. Each image stage contains a
+`deployment-manifest.json` with wheel/library hashes.
 
-## Evidence and remaining work
+Decode plugin `18f3d9b` admits max length 139264 and 20 requests per DP group.
+It pre-captures one fixed bucket of 20 lanes for target and draft; positions,
+page IDs and lane activity are device inputs. FlagGems kernels access each
+request's state directly, without whole-page copies during replay.
+The official host's `--enforce-eager` disables its own graph manager; the FL
+runner explicitly captures and replays its independent graphs.
 
-- Source workload: `/root/sglang-plugin-FL/docker/dsv41/PROFILE_STEADY_DECODE.md`
-  and `FLAGCX_PD.md` in the same directory.
-- Functional PD Graph receipt before graph-pool isolation:
-  `/public-nvme/yjwu/dsv41-fl-028/evidence/decode-graph-pd-smoke-128x16.json`.
-  FlagCX transferred one page on every rank, and target/draft Graph replayed.
-- Identical follow-up requests produced different content hashes with both
-  shared and independent graph allocator pools; see the `repeat`, `repeat3`,
-  and `decode-graph-isolated-repeat-128x16-c1-r3.json` receipts beside that
-  first result. Independent pools were insufficient to fix the drift.
-- The model's one-entry LRU caches for window and DSpark index tensors can
-  evict a GPU tensor while a captured graph still retains its raw address.
-  Graph-owned references to those tensors and a cross-position GPU regression
-  test have been added. The targeted Graph/request-state/PD/MTP suite passed
-  22 tests in the new runtime image.
-- Eager Decode with the same Prefill node, checkpoint, FlagCX transfer, and
-  128/16 prompt returned identical 15-token sequences in three rounds:
-  `/public-nvme/yjwu/dsv41-fl-028/evidence/decode-eager-repeat-tokens-128x16.json`.
-  Its text hash matches the first cold-capture Graph request. This confines the
-  later drift to the Graph path rather than the shared Prefill state.
-- The corrected Graph image `local/dsv41-fl:decode-graph-4870e10` passed three
-  identical PD requests starting from an empty graph cache. All 15 Decode
-  token IDs and the text hash match the Eager receipt in every round. The
-  eight-rank service captured 15 target and four draft graphs and replayed
-  them 45 and 12 times. Receipt:
-  `/public-nvme/yjwu/dsv41-fl-028/evidence/decode-graph-lru-fixed-repeat-tokens-128x16.json`.
-  Three later C=1 functional rounds reused these graphs with no capture; a
-  C=4 functional round reached four active Decode requests and transferred
-  exactly four FlagCX pages on every rank. Receipts:
-  `decode-graph-lru-fixed-smoke-c1-r3.json` and
-  `decode-graph-lru-fixed-smoke-c4.json` in the same evidence directory.
-- The actual 80×128K/8192 benchmark was rejected before prompt preparation.
-  Both servers advertise max context 33792 and Decode exposes one DP metric
-  group. Receipt:
-  `/public-nvme/yjwu/dsv41-fl-028/evidence/steady-decode-80x128k8192-admission.json`.
-  No comparable 80-way performance number was produced.
+Verification currently advances the proposed positions sequentially:
+one to six target replays plus one draft replay per step. This is the
+implementation to measure, and differs from the reference SGLang trace's
+two launches per step. Do not equate their per-step kernel counts.
 
-The next performance milestone requires a paged request-state layout at 128K,
-batched Decode for 20 requests in each of four attention TP2 groups with
-global EP8, cross-topology FlagCX PD transfer, and reusable Graph buckets that
-do not specialize on every absolute position. Only after the four groups are
-observed at 20 active requests can the two unprofiled 8192-token rounds and
-ten-step per-rank profiler window be compared with SGLang-FL.
+Each rank holds 21 state pages of 452419584 bytes (including the inactive
+page). Target-capacity startup and Graph capture succeeded. Physical free
+memory after numerical checks was about 212 MiB on rank 0, with additional
+unused Torch reserve. Live transfer/request/profiling peaks remain to be
+validated. Differential probes use CPU snapshots to avoid cloning several
+GiB of live state on the GPU.
+
+Prefill has four GPU slots and 80 independent pinned-host snapshot slots per
+rank. A completed prefix is copied to a retained host slot before its GPU slot
+is released. FlagCX protocol 2 maps each TP2 consumer to the appropriate TP8
+producer lane and releases unused producer copies. This permits all 80
+prefixes to be prepared without retaining 80 GPU pages on Prefill.
+
+## Evidence and remaining acceptance
+
+Artifacts are under `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`.
+
+- `benchmark/real-target-batch-18f3d9b.json`: all eight ranks passed two real
+  Graph replay passes, with exact target logits/hidden/IDs and persistent
+  state, and exact DSpark IDs/logits/confidence/state.
+- `benchmark/dp-b16aa3d-c1-repeat-v2.json` and `dp-b16aa3d-c8-routed.json`:
+  small functional PD runs passed repeated greedy requests and explicit
+  routing across four DP groups. All ranks replayed Graphs, and producer
+  snapshots were released. These are not target performance results.
+- `benchmark/reference-prompt-crosscheck.json`: reference prompt hash and
+  131072-token lengths verified for multiple request variants.
+- `benchmark/real-chunked-18f3d9b-128-32.json` and
+  `real-chunked-18f3d9b-8192-4096.json`: chunked Prefill failed the existing
+  0.03 relative-RMS threshold, despite equal top-1 tokens. Earliest remaining
+  divergence is in FP32 router projection geometry; isolated real-weight
+  evidence is in `kernel/gate-geometry-real-weights.json`.
+- Prefill candidate `b341282` preserves complete-prefix FP32 projection
+  geometry and long-prefix mHC slicing. Five CUDA tests passed. Real-weight
+  deployment validation is pending; do not treat this candidate as admitted.
+
+Next acceptance is corrected real-weight Prefill, a full-length PD functional
+run, then the exact C80 unprofiled workload and a separate eight-rank profile.
+Detailed chronological evidence is in `humanize/model-loop-checkpoint.md`,
+`analysis/root-cause.md` and `history/attempts.jsonl` in the campaign directory.
