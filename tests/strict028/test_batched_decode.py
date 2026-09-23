@@ -367,3 +367,37 @@ def test_fixed_capacity_graph_masks_padding_and_participates_when_idle():
     torch.testing.assert_close(state.storage, expected_state, rtol=0, atol=0)
     assert graph.stats()["target_batch_sizes"] == [3]
     assert graph.stats()["draft_batch_sizes"] == [3]
+
+
+@torch.inference_mode()
+def test_validation_rpc_uses_host_snapshots_and_restores_live_pages():
+    from vllm_fl.strict028.validation import ReferenceProbeExtension
+
+    model, state = make_model()
+    graphs = BatchedDecodeGraphs(model, state, torch.device("cuda"), batch_capacity=4)
+    runner = SimpleNamespace(
+        model=model,
+        state=state,
+        graphs=graphs,
+        requests={},
+        batched_decode_enabled=True,
+    )
+    worker = SimpleNamespace(
+        model_runner=runner,
+        get_model=lambda: model,
+        device=torch.device("cuda"),
+        global_rank=0,
+    )
+    original = state.storage.clone()
+    report = ReferenceProbeExtension.fl_batched_decode_differential(
+        worker, list(range(40))
+    )
+    assert torch.equal(state.storage[1:4], original[1:4])
+    assert all(
+        r["logits_equal"]
+        and r["hidden_equal"]
+        and r["state_equal"]
+        and r["draft_state_equal"]
+        and all(r["draft_equal"])
+        for r in report["passes"]
+    )

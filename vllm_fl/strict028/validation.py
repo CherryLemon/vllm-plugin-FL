@@ -315,7 +315,9 @@ class ReferenceProbeExtension:
                 if options.get("diagnose_layers"):
                     from .prefill_diagnostics import compare_prefill_layers
 
-                    diagnostics = compare_prefill_layers(self, ids, chunk_size)
+                    diagnostics = compare_prefill_layers(
+                        self, ids, chunk_size, layers=int(options.get("layers", 2))
+                    )
                 return dict(
                     rank=self.global_rank,
                     layer_diagnostics=diagnostics,
@@ -402,7 +404,11 @@ class ReferenceProbeExtension:
         state = runner.state
         if state.storage.shape[0] < 4:
             raise ValueError("the probe needs three request pages plus the null page")
-        saved = state.storage[1:4].clone()
+        # Target capacity leaves less than one extra request page on GPU.
+        # Validation snapshots belong in host RAM, outside serving graph memory.
+        if diagnose_layers and state.page_bytes > 256 << 20:
+            raise ValueError("layer hooks require a smaller validation deployment")
+        saved = state.storage[1:4].cpu()
         previous = state.active_block
         report = {"rank": self.global_rank, "passes": []}
         try:
@@ -429,7 +435,7 @@ class ReferenceProbeExtension:
                         report["layer_diagnostics"] = compare_model_layers(
                             runner, tokens, pages, positions
                         )
-                    initial = state.storage[1:4].clone()
+                    initial = state.storage[1:4].cpu()
                     serial_logits, serial_hidden = [], []
                     for i, page in enumerate(order):
                         state.bind(page)
@@ -439,7 +445,7 @@ class ReferenceProbeExtension:
                         model.core.store_spec_context(hidden, lengths[page - 1])
                         serial_logits.append(logits)
                         serial_hidden.append(hidden)
-                    expected = state.storage[1:4].clone()
+                    expected = state.storage[1:4].cpu()
                     state.storage[1:4].copy_(initial)
                     logits, hidden = runner.graphs.target_batch(
                         tokens, pages, positions, active
@@ -448,6 +454,7 @@ class ReferenceProbeExtension:
                         torch.cat(serial_logits),
                         torch.cat(serial_hidden),
                     )
+                    actual_state = state.storage[1:4].cpu()
                     row = {
                         "positions": positions.tolist(),
                         "logits_equal": torch.equal(logits, golden_logits),
@@ -456,12 +463,12 @@ class ReferenceProbeExtension:
                             logits.argmax(-1), golden_logits.argmax(-1)
                         ),
                         "logits_max_abs": float((logits - golden_logits).abs().max()),
-                        "state_equal": torch.equal(state.storage[1:4], expected),
+                        "state_equal": torch.equal(actual_state, expected),
                         "different_fields": [
                             f"{f.module}.{f.name}"
                             for f in state.fields
                             if not torch.equal(
-                                state.storage[1:4, f.offset : f.offset + f.nbytes],
+                                actual_state[:, f.offset : f.offset + f.nbytes],
                                 expected[:, f.offset : f.offset + f.nbytes],
                             )
                         ],
@@ -508,7 +515,9 @@ class ReferenceProbeExtension:
                         }
                         for c, actual in enumerate(draft)
                     ]
-                    row["draft_state_equal"] = torch.equal(state.storage[1:4], expected)
+                    row["draft_state_equal"] = torch.equal(
+                        state.storage[1:4].cpu(), expected
+                    )
                     report["passes"].append(row)
                     lengths = [p + 1 for p in lengths]
             report["graphs"] = runner.graphs.stats()
