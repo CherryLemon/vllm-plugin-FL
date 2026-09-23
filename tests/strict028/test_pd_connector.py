@@ -72,7 +72,7 @@ def test_fl_worker_initializes_connector_without_vllm_tp_group(monkeypatch):
         storage=storage,
     )
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(state=state),
+        model_runner=SimpleNamespace(state=state, graph_enabled=False),
         vllm_config=SimpleNamespace(kv_transfer_config=object()),
         device="cuda:0",
         pd_connector=None,
