@@ -44,8 +44,10 @@ all eight Decode ranks. It failed in `MoE.forward` at
 illegal during capture. The subsequent `torch.where(indices == i)` also creates
 data-dependent expert work. The failure receipt is
 `/public-nvme/yjwu/dsv41-fl-028/evidence/flagtree-fixed-pos-graph-d68.json`.
-The serving graph remains disabled; the failed probe did not make the D service
-unhealthy.
+The serving graph remains disabled. After this failed collective RPC, `/health`
+still returned 200 but the next Worker RPC re-raised the capture error; the D
+container had to be restarted before further PD testing. An API health check
+alone is insufficient after a failed capture attempt.
 
 The next implementation boundary is a graph-safe, device-routed expert path in
 FlagGems with the checkpoint's packed E2M1/UE8M0 layout and the exact clamp and
@@ -54,3 +56,18 @@ rewriting position and request-state page selection as device-side metadata.
 Finally, MTP target verification must use a fixed, GPU-controlled kernel
 sequence rather than Python breaking on the first rejected draft. None of
 these changes can be supplied by a vLLM `--no-enforce-eager` flag alone.
+
+The same FlagTree image was built and started on `.13` Prefill and `.68` Decode.
+Both running containers report vLLM `0.28.0+empty`, plugin
+`0.4.0.dev0+gdf2488c`, and active compiler `/opt/flagtree/triton/__init__.py`.
+The local image ID is `sha256:dd51d726a95c338a7ce1e808cf4e04601d59db7f3fd6784dbac05e055533353b`;
+the `.68` pip-build image ID is
+`sha256:6f0e9e3ac74fd12afbd981159e06ece2e7a05b4d045a8019d822b3fa0b1ef6a1`.
+After restarting D from the failed probe, a 128-input/16-output-token C=1
+P→D functional request passed: every P rank sent one state page, every D rank
+received one, all eight MTP ranks accepted 11 draft tokens, and no rank reported
+a fatal FlagCX error. The receipt is
+`/public-nvme/yjwu/dsv41-fl-028/evidence/flagtree-pd-smoke-128x16-c1-r2.json`.
+It used the existing Eager serving path and is not a Graph performance result.
+The requested 32K/512/C1,4,16 steady Decode benchmark remains unmeasured on
+Graph until the serving path actually captures and replays it.
