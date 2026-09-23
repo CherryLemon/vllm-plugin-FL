@@ -45,6 +45,18 @@ The summary checks actual launch counts against per-step replay counters.
 It reports kernel sums, overlapping-kernel union time and GPU span separately;
 these are not interchangeable with unprofiled token throughput.
 
+Profiling workers configure CUPTI activity attribute 8 to use pinned host
+buffers before creating their CUDA contexts. On this CUDA 12.9/H100 runtime,
+a 50000-node graph at roughly 96 MiB free device memory reproduced Xid 13
+while collecting repeated replays with the default device buffers. Setting
+the host allocation mode before context creation completed all 70 replays
+and exported all 3500000 kernel events; the same early setting also passed
+with stack and shape recording enabled. Configuring it only after graph
+capture stalled the low-memory probe. Evidence is in
+`kernel/large-graph-hostpinned-probe.json` and the corresponding profile.
+The first C80 profiling attempt failed and produced no usable model trace;
+its logs are retained separately from the retry using plugin `0f62694`.
+
 ## Implemented deployment
 
 The base is `vllm/vllm-openai:v0.28.0-cu129`, with official vLLM commit
