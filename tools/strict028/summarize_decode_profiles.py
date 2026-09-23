@@ -35,9 +35,13 @@ def summarize_rank(directory, rank):
     )
     markers = [
         e for e in events
-        if e.get("ph") == "X" and e.get("name", "").startswith("fl_decode_step_")
+        if e.get("ph") == "X" and e.get("cat") == "user_annotation"
+        and e.get("name", "").startswith("fl_decode_step_")
     ]
-    if launches != expected_launches or len(markers) != 10:
+    if (
+        launches != expected_launches or len(markers) != 10
+        or {e["name"] for e in markers} != {f"fl_decode_step_{i}" for i in range(10)}
+    ):
         raise ValueError(
             f"rank {rank}: trace has {launches}/{expected_launches} graph launches "
             f"and {len(markers)}/10 step markers"

@@ -19,7 +19,11 @@ def write_profile(directory, *, missing_launch=False, active=20):
     for step in range(10):
         rows.append(dict(active=active, min_position=131073 + step,
                          max_position=131074 + step, target_replays=2, draft_replays=1))
-        events.append(dict(ph="X", name=f"fl_decode_step_{step}", ts=step * 100, dur=40))
+        events.append(dict(ph="X", cat="user_annotation", name=f"fl_decode_step_{step}", ts=step * 100, dur=40))
+        # Kineto also projects one CPU scope onto multiple GPU streams/ranges.
+        # These are annotations of the same step, not additional steps.
+        for _ in range(3):
+            events.append(dict(ph="X", cat="gpu_user_annotation", name=f"fl_decode_step_{step}", ts=step * 100, dur=40))
         for _ in range(3):
             events.append(dict(ph="X", cat="cuda_runtime", name="cudaGraphLaunch", dur=1))
         for offset in (0, 5):
