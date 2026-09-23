@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+import torch
+
 
 def copy_reference_buffers(source, target):
     """Materialize every buffer binding, including aliases hidden by deduplication."""
@@ -236,6 +238,91 @@ class ReferenceProbeExtension:
             "rank": self.rank,
             **(graphs.stats() if graphs is not None else {"enabled": False}),
         }
+
+    @torch.inference_mode()
+    def fl_batched_decode_differential(self, prompt_ids):
+        """Compare the real batched graph with serial target/draft and state.
+
+        Run only on an idle validation deployment. This is a correctness RPC,
+        not throughput measurement; it temporarily saves three request pages.
+        """
+        import json
+
+        from .models.deepseek_v41.model import set_dtype
+
+        if isinstance(prompt_ids, str):
+            prompt_ids = json.loads(prompt_ids)
+        runner, model = self.model_runner, self.get_model()
+        if not runner.batched_decode_enabled or runner.requests:
+            raise ValueError("an idle batched Decode validation service is required")
+        if len(prompt_ids) < 3 or len(prompt_ids) + 8 >= model.args.max_seq_len:
+            raise ValueError("prompt must leave room for target/draft replay")
+        state = runner.state
+        if state.storage.shape[0] < 4:
+            raise ValueError("the probe needs three request pages plus the null page")
+        saved = state.storage[1:4].clone()
+        previous = state.active_block
+        report = {"rank": self.rank, "passes": []}
+        try:
+            lengths = [len(prompt_ids) - 2, len(prompt_ids) - 1, len(prompt_ids)]
+            with torch.device(self.device), set_dtype(torch.bfloat16):
+                for page, length in zip((1, 2, 3), lengths):
+                    state.bind(page, reset=True)
+                    _, _, hidden = model.core(torch.tensor([prompt_ids[:length]], device=self.device), 0)
+                    model.core.store_spec_context(hidden, 0)
+                for order in ((1, 2, 3), (3, 1, 2)):
+                    pages = torch.tensor(order, device=self.device)
+                    positions = torch.tensor([lengths[p - 1] for p in order], device=self.device)
+                    tokens = torch.tensor([prompt_ids[-p] for p in order], device=self.device)
+                    active = torch.ones(3, dtype=torch.bool, device=self.device)
+                    initial = state.storage[1:4].clone()
+                    serial_logits, serial_hidden = [], []
+                    for i, page in enumerate(order):
+                        state.bind(page)
+                        _, logits, hidden = model.core(tokens[i:i + 1, None], lengths[page - 1])
+                        model.core.store_spec_context(hidden, lengths[page - 1])
+                        serial_logits.append(logits)
+                        serial_hidden.append(hidden)
+                    expected = state.storage[1:4].clone()
+                    state.storage[1:4].copy_(initial)
+                    logits, hidden = runner.graphs.target_batch(tokens, pages, positions, active)
+                    golden_logits, golden_hidden = torch.cat(serial_logits), torch.cat(serial_hidden)
+                    row = {
+                        "positions": positions.tolist(),
+                        "logits_equal": torch.equal(logits, golden_logits),
+                        "hidden_equal": torch.equal(hidden, golden_hidden),
+                        "token_ids_equal": torch.equal(logits.argmax(-1), golden_logits.argmax(-1)),
+                        "logits_max_abs": float((logits - golden_logits).abs().max()),
+                        "state_equal": torch.equal(state.storage[1:4], expected),
+                        "different_fields": [
+                            f"{f.module}.{f.name}" for f in state.fields
+                            if not torch.equal(
+                                state.storage[1:4, f.offset:f.offset + f.nbytes],
+                                expected[:, f.offset:f.offset + f.nbytes],
+                            )
+                        ],
+                    }
+                    bonus = logits.argmax(-1)
+                    initial.copy_(state.storage[1:4])
+                    serial_draft = []
+                    for i, page in enumerate(order):
+                        state.bind(page)
+                        serial_draft.append(model.core.forward_spec(bonus[i:i + 1], hidden[i:i + 1], lengths[page - 1]))
+                    expected.copy_(state.storage[1:4])
+                    state.storage[1:4].copy_(initial)
+                    draft = runner.graphs.draft_batch(bonus, hidden, pages, positions, active)
+                    row["draft_equal"] = [
+                        torch.equal(actual, torch.cat([r[c] for r in serial_draft]))
+                        for c, actual in enumerate(draft)
+                    ]
+                    row["draft_state_equal"] = torch.equal(state.storage[1:4], expected)
+                    report["passes"].append(row)
+                    lengths = [p + 1 for p in lengths]
+            report["graphs"] = runner.graphs.stats()
+            return report
+        finally:
+            state.storage[1:4].copy_(saved)
+            state.bind(0 if previous is None else previous)
 
     def fl_mtp_differential(self, prompt_ids):
         if isinstance(prompt_ids, str):

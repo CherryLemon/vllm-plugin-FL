@@ -1,5 +1,22 @@
 # DeepSeek V4.1 Flash steady Decode admission
 
+2026-09-23 follow-up: `VLLM_FL_BATCHED_DECODE=1` (also requires
+`VLLM_FL_DECODE_GRAPH=1`) selects the new device-position batch graph. Graphs
+are keyed by actual batch size; page IDs, positions and lane activity are
+device inputs. FlagGems reads window/compressed/index state directly from
+request pages. Replay copies no whole state page. Target verification currently
+advances draft positions sequentially while batching requests; this is an
+intermediate engineering step, not the final two-graph parallel DSpark path.
+
+Focused tests under pinned FlagTree: 33 passed, including actual model
+compositions at batch 3 and 20, target/draft replay across position/page changes,
+exact persistent state, inactive-lane preservation, all six acceptance lengths,
+and previous request-state/PD/Graph tests. The dense FP32 compatibility path
+preserves per-request projection shape to avoid cuBLAS reduction changes.
+Real 8-rank acceptance and target topology/long-context work are tracked in
+`/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`. Unit tests do not establish
+target-workload throughput. Existing admission limits remain in force.
+
 The reference workload is the SGLang-FL `PROFILE_STEADY_DECODE.md` run, not the
 older 32K/512 single-node benchmark: 80 concurrent requests, exactly 131072
 input tokens and 8192 generated tokens each (`ignore_eos=True`). Prefill runs

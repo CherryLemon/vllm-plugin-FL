@@ -90,3 +90,59 @@ def test_truncated_scheduler_draft_span_and_next_step():
     assert runner.execute_model(scheduled([14, 15])).sampled_token_ids == [[14, 15, 16]]
     assert runner.execute_model(scheduled([], start=6)).sampled_token_ids == [[17]]
     assert target.commits == [3, 4, 5, 6]
+
+
+class BatchedOracle:
+    def __init__(self):
+        self.commits = {}
+        self.calls = []
+
+    def target_batch(self, tokens, pages, positions, active):
+        self.calls.append((pages.tolist(), positions.tolist(), active.tolist()))
+        logits = torch.zeros(len(tokens), 128)
+        for i, (page, position, enabled) in enumerate(
+            zip(pages.tolist(), positions.tolist(), active.tolist())
+        ):
+            if enabled:
+                self.commits.setdefault(page, []).append((position, int(tokens[i])))
+                logits[i, position + 11] = 1
+        return logits, positions[:, None, None].float()
+
+    def draft_batch(self, tokens, hidden, pages, positions, active):
+        torch.testing.assert_close(hidden[active, 0, 0], positions[active].float())
+        ids = tokens[:, None] + torch.arange(6)
+        return ids, torch.ones(len(tokens), 5, 128), torch.ones(len(tokens), 5)
+
+
+def test_batched_verification_masks_each_rejected_prefix_independently(monkeypatch):
+    monkeypatch.setenv("VLLM_FL_DECODE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_FL_BATCHED_DECODE", "1")
+    runner = ModelRunnerFL028(Target(), NS(), "cpu")
+    runner.graphs = BatchedOracle()
+    req_ids = [f"r{i}" for i in range(6)]
+    output = scheduled([])
+    output.scheduled_cached_reqs.req_ids = []
+    output.num_scheduled_tokens = {}
+    output.scheduled_spec_decode_tokens = {}
+    for i, req_id in enumerate(req_ids):
+        start = 3 + i
+        runner.requests[req_id] = Request(list(range(10, start + 11)), i + 1, start)
+        draft = list(range(start + 11, start + 16))
+        if i < 5:
+            draft[i] = 99
+        output.num_scheduled_tokens[req_id] = 6
+        output.scheduled_spec_decode_tokens[req_id] = draft
+    result = runner.execute_model(output)
+    assert len(runner.graphs.calls) == 6
+    for i, req_id in enumerate(req_ids):
+        start = 3 + i
+        assert result.sampled_token_ids[i] == list(range(start + 11, start + 12 + i))
+        assert runner.requests[req_id].computed == start + i + 1
+        assert runner.graphs.commits[i + 1] == [
+            (p, p + 10) for p in range(start, start + i + 1)
+        ]
+    assert runner.spec_stats["accepted_prefix_histogram"] == [1] * 6
+    assert runner.spec_stats["target_forward_calls"] == 21
+    proposals = runner.take_draft_token_ids()
+    assert proposals.req_ids == req_ids
+    assert all(len(ids) == 5 for ids in proposals.draft_token_ids)

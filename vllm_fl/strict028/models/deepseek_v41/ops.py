@@ -7,14 +7,44 @@ profile, not a claim that all operations have migrated to FlagGems.
 """
 
 import os
+from contextlib import contextmanager
 
 import torch
+
+_decode_batch_size = 1
+
+
+@contextmanager
+def decode_dense_batch(batch_size):
+    """Preserve each request's reference GEMV/GEMM reduction in a decode batch.
+
+    Changing cuBLAS M from one request to a batch can alter FP32 compressor
+    state by one ULP, which then crosses low-precision quantization boundaries.
+    This compatibility composition keeps the request dimension separate for
+    the unquantized projections. Low-precision FlagGems GEMMs remain batched.
+    """
+    global _decode_batch_size
+    previous, _decode_batch_size = _decode_batch_size, batch_size
+    try:
+        yield
+    finally:
+        _decode_batch_size = previous
 
 
 def dense_linear(x, weight):
     # Preserve the published reduction for unquantized mHC, compressor and
     # head projections. Small changes amplify at subsequent quantization ties.
     # This is an explicit reference composition, not a silent dispatch fallback.
+    if _decode_batch_size > 1:
+        if x.shape[0] % _decode_batch_size:
+            raise ValueError("dense decode projection must retain its request grouping")
+        return torch.cat(
+            [
+                torch.nn.functional.linear(part, weight)
+                for part in x.chunk(_decode_batch_size, dim=0)
+            ],
+            dim=0,
+        )
     return torch.nn.functional.linear(x, weight)
 
 
@@ -79,7 +109,9 @@ def hc_split_sinkhorn(*args):
 
 EXECUTION_PROFILE = {
     "name": (
-        "fl_dsv41_decode_graph_v1"
+        "fl_dsv41_batched_decode_graph_v1"
+        if os.environ.get("VLLM_FL_BATCHED_DECODE") == "1"
+        else "fl_dsv41_decode_graph_v1"
         if os.environ.get("VLLM_FL_DECODE_GRAPH") == "1"
         else "fl_dsv41_eager_reference_v1"
     ),

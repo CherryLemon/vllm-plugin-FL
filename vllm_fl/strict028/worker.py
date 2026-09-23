@@ -40,6 +40,9 @@ class ModelRunnerFL028:
         self.drafting_enabled = model.speculative_config is not None
         self.draft_token_ids = None
         self.graph_enabled = os.environ.get("VLLM_FL_DECODE_GRAPH") == "1"
+        self.batched_decode_enabled = os.environ.get("VLLM_FL_BATCHED_DECODE") == "1"
+        if self.batched_decode_enabled and not self.graph_enabled:
+            raise ValueError("batched Decode requires VLLM_FL_DECODE_GRAPH=1")
         self.graphs = None
         self.spec_stats = {
             "draft_steps": 0,
@@ -122,6 +125,13 @@ class ModelRunnerFL028:
                 raise ValueError("a request cannot acquire a second state block")
             request.computed = cached.num_computed_tokens[i]
 
+        if (
+            self.batched_decode_enabled
+            and output.num_scheduled_tokens
+            and all(self.requests[r].computed > 0 for r in output.num_scheduled_tokens)
+        ):
+            return self.execute_decode_batch(output)
+
         req_ids, samples, next_drafts = [], [], []
         for req_id, count in output.num_scheduled_tokens.items():
             request = self.requests[req_id]
@@ -189,6 +199,92 @@ class ModelRunnerFL028:
         self.draft_token_ids = (
             DraftTokenIds(req_ids, next_drafts) if self.drafting_enabled else None
         )
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req: i for i, req in enumerate(req_ids)},
+            sampled_token_ids=samples,
+        )
+
+    def execute_decode_batch(self, output):
+        """Verify request prefixes together, masking a lane after rejection.
+
+        Target verification remains sequential across draft positions for now;
+        different requests share each model forward and graph. A rejected lane
+        never commits its suffix to Engram, compressor, or window state.
+        """
+        req_ids = list(output.num_scheduled_tokens)
+        requests = [self.requests[r] for r in req_ids]
+        drafts = [output.scheduled_spec_decode_tokens.get(r, []) for r in req_ids]
+        for req_id, request, draft in zip(req_ids, requests, drafts):
+            if (
+                output.num_scheduled_tokens[req_id] != 1 + len(draft)
+                or len(request.tokens) != request.computed + 1
+            ):
+                raise ValueError(f"invalid scheduled decode span for {req_id}")
+        pages = torch.tensor([r.block for r in requests], device=self.device)
+        starts = torch.tensor([r.computed for r in requests], device=self.device)
+        inputs = torch.tensor([r.tokens[r.computed] for r in requests], device=self.device)
+        active_host = [True] * len(requests)
+        active = torch.ones(len(requests), device=self.device, dtype=torch.bool)
+        samples = [[] for _ in requests]
+        last_hidden = None
+        last_tokens = inputs.clone()
+        for offset in range(1 + max(map(len, drafts))):
+            if not any(active_host):
+                break
+            positions = torch.where(active, starts + offset, 0)
+            logits, hidden = self.graphs.target_batch(inputs, pages, positions, active)
+            if not bool(torch.isfinite(logits[active]).all().item()):
+                raise FloatingPointError("non-finite batched target logits")
+            selected = logits.argmax(-1)
+            selected_host = selected.tolist()
+            last_tokens = torch.where(active, selected, last_tokens)
+            if self.drafting_enabled:
+                if last_hidden is None:
+                    last_hidden = torch.zeros_like(hidden)
+                last_hidden = torch.where(active[:, None, None], hidden, last_hidden)
+            self.spec_stats["target_forward_calls"] += sum(active_host)
+            for i, enabled in enumerate(active_host):
+                if not enabled:
+                    continue
+                token = selected_host[i]
+                samples[i].append(token)
+                active_host[i] = offset < len(drafts[i]) and token == drafts[i][offset]
+            active.copy_(torch.tensor(active_host, device=self.device))
+            inputs = selected
+        next_drafts = [[] for _ in requests]
+        for request, generated, draft in zip(requests, samples, drafts):
+            request.computed += len(generated)
+            request.tokens.extend(generated)
+            if draft:
+                accepted = len(generated) - 1
+                self.spec_stats["verified_steps"] += 1
+                self.spec_stats["draft_tokens"] += len(draft)
+                self.spec_stats["accepted_tokens"] += accepted
+                self.spec_stats["accepted_prefix_histogram"][accepted] += 1
+        if self.drafting_enabled:
+            can_draft = [r.computed + 5 <= self.model.args.max_seq_len for r in requests]
+            if any(can_draft):
+                active.copy_(torch.tensor(can_draft, device=self.device))
+                positions = torch.tensor(
+                    [r.computed - 1 if enabled else 0 for r, enabled in zip(requests, can_draft)],
+                    device=self.device,
+                )
+                ids, logits, confidence = self.graphs.draft_batch(
+                    last_tokens, last_hidden, pages, positions, active
+                )
+                if not (
+                    bool(torch.isfinite(logits[active]).all().item())
+                    and bool(torch.isfinite(confidence[active]).all().item())
+                ):
+                    raise FloatingPointError("non-finite batched DSpark output")
+                for i, (enabled, row) in enumerate(zip(can_draft, ids.tolist())):
+                    if enabled:
+                        if len(row) != 6 or row[0] != samples[i][-1]:
+                            raise ValueError("DSpark must return bonus plus five drafts")
+                        next_drafts[i] = row[1:]
+                        self.spec_stats["draft_steps"] += 1
+        self.draft_token_ids = DraftTokenIds(req_ids, next_drafts) if self.drafting_enabled else None
         return ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={req: i for i, req in enumerate(req_ids)},
@@ -288,12 +384,19 @@ class WorkerFL028(WorkerBase):
     def initialize_from_config(self, kv_cache_config):
         self.model_runner.state.allocate(kv_cache_config, self.device)
         if self.model_runner.graph_enabled:
-            from .decode_graph import DecodeGraphs
+            if self.model_runner.batched_decode_enabled:
+                from .batched_graph import BatchedDecodeGraphs
 
-            self.model_runner.state.allocate_graph_scratch()
-            self.model_runner.graphs = DecodeGraphs(
-                self.get_model(), self.model_runner.state, self.device
-            )
+                self.model_runner.graphs = BatchedDecodeGraphs(
+                    self.get_model(), self.model_runner.state, self.device
+                )
+            else:
+                from .decode_graph import DecodeGraphs
+
+                self.model_runner.state.allocate_graph_scratch()
+                self.model_runner.graphs = DecodeGraphs(
+                    self.get_model(), self.model_runner.state, self.device
+                )
         if self.vllm_config.kv_transfer_config is not None:
             # The strict FL Worker owns its TP collectives. vLLM's global KV
             # initializer assumes its own model-parallel TP group exists.

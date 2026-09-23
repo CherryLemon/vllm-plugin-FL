@@ -955,6 +955,8 @@ class Attention(nn.Module):
         return shared_attn.compress_kv[:bsz, :compress_len], idxs
 
     def forward(self, x: torch.Tensor, start_pos: int):
+        if not isinstance(start_pos, int):
+            return start_pos.attention(self, x)
         bsz, seqlen, _ = x.size()
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         rd = self.rope_head_dim
@@ -1144,7 +1146,9 @@ class MoE(nn.Module):
         weights, indices = self.gate(
             x, None if image_mask is None else image_mask.flatten()
         )
-        if self.packed_gate_up is not None and x.size(0) <= 16:
+        if self.packed_gate_up is not None and (
+            x.size(0) <= 16 or getattr(self, "device_routing", False)
+        ):
             from flag_gems.fused.block_scaled_mxfp4_moe import block_scaled_mxfp4_moe
 
             y = block_scaled_mxfp4_moe(
@@ -1375,6 +1379,8 @@ def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos:
 class DSparkAttention(Attention):
     def store_context(self, main_x: torch.Tensor, start_pos: int):
         """Commit target context only; draft queries never enter the ring cache."""
+        if not isinstance(start_pos, int):
+            return start_pos.store_draft_context(self, main_x)
         assert self.compress_ratio == 0
         bsz, seqlen, _ = main_x.size()
         win = self.window_size
@@ -1398,6 +1404,8 @@ class DSparkAttention(Attention):
             self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1)
 
     def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor):
+        if not isinstance(start_pos, int):
+            return start_pos.draft_attention(self, x, main_x)
         self.store_context(main_x, start_pos)
         if start_pos == 0:
             return x

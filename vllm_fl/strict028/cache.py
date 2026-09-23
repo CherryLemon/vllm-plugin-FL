@@ -106,6 +106,7 @@ class RequestState:
         self.storage = None
         self.active_block = None
         self.graph_scratch = None
+        self.pools = {}
 
     def allocate(self, kv_cache_config, device):
         if len(kv_cache_config.kv_cache_groups) != 1:
@@ -127,9 +128,34 @@ class RequestState:
             dtype=torch.uint8,
             device=device,
         )
+        self.pools = {}
+        for field in self.fields:
+            if field.shape[0] != 1:
+                raise ValueError("request-state fields must describe one request")
+            size = torch.empty((), dtype=field.dtype).element_size()
+            shape = field.shape[1:]
+            strides, running = [], 1
+            for dim in reversed(shape):
+                strides.insert(0, running)
+                running *= dim
+            self.pools[(id(self.model.get_submodule(field.module)), field.name)] = (
+                self.storage.view(field.dtype).as_strided(
+                    (kv_cache_config.num_blocks, *shape),
+                    (self.page_bytes // size, *strides),
+                    storage_offset=field.offset // size,
+                )
+            )
         # Release construction-time request buffers; all future views are pages
         # whose allocation, ownership and reuse are managed by the host scheduler.
         self.bind(0, reset=True)
+
+    def pool(self, module, name):
+        """Stable view of one state field across scheduler-owned request pages.
+
+        Graph kernels index its page dimension with device metadata. No full
+        request page is rebound or copied for batched decode.
+        """
+        return self.pools[(id(module), name)]
 
     def allocate_graph_scratch(self):
         if self.storage is None:

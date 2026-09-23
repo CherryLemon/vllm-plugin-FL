@@ -183,6 +183,8 @@ class NgramHashState(nn.Module):
     ) -> torch.Tensor:
         """token_mask: [B, L], False for tokens that take no part in an n-gram (image spans).
         Returns the hash ids, shaped [B, L, n_engram_layers, n_hash_cols]."""
+        if not isinstance(start_pos, int):
+            return start_pos.hash(self, input_ids, token_mask)
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         if token_mask is not None:
