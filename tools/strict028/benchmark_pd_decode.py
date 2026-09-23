@@ -116,6 +116,34 @@ def rpc(opener, url, method, timeout):
         return json.load(response)["results"]
 
 
+def admit_deployment(opener, p_url, d_url, prompt_tokens, output_tokens, smoke):
+    """Reject an undersized service before preparing the 80 x 128K workload."""
+    cards = {}
+    for url in (p_url, d_url):
+        with opener.open(url + "/health", timeout=60):
+            pass
+        with opener.open(url + "/v1/models", timeout=60) as response:
+            models = json.load(response)["data"]
+        if len(models) != 1 or models[0]["max_model_len"] < (
+            prompt_tokens + output_tokens
+        ):
+            raise AssertionError(
+                f"{url} does not admit {prompt_tokens + output_tokens} total tokens"
+            )
+        cards[url] = {"max_model_len": models[0]["max_model_len"]}
+    with opener.open(d_url + "/metrics", timeout=60) as response:
+        metrics = response.read().decode()
+    decode_groups = re.findall(
+        r"^vllm:num_requests_running\{[^}]*\}\s+(\S+)", metrics, re.M
+    )
+    if not smoke and len(decode_groups) != 4:
+        raise AssertionError(
+            f"Decode exposes {len(decode_groups)} DP metric groups; "
+            "the 80-way steady profile requires four"
+        )
+    return {"models": cards, "decode_dp_metric_groups": len(decode_groups)}
+
+
 def prepare_one(opener, url, prompt_ids, timeout):
     transfer_id = "fl-bench-" + uuid.uuid4().hex
     start = time.perf_counter()
@@ -370,6 +398,10 @@ def main():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     p_url = args.prefill_url.rstrip("/")
     d_url = args.decode_url.rstrip("/")
+    admission = admit_deployment(
+        opener, p_url, d_url,
+        args.target_prompt_tokens, args.output_tokens, args.smoke,
+    )
     encode, encoder_sha = prompt_encoder(args.model_path)
     prefix, repetitions, padding = calibrate_prompt(encode, args.target_prompt_tokens)
     prompts = [encode(request_prompt(prefix, i)) for i in range(max(args.concurrency))]
@@ -400,6 +432,7 @@ def main():
         "concurrency": args.concurrency,
         "required_active_decode_requests": None if args.smoke else 80,
         "required_decode_topology": None if args.smoke else "attention TP2 x DP4; global TP8/EP8",
+        "deployment_admission": admission,
         "decode_tps_definition": "(Decode completion_tokens - 1)/(last_content - first_content)",
         "aggregate_decode_tps_definition": "sum(Decode completion_tokens - 1)/(last_content_any - first_content_any)",
         "prefill_phase_excluded": True,
@@ -412,30 +445,6 @@ def main():
         args.output.write_text(json.dumps(report, indent=2) + "\n")
 
     try:
-        for url in (p_url, d_url):
-            with opener.open(url + "/health", timeout=60):
-                pass
-            with opener.open(url + "/v1/models", timeout=60) as response:
-                models = json.load(response)["data"]
-            if len(models) != 1 or models[0]["max_model_len"] < (
-                args.target_prompt_tokens + args.output_tokens
-            ):
-                raise AssertionError(
-                    f"{url} does not admit the requested prompt plus output length"
-                )
-        if not args.smoke:
-            with opener.open(d_url + "/metrics", timeout=60) as response:
-                metrics = response.read().decode()
-            decode_groups = re.findall(
-                r"^vllm:num_requests_running\{[^}]*\}\s+(\S+)",
-                metrics,
-                re.M,
-            )
-            if len(decode_groups) != 4:
-                raise AssertionError(
-                    f"Decode exposes {len(decode_groups)} DP metric groups; "
-                    "the 80-way steady profile requires four"
-                )
         report["before"] = {
             "prefill_pd": rpc(opener, p_url, "fl_pd_stats", args.timeout),
             "decode_pd": rpc(opener, d_url, "fl_pd_stats", args.timeout),
@@ -481,6 +490,13 @@ def main():
                 if round_index >= 0:
                     measured.append(result)
             rows = [row for result in measured for row in result["requests"]]
+            if args.smoke and concurrency == 1 and len(measured) > 1:
+                hashes = {row["content_sha256"] for row in rows}
+                first_tokens = {row["prefill_first_token"] for row in rows}
+                if len(hashes) != 1 or len(first_tokens) != 1:
+                    raise AssertionError(
+                        "identical greedy PD smoke requests produced different output"
+                    )
             report["summary"][str(concurrency)] = {
                 "requests": len(rows),
                 "min_request_decode_tps": min(row["decode_tps"] for row in rows),

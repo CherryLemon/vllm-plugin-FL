@@ -21,6 +21,7 @@ class _TargetGraph:
     token: torch.Tensor
     logits: torch.Tensor
     hidden: torch.Tensor | None
+    external_inputs: tuple[torch.Tensor, ...]
 
 
 @dataclass
@@ -29,6 +30,7 @@ class _DraftGraph:
     token: torch.Tensor
     hidden: torch.Tensor
     result: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    external_inputs: tuple[torch.Tensor, ...]
 
 
 class DecodeGraphs:
@@ -71,6 +73,31 @@ class DecodeGraphs:
         page.copy_(self.state.graph_scratch)
         self.page_copy_bytes += self.state.page_bytes
 
+    def _external_inputs(self, position, *, draft):
+        """Retain tensors created before capture that its kernels still read.
+
+        The model caches sliding-window and DSpark index tensors in separate
+        one-entry LRUs. A later position evicts those tensors, but a captured
+        graph retains their raw device addresses. Each graph must own a Python
+        reference until it is destroyed.
+        """
+        args = getattr(self.model, "args", None)
+        if args is None:
+            return ()
+        from .models.deepseek_v41.model import (
+            get_dspark_topk_idxs,
+            get_window_topk_idxs,
+        )
+
+        with torch.device(self.device):
+            if draft:
+                return (
+                    get_dspark_topk_idxs(
+                        args.window_size, 1, args.dspark_block_size, position
+                    ),
+                )
+            return (get_window_topk_idxs(args.window_size, 1, 1, position),)
+
     def _capture_target(self, position, sample):
         block, page = self._active_page()
         static_token = torch.empty_like(sample)
@@ -96,7 +123,10 @@ class DecodeGraphs:
                 logits, hidden = forward()
         finally:
             self.state.bind(block)
-        record = _TargetGraph(graph, static_token, logits, hidden)
+        record = _TargetGraph(
+            graph, static_token, logits, hidden,
+            self._external_inputs(position, draft=False),
+        )
         self.targets[position] = record
         self.capture_seconds += time.monotonic() - start
         return record
@@ -137,7 +167,10 @@ class DecodeGraphs:
                 result = forward()
         finally:
             self.state.bind(block)
-        record = _DraftGraph(graph, static_token, static_hidden, result)
+        record = _DraftGraph(
+            graph, static_token, static_hidden, result,
+            self._external_inputs(position, draft=True),
+        )
         self.drafts[position] = record
         self.capture_seconds += time.monotonic() - start
         return record

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Replay must read and write the selected request page, not capture its address."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm_fl.strict028.decode_graph import DecodeGraphs
+from vllm_fl.strict028.models.deepseek_v41.model import get_window_topk_idxs
 
 
 class _Pages:
@@ -49,6 +52,18 @@ class _DraftModel(_Model):
         self.pages.active[1].add_(token[0] + hidden[0].long() + position)
         value = self.pages.active[1].clone()
         return value.view(1, 1), value.float(), value.float()
+
+
+class _CachedIndexModel(_Model):
+    args = SimpleNamespace(window_size=4, dspark_block_size=5)
+
+    def forward_with_aux(self, token, *, start_pos):
+        with torch.device(token.device):
+            indices = get_window_topk_idxs(4, 1, 1, start_pos)
+            weights = torch.arange(1, 5, device=token.device)
+        score = (indices[0, 0].long() * weights).sum()
+        self.pages.active[0].add_(token[0] + score)
+        return self.pages.active[:1].float().clone(), None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -104,3 +119,25 @@ def test_target_and_draft_graphs_replay_out_of_capture_order():
     assert graphs.stats()["draft_graphs"] == 2
     assert graphs.stats()["target_replays"] == 4
     assert graphs.stats()["draft_replays"] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graph_keeps_position_index_alive_after_lru_eviction():
+    get_window_topk_idxs.cache_clear()
+    pages = _Pages()
+    graphs = DecodeGraphs(_CachedIndexModel(pages), pages, torch.device("cuda"))
+    expected = [0, 0]
+    for block, position, token, score in (
+        (0, 16, 2, 14),
+        (1, 17, 3, 12),
+        (0, 16, 4, 14),
+        (1, 17, 5, 12),
+    ):
+        pages.bind(block)
+        logits, _ = graphs.target(
+            torch.tensor([token], dtype=torch.int64, device="cuda"), position
+        )
+        expected[block] += token + score
+        assert logits.item() == expected[block]
+        assert pages.storage[block].view(torch.int64)[0].item() == expected[block]
+    assert all(record.external_inputs for record in graphs.targets.values())
