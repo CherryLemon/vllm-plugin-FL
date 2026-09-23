@@ -18,6 +18,7 @@ from .image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
 from .ops import (
     act_quant,
     decode_mean,
+    decode_sum,
     dense_linear,
     fp4_act_quant,
     gathered_decode_batch,
@@ -428,7 +429,7 @@ class Engram(nn.Module):
         rstd = torch.rsqrt(decode_mean(h.square(), -1) + eps) * torch.rsqrt(
             decode_mean(key.square(), -1) + eps
         )
-        dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
+        dot = decode_sum(h * weight * key, -1) * rstd * self.dim**-0.5
         # signed sqrt before the sigmoid, matching the training kernel
         gate = torch.sigmoid(
             torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot)

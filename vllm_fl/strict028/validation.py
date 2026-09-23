@@ -313,6 +313,10 @@ class ReferenceProbeExtension:
                         ],
                     }
                     bonus = logits.argmax(-1)
+                    if diagnose_layers and "draft_layer_diagnostics" not in report:
+                        report["draft_layer_diagnostics"] = compare_model_layers(
+                            runner, bonus, pages, positions, draft_hidden=hidden
+                        )
                     initial.copy_(state.storage[1:4])
                     serial_draft = []
                     for i, page in enumerate(order):
@@ -323,6 +327,13 @@ class ReferenceProbeExtension:
                     draft = runner.graphs.draft_batch(bonus, hidden, pages, positions, active)
                     row["draft_equal"] = [
                         torch.equal(actual, torch.cat([r[c] for r in serial_draft]))
+                        for c, actual in enumerate(draft)
+                    ]
+                    row["draft_errors"] = [
+                        {
+                            "max_abs": float((actual.float() - torch.cat([r[c] for r in serial_draft]).float()).abs().max()),
+                            "close_1e4": torch.allclose(actual.float(), torch.cat([r[c] for r in serial_draft]).float(), rtol=1e-4, atol=1e-4),
+                        }
                         for c, actual in enumerate(draft)
                     ]
                     row["draft_state_equal"] = torch.equal(state.storage[1:4], expected)

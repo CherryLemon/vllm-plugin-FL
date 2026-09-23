@@ -7,7 +7,9 @@ from .batched_decode import DecodeBatch
 
 
 @torch.inference_mode()
-def compare_model_layers(runner, tokens, pages, positions, *, layers=None):
+def compare_model_layers(
+    runner, tokens, pages, positions, *, layers=None, draft_hidden=None
+):
     """Find the first serial-vs-batch difference before attempting capture.
 
     Hooks only clone tensors in an eager diagnostic run. Request state is
@@ -36,7 +38,11 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=None):
 
     try:
         for name, module in model.core.named_modules():
-            if not name.startswith("layers.") or int(name.split(".")[1]) >= layers:
+            if draft_hidden is None:
+                wanted = name.startswith("layers.") and int(name.split(".")[1]) < layers
+            else:
+                wanted = name.startswith("mtp.") or name in ("embed", "head", "norm")
+            if not wanted:
                 continue
             handles.append(
                 module.register_forward_pre_hook(
@@ -53,26 +59,17 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=None):
         serial_runs = []
         for i in range(tokens.numel()):
             state.bind(int(pages[i]))
-            model.core(tokens[i : i + 1, None], int(positions[i]))
-            serial_runs.append(recorded)
+            if draft_hidden is None:
+                model.core(tokens[i : i + 1, None], int(positions[i]))
+            else:
+                model.core.forward_spec(
+                    tokens[i : i + 1], draft_hidden[i : i + 1], int(positions[i])
+                )
+            lookup = {}
+            for name, kind, values in recorded:
+                lookup.setdefault((name, kind), []).append(values)
+            serial_runs.append(lookup)
             recorded = []
-        serial = []
-        for events in zip(*serial_runs):
-            name, kind = events[0][:2]
-            if any(event[:2] != (name, kind) for event in events):
-                raise AssertionError(
-                    "serial requests took different diagnostic module paths"
-                )
-            serial.append(
-                (
-                    name,
-                    kind,
-                    tuple(
-                        torch.cat(parts)
-                        for parts in zip(*(event[2] for event in events))
-                    ),
-                )
-            )
         state.storage[1:4].copy_(saved)
         context = DecodeBatch(
             state,
@@ -80,48 +77,53 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=None):
             positions[:, None],
             torch.ones_like(positions[:, None], dtype=torch.bool),
         )
-        runner.graphs._forward(tokens, context, None)
+        runner.graphs._forward(tokens, context, draft_hidden)
         result = []
-        lookup = {}
-        for name, kind, values in serial:
-            lookup.setdefault((name, kind), []).append(values)
         occurrences = {}
         for name, kind, actual in recorded:
             key = (name, kind)
             index = occurrences.get(key, 0)
             occurrences[key] = index + 1
-            if key not in lookup or index >= len(lookup[key]):
-                continue
-            expected = lookup[key][index]
-            for part, (a, e) in enumerate(zip(actual, expected)):
-                if a.shape != e.shape or not torch.equal(a, e):
-                    row = {
-                        "module": name,
-                        "kind": kind,
-                        "part": part,
-                        "actual_shape": list(a.shape),
-                        "expected_shape": list(e.shape),
-                    }
-                    if a.shape == e.shape:
-                        row.update(
-                            mismatched=int((a != e).sum()),
-                            max_abs=float((a.float() - e.float()).abs().max()),
-                            different_requests=(a != e)
-                            .flatten(1)
-                            .any(1)
-                            .nonzero()
-                            .flatten()
-                            .tolist(),
-                        )
-                    result.append(row)
+            for request, lookup in enumerate(serial_runs):
+                if key not in lookup or index >= len(lookup[key]):
+                    # A ratio2 owner publishes a key only on completed groups.
+                    # The batched path computes all lanes and masks publication.
+                    continue
+                expected = lookup[key][index]
+                for part, (full, e) in enumerate(zip(actual, expected)):
+                    width = e.shape[0]
+                    a = full[request * width : (request + 1) * width]
+                    if a.shape != e.shape or not torch.equal(a, e):
+                        row = {
+                            "module": name,
+                            "kind": kind,
+                            "part": part,
+                            "request": request,
+                            "actual_shape": list(a.shape),
+                            "expected_shape": list(e.shape),
+                        }
+                        if a.shape == e.shape:
+                            row.update(
+                                mismatched=int((a != e).sum()),
+                                max_abs=float((a.float() - e.float()).abs().max()),
+                            )
+                        result.append(row)
             if len(result) >= 24:
                 break
         statistics = []
         for name, kind, actual in recorded:
-            if kind != "input" or len(name.split(".")) != 2 or not actual:
+            if (
+                kind != "input"
+                or not name.startswith("layers.")
+                or len(name.split(".")) != 2
+                or not actual
+            ):
                 continue
-            expected = lookup[(name, kind)][0]
-            if not torch.equal(actual[0], expected[0]):
+            key = (name, kind)
+            if any(key not in lookup for lookup in serial_runs):
+                continue
+            expected = torch.cat([lookup[key][0][0] for lookup in serial_runs])
+            if not torch.equal(actual[0], expected):
                 continue
             stream = actual[0].flatten(2).float().square()
             serial_mean = torch.cat(
@@ -138,9 +140,11 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=None):
                 }
             )
         return {
-            "scope": f"first {layers} layers, all {tokens.numel()} requests, eager serial vs batch",
+            "scope": f"{'draft' if draft_hidden is not None else 'target'} layers, all {tokens.numel()} requests, eager serial vs batch",
             "first_differences": result,
-            "serial_events": len(serial),
+            "serial_events": sum(
+                sum(len(events) for events in lookup.values()) for lookup in serial_runs
+            ),
             "batch_events": len(recorded),
             "hc_statistics": statistics,
         }

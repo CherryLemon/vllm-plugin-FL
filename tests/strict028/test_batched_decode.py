@@ -17,7 +17,11 @@ from vllm_fl.strict028.models.deepseek_v41.model import (
     Transformer,
     set_dtype,
 )
-from vllm_fl.strict028.models.deepseek_v41.ops import decode_dense_batch, decode_mean
+from vllm_fl.strict028.models.deepseek_v41.ops import (
+    decode_dense_batch,
+    decode_mean,
+    decode_sum,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -254,12 +258,16 @@ def test_twenty_request_graph_keeps_cache_untouched_during_capture():
 
 
 @torch.inference_mode()
-def test_layer_probe_restores_state_and_removes_hooks():
+@pytest.mark.parametrize("draft", [False, True])
+def test_layer_probe_restores_state_and_removes_hooks(draft):
     model, state = make_model()
-    for page in (1, 2, 3):
+    hiddens = []
+    for page, length in ((1, 2), (2, 3), (3, 4)):
         state.bind(page, reset=True)
         with torch.device("cuda"), set_dtype(torch.bfloat16):
-            model.core(torch.tensor([[page, 1, 2]], device="cuda"), 0)
+            _, _, hidden = model.core(torch.arange(length, device="cuda")[None], 0)
+            model.core.store_spec_context(hidden, 0)
+            hiddens.append(hidden[:, -1:])
     saved = state.storage.clone()
     runner = SimpleNamespace(
         model=model,
@@ -271,10 +279,12 @@ def test_layer_probe_restores_state_and_removes_hooks():
             runner,
             torch.tensor([4, 5, 6]),
             torch.tensor([1, 2, 3]),
-            torch.tensor([3, 3, 3]),
+            torch.tensor([2, 3, 4]),
+            draft_hidden=torch.cat(hiddens) if draft else None,
         )
     assert report["serial_events"] > 0 and report["batch_events"] > 0
-    assert not report["first_differences"]
+    if not draft:
+        assert not report["first_differences"]
     torch.testing.assert_close(state.storage, saved, rtol=0, atol=0)
     assert not any(
         m._forward_hooks or m._forward_pre_hooks for m in model.core.modules()
@@ -290,6 +300,16 @@ def test_decode_statistics_preserve_real_dimension_reduction(width):
     reference = torch.cat([row.mean(-1, keepdim=True) for row in values.split(1)])
     with decode_dense_batch(20):
         actual = decode_mean(values, -1, keepdim=True)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batch", [3, 20])
+def test_engram_dot_sum_preserves_request_reduction(batch):
+    torch.manual_seed(41)
+    values = torch.randn(batch, 1, 4, 5120, device="cuda", dtype=torch.bfloat16).float()
+    reference = torch.cat([part.sum(-1) for part in values.split(1)])
+    with decode_dense_batch(batch):
+        actual = decode_sum(values, -1)
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 

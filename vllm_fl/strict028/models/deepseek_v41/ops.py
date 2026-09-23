@@ -76,6 +76,21 @@ def decode_mean(x, dim, keepdim=False):
     return x.mean(dim=dim, keepdim=keepdim)
 
 
+def decode_sum(x, dim, keepdim=False):
+    """Keep per-request ATen sum association, as for decode_mean."""
+    if _decode_batch_size > 1:
+        if x.shape[0] % _decode_batch_size:
+            raise ValueError("decode sum must retain its request grouping")
+        return torch.cat(
+            [
+                part.sum(dim=dim, keepdim=keepdim)
+                for part in x.chunk(_decode_batch_size, dim=0)
+            ],
+            dim=0,
+        )
+    return x.sum(dim=dim, keepdim=keepdim)
+
+
 def lowp_linear(x, weight, scale):
     from flag_gems.fused.block_scaled_lowp_linear import block_scaled_lowp_linear
 
