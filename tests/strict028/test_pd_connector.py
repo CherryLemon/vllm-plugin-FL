@@ -114,6 +114,7 @@ def test_release_is_validated_and_completes_without_copying_state():
     worker._pending_send = {"transfer": ("request", 3)}
     worker._seen_transfer_ids, worker._sent_ids = set(), set()
     worker.released_pages = 0
+    worker.host_snapshot_capacity = 0
     message = dict(
         action="release",
         layout_hash="layout",
@@ -246,3 +247,79 @@ def test_unused_sources_release_only_after_successful_gpu_install(
         ]
         assert worker._received_ids == {"request"}
         assert worker.received_pages == 1 and worker.received_bytes == 2048
+
+
+@pytest.mark.parametrize("action", ["transfer", "release"])
+def test_host_snapshot_survives_gpu_page_reuse_and_completes_once(monkeypatch, action):
+    import threading
+
+    import torch
+
+    from vllm_fl.strict028.pd_connector import FullStateFlagCXWorker
+
+    worker = object.__new__(FullStateFlagCXWorker)
+    worker.role = "kv_producer"
+    worker.storage = torch.arange(16, dtype=torch.uint8).reshape(2, 8)
+    worker.staging = torch.empty_like(worker.storage)
+    worker.host_snapshot_capacity = 2
+    worker._free_host_slots = [0, 1]
+    worker.offloaded_pages = worker.sent_pages = worker.sent_bytes = (
+        worker.released_pages
+    ) = 0
+    worker.rank, worker.tp_size, worker.model_signature = 0, 8, "model"
+    worker.spec = SimpleNamespace(
+        state_layout_hash="layout", layout_version="v1", state_page_bytes=8
+    )
+    worker._condition, worker._stop = threading.Condition(), threading.Event()
+    worker._pending_send = {}
+    worker._sent_ids, worker._received_ids, worker._seen_transfer_ids = (
+        set(),
+        set(),
+        set(),
+    )
+    worker._fatal_error = None
+    worker.timeout, worker.device = 1, "cuda:0"
+    worker._connections, worker.engine = {}, object()
+    writes = []
+    worker.flagcx = SimpleNamespace(
+        flagcxP2pGetConn=lambda *a: object(),
+        flagcxP2pBatchWriteSync=lambda conn, src, dst, sizes: writes.append(
+            worker.staging[1].clone()
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm_fl.strict028.pd_connector.torch.cuda.synchronize", lambda *a: None
+    )
+    expected = worker.storage[1].clone()
+    worker.start(SimpleNamespace(reqs_to_send={"p1": ("t1", [[1]])}))
+    assert worker.get_finished(set()) == ({"p1"}, None)
+    worker.storage[1].zero_()  # Official scheduler may now recycle this page.
+    worker.start(SimpleNamespace(reqs_to_send={"p2": ("t2", [[1]])}))
+    assert worker.get_finished(set()) == ({"p2"}, None)
+    assert torch.equal(worker.staging[1], expected)
+    assert worker.offloaded_pages == 2
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        worker.start(SimpleNamespace(reqs_to_send={"p3": ("t3", [[1]])}))
+    worker._send_one(
+        dict(
+            action=action,
+            layout_hash="layout",
+            layout_version="v1",
+            page_bytes=8,
+            rank=0,
+            tp_size=8,
+            model_signature="model",
+            transfer_id="t1",
+            host="decode",
+            rpc_port=1,
+            dst_addr=123,
+        )
+    )
+    assert worker._free_host_slots == [1]
+    assert worker.get_finished(set()) == (None, None)  # Never free GPU page twice.
+    if action == "transfer":
+        assert len(writes) == 1 and torch.equal(writes[0], expected)
+    else:
+        assert not writes
+    worker.start(SimpleNamespace(reqs_to_send={"p3": ("t3", [[1]])}))
+    assert worker.get_finished(set()) == ({"p3"}, None)

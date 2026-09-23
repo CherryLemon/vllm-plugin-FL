@@ -29,6 +29,7 @@ docker_args=(
   -e FLAGCX_BOOTSTRAP_PORT=18998
   -e FLAGCX_LIB_PATH=/opt/flagcx/build/lib/libflagcx.so
   -e FL_PD_TRANSFER_TIMEOUT_S=240
+  -e "FL_PD_HOST_SNAPSHOTS=${FL_PD_HOST_SNAPSHOTS:-0}"
   -e OPENBLAS_NUM_THREADS=1
   -e OMP_NUM_THREADS=1
   -v "$model_path:/models/DeepSeek-V4.1-Flash:ro"

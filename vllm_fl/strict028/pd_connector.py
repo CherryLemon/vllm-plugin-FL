@@ -161,6 +161,15 @@ class FullStateFlagCXWorker:
         self.role = vllm_config.kv_transfer_config.kv_role
         if self.role not in ("kv_producer", "kv_consumer"):
             raise ValueError("FL PD supports one Prefill and one Decode engine")
+        # Retain completed Prefills independently of scarce GPU request pages.
+        # The scheduler may recycle a page only after its host copy completes.
+        self.host_snapshot_capacity = int(os.environ.get("FL_PD_HOST_SNAPSHOTS", "0"))
+        if self.host_snapshot_capacity < 0 or (
+            self.host_snapshot_capacity and self.role != "kv_producer"
+        ):
+            raise ValueError("host snapshot retention is a producer-only capacity")
+        self._free_host_slots = list(range(self.host_snapshot_capacity))
+        self.offloaded_pages = 0
         self.host = get_ip()
         self.side_port = int(os.environ.get("FLAGCX_BOOTSTRAP_PORT", "8998"))
         self.timeout = int(os.environ.get("FL_PD_TRANSFER_TIMEOUT_S", "240"))
@@ -208,8 +217,13 @@ class FullStateFlagCXWorker:
             raise ValueError("FL PD state storage differs from the declared layout")
         self.storage = storage
         self.device = storage.device
+        shape = (
+            (self.host_snapshot_capacity, storage.shape[1])
+            if self.host_snapshot_capacity
+            else storage.shape
+        )
         self.staging = torch.empty(
-            storage.shape, dtype=torch.uint8, device="cpu", pin_memory=True
+            shape, dtype=torch.uint8, device="cpu", pin_memory=True
         )
         self.flagcx.flagcxP2pRegisterHost(
             self.engine, self.staging.data_ptr(), self.staging.numel()
@@ -228,7 +242,7 @@ class FullStateFlagCXWorker:
             "FL PD rank %d %s: %d pinned state pages, %d bytes each; side=%s:%d, rpc=%d",
             self.rank,
             self.role,
-            storage.shape[0],
+            self.staging.shape[0],
             self.spec.state_page_bytes,
             self.host,
             self.side_port + self.rank,
@@ -300,11 +314,12 @@ class FullStateFlagCXWorker:
             # both transferred and released copies, before reusing the page.
             with self._condition:
                 self._pending_send.pop(transfer_id)
-                self._sent_ids.add(p_req_id)
+                self._complete_send(p_req_id, block)
                 self.released_pages += 1
             return
-        self.staging[block].copy_(self.storage[block], non_blocking=False)
-        torch.cuda.synchronize(self.device)
+        if not self.host_snapshot_capacity:
+            self.staging[block].copy_(self.storage[block], non_blocking=False)
+            torch.cuda.synchronize(self.device)
         session = f"{request['host']}:{request['rpc_port']}"
         conn = self._connections.get(session)
         if conn is None:
@@ -318,9 +333,15 @@ class FullStateFlagCXWorker:
         )
         with self._condition:
             self._pending_send.pop(transfer_id, None)
-            self._sent_ids.add(p_req_id)
+            self._complete_send(p_req_id, block)
             self.sent_pages += 1
             self.sent_bytes += self.spec.state_page_bytes
+
+    def _complete_send(self, req_id, slot):
+        if self.host_snapshot_capacity:
+            self._free_host_slots.append(slot)
+        else:
+            self._sent_ids.add(req_id)
 
     def _receive_one(self, req_id: str, meta):
         assert self.storage is not None and self.staging is not None
@@ -383,7 +404,22 @@ class FullStateFlagCXWorker:
                     if groups:
                         if transfer_id in self._pending_send:
                             raise ValueError("duplicate pending PD transfer")
-                        self._pending_send[transfer_id] = (p_req_id, _one_block(groups))
+                        block = _one_block(groups)
+                        if self.host_snapshot_capacity:
+                            if not self._free_host_slots:
+                                raise RuntimeError(
+                                    "Prefill host snapshot capacity exhausted"
+                                )
+                            slot = self._free_host_slots.pop()
+                            self.staging[slot].copy_(
+                                self.storage[block], non_blocking=False
+                            )
+                            torch.cuda.synchronize(self.device)
+                            self._pending_send[transfer_id] = (p_req_id, slot)
+                            self._sent_ids.add(p_req_id)
+                            self.offloaded_pages += 1
+                        else:
+                            self._pending_send[transfer_id] = (p_req_id, block)
                 self._condition.notify_all()
         else:
             for req_id, meta in metadata.reqs_to_recv.items():
@@ -413,6 +449,8 @@ class FullStateFlagCXWorker:
                 "sent_bytes": self.sent_bytes,
                 "received_bytes": self.received_bytes,
                 "pending_sends": len(self._pending_send),
+                "host_snapshot_capacity": self.host_snapshot_capacity,
+                "offloaded_pages": self.offloaded_pages,
                 "fatal_error": self._fatal_error,
             }
 
