@@ -215,6 +215,21 @@ def reference_differential(worker, prompt_ids):
 
 
 class ReferenceProbeExtension:
+    def fl_memory_stats(self):
+        free, total = torch.cuda.mem_get_info(self.device)
+        return global_rank_report(
+            dict(
+                rank=self.global_rank,
+                free_bytes=free,
+                total_bytes=total,
+                allocated_bytes=torch.cuda.memory_allocated(self.device),
+                reserved_bytes=torch.cuda.memory_reserved(self.device),
+                peak_allocated_bytes=torch.cuda.max_memory_allocated(self.device),
+                state_pages=self.model_runner.state.storage.shape[0],
+                state_page_bytes=self.model_runner.state.page_bytes,
+            )
+        )
+
     def fl_profile_decode(self, options):
         import os
 
@@ -296,8 +311,14 @@ class ReferenceProbeExtension:
                     state.bind(2)
                     actual, _ = model.forward_with_aux(token, start_pos=position)
                     decode.append(compare(actual, reference))
+                diagnostics = None
+                if options.get("diagnose_layers"):
+                    from .prefill_diagnostics import compare_prefill_layers
+
+                    diagnostics = compare_prefill_layers(self, ids, chunk_size)
                 return dict(
                     rank=self.global_rank,
+                    layer_diagnostics=diagnostics,
                     prefill=prefill,
                     decode=decode,
                     state_differences=fields,
@@ -491,7 +512,7 @@ class ReferenceProbeExtension:
                     report["passes"].append(row)
                     lengths = [p + 1 for p in lengths]
             report["graphs"] = runner.graphs.stats()
-            return report
+            return global_rank_report(report)
         finally:
             state.storage[1:4].copy_(saved)
             state.bind(0 if previous is None else previous)

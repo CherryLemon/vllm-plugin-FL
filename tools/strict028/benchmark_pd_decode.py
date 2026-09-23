@@ -139,6 +139,14 @@ def admit_deployment(opener, p_url, d_url, prompt_tokens, output_tokens, smoke):
     decode_groups = re.findall(
         r"^vllm:num_requests_running\{[^}]*\}\s+(\S+)", metrics, re.M
     )
+    # Idle Prometheus gauges have no children until the first scheduling step.
+    # Counters already expose the configured engine labels at service startup.
+    if not decode_groups:
+        decode_groups = re.findall(
+            r"^vllm:num_preemptions_total\{[^}]*\}\s+(\S+)", metrics, re.M
+        )
+    if not decode_groups:
+        raise AssertionError("Decode exposes no DP engine metrics")
     if not smoke and len(decode_groups) != 4:
         raise AssertionError(
             f"Decode exposes {len(decode_groups)} DP metric groups; "
@@ -648,7 +656,7 @@ def main():
                 end.get(k, 0) - begin.get(k, 0)
                 for k in ("sent_pages", "released_pages")
             )
-            if completed != expected or end["pending_sends"]:
+            if completed != expected or end["pending_sends"] != begin["pending_sends"]:
                 raise AssertionError(
                     f"Prefill rank {end['rank']} retained or lost requests"
                 )

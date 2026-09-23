@@ -56,3 +56,32 @@ def test_chunked_prefix_matches_full_prefix_and_next_decode(sizes):
             state.bind(2)
             _, logits, _ = model.core(token, position)
             torch.testing.assert_close(logits, expected_logits, rtol=1e-4, atol=1e-4)
+
+
+@torch.inference_mode()
+def test_prefill_diagnostics_restore_hooks_and_only_touch_null_page():
+    from types import MethodType, SimpleNamespace
+
+    from vllm_fl.strict028.models.deepseek_v41.entry import (
+        DeepseekV41FlashFLForCausalLM,
+    )
+    from vllm_fl.strict028.prefill_diagnostics import compare_prefill_layers
+
+    model, state = make_model()
+    model.forward_with_aux = MethodType(
+        DeepseekV41FlashFLForCausalLM.forward_with_aux, model
+    )
+    model.forward_prefill_chunk = MethodType(
+        DeepseekV41FlashFLForCausalLM.forward_prefill_chunk, model
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: model, model_runner=SimpleNamespace(state=state)
+    )
+    live = state.storage[1:].clone()
+    ids = torch.arange(32, device="cuda") % 64
+    reports = compare_prefill_layers(worker, ids, 8)
+    assert [r["start"] for r in reports] == [0, 8, 16, 24]
+    assert torch.equal(live, state.storage[1:])
+    assert all(
+        not m._forward_hooks and not m._forward_pre_hooks for m in model.core.modules()
+    )
