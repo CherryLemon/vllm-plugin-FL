@@ -16,7 +16,9 @@ def compare_prefill_layers(worker, ids, chunk_size, layers=2):
                 name,
                 kind,
                 tuple(
-                    v.detach().clone()
+                    # Full-prefix module hooks otherwise retain several GiB
+                    # on each GPU before collecting the chunk activations.
+                    v.detach().to(device="cpu", copy=True)
                     for v in values
                     if isinstance(v, torch.Tensor) and v.ndim
                 ),
