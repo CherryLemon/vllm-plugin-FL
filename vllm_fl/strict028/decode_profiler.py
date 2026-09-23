@@ -1,11 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-rank, bounded Decode profiling through the public Worker extension API."""
 
+import ctypes
 import json
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
+
+
+def use_host_activity_buffers():
+    """Keep CUPTI trace buffers out of the nearly full serving device.
+
+    CUPTI's public activity attribute 8 takes a uint8_t. The CUDA 12 runtime
+    library is already loaded by this NVIDIA-only worker's PyTorch build.
+    Configure before creating a CUDA context in Worker.init_device; setting
+    it only when profiling starts does not relocate existing device buffers.
+    Fail before arming if the requested allocation mode is unavailable.
+    """
+    cupti = ctypes.CDLL("libcupti.so.12")
+    value, size = ctypes.c_uint8(1), ctypes.c_size_t(1)
+    result = cupti.cuptiActivitySetAttribute(8, ctypes.byref(size), ctypes.byref(value))
+    if result:
+        raise RuntimeError(f"CUPTI host activity buffer configuration failed: {result}")
+    value.value = 0
+    result = cupti.cuptiActivityGetAttribute(8, ctypes.byref(size), ctypes.byref(value))
+    if result or value.value != 1:
+        raise RuntimeError(f"CUPTI host activity buffer verification failed: {result}")
 
 
 class DecodeProfiler:
@@ -29,6 +50,7 @@ class DecodeProfiler:
         if count != self.active:
             raise RuntimeError("Decode occupancy changed inside the profiling window")
         if self.profiler is None:
+            use_host_activity_buffers()
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -71,6 +93,7 @@ class DecodeProfiler:
                         rank=self.rank,
                         steps=self.completed,
                         required_active=self.active,
+                        cupti_activity_buffer_location="host_pinned",
                         rows=self.rows,
                         scope="profiled Decode steps; throughput must come from an unprofiled run",
                     ),

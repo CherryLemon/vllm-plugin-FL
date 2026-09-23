@@ -39,6 +39,7 @@ def test_real_graph_profile_waits_for_occupancy_and_stops(tmp_path):
     torch.testing.assert_close(result, torch.full_like(result, 32))
     receipt = json.loads((tmp_path / "rank3.receipt.json").read_text())
     assert receipt["steps"] == 2
+    assert receipt["cupti_activity_buffer_location"] == "host_pinned"
     assert [r["target_replays"] for r in receipt["rows"]] == [1, 1]
     with gzip.open(tmp_path / "rank3.json.gz", "rt") as f:
         trace = json.load(f)

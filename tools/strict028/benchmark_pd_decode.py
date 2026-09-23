@@ -347,20 +347,25 @@ def measure_steady_window(samples, requests, origin):
 
 def run_burst(
     opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1,
-    sample_path=None, profile_directory=None,
+    sample_path=None, profile_directory=None, prepared=None,
 ):
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        prepared = []
-        for index, row in enumerate(pool.map(
-            lambda ids: prepare_one(opener, p_url, ids, timeout), prompts
-        )):
-            prepared.append(row)
-            print(json.dumps(dict(
-                event="prefill_ready", request=index, total=concurrency,
-                prefill_s=row["prefill_s"],
-            )), flush=True)
+    if prepared is None:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            prepared = []
+            for index, row in enumerate(pool.map(
+                lambda ids: prepare_one(opener, p_url, ids, timeout), prompts
+            )):
+                prepared.append(row)
+                print(json.dumps(dict(
+                    event="prefill_ready", request=index, total=concurrency,
+                    prefill_s=row["prefill_s"],
+                )), flush=True)
+    elif len(prepared) != concurrency or any(
+        row["prompt_ids"] != ids for row, ids in zip(prepared, prompts)
+    ):
+        raise ValueError("prepared handoffs do not match the requested prompts")
     prefill_end = time.perf_counter()
     print(json.dumps(dict(event="decode_burst_start", concurrency=concurrency)), flush=True)
     barrier = threading.Barrier(concurrency + 1)

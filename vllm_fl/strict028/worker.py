@@ -406,6 +406,10 @@ class ModelRunnerFL028:
 
 class WorkerFL028(WorkerBase):
     def init_device(self):
+        if os.environ.get("FL_PROFILE_DIR"):
+            from .decode_profiler import use_host_activity_buffers
+
+            use_host_activity_buffers()
         self.pd_connector = None
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         # Atomic FP32 Split-K changes mHC mixes between identical requests. The
