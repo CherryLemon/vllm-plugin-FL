@@ -385,6 +385,25 @@ class Engram(nn.Module):
     ) -> torch.Tensor:
         """x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]; token_mask: [B, L], False shuts
         the gate so those positions pass through untouched."""
+        if x.size(1) > 4096:
+            # Hash lookup, projection and gating are token-local. Avoid making
+            # full-sequence FP32 key, stream and square buffers at 32K.
+            y = torch.empty_like(x)
+            for begin in range(0, x.size(1), 256):
+                end = min(begin + 256, x.size(1))
+                mask = None if token_mask is None else token_mask[:, begin:end]
+                y[:, begin:end] = self._forward_chunk(
+                    x[:, begin:end], hash_ids[:, begin:end], mask
+                )
+            return y
+        return self._forward_chunk(x, hash_ids, token_mask)
+
+    def _forward_chunk(
+        self,
+        x: torch.Tensor,
+        hash_ids: torch.Tensor,
+        token_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
         kv = self.wkv(self.embed(hash_ids).flatten(-2))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
