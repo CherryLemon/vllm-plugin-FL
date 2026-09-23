@@ -252,6 +252,10 @@ class ReferenceProbeExtension:
 
         if isinstance(prompt_ids, str):
             prompt_ids = json.loads(prompt_ids)
+        diagnose_layers = False
+        if isinstance(prompt_ids, dict):
+            diagnose_layers = bool(prompt_ids.get("diagnose_layers"))
+            prompt_ids = prompt_ids["prompt_ids"]
         runner, model = self.model_runner, self.get_model()
         if not runner.batched_decode_enabled or runner.requests:
             raise ValueError("an idle batched Decode validation service is required")
@@ -275,6 +279,12 @@ class ReferenceProbeExtension:
                     positions = torch.tensor([lengths[p - 1] for p in order], device=self.device)
                     tokens = torch.tensor([prompt_ids[-p] for p in order], device=self.device)
                     active = torch.ones(3, dtype=torch.bool, device=self.device)
+                    if diagnose_layers and "layer_diagnostics" not in report:
+                        from .batch_diagnostics import compare_model_layers
+
+                        report["layer_diagnostics"] = compare_model_layers(
+                            runner, tokens, pages, positions
+                        )
                     initial = state.storage[1:4].clone()
                     serial_logits, serial_hidden = [], []
                     for i, page in enumerate(order):
