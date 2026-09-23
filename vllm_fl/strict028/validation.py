@@ -195,14 +195,9 @@ def reference_differential(worker, prompt_ids):
 
 class ReferenceProbeExtension:
     def fl_pd_stats(self):
-        from vllm.distributed.kv_transfer import (
-            get_kv_transfer_group,
-            has_kv_transfer_group,
-        )
-
-        if not has_kv_transfer_group():
+        if self.pd_connector is None:
             return {"rank": self.rank, "enabled": False}
-        return {"enabled": True, **get_kv_transfer_group().stats()}
+        return {"enabled": True, **self.pd_connector.stats()}
 
     def fl_tp_stats(self):
         from .collectives import tp_collective_stats

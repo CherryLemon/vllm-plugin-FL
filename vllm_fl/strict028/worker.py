@@ -10,18 +10,14 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from vllm.distributed.kv_transfer import (
-    ensure_kv_transfer_initialized,
-    ensure_kv_transfer_shutdown,
-    get_kv_transfer_group,
-    has_kv_transfer_group,
-)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from .cache import RequestState
 from .collectives import init_tp_collectives, requested_backend
 from .model_loader import FLDeepseekV41Loader
+from .pd_connector import DeepseekV41FLConnector
 from .sampling import validate_sampling
 
 logger = logging.getLogger(__name__)
@@ -193,6 +189,7 @@ class ModelRunnerFL028:
 
 class WorkerFL028(WorkerBase):
     def init_device(self):
+        self.pd_connector = None
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         # Atomic FP32 Split-K changes mHC mixes between identical requests. The
         # small rounding differences amplify through BF16 residuals and routing.
@@ -282,8 +279,12 @@ class WorkerFL028(WorkerBase):
     def initialize_from_config(self, kv_cache_config):
         self.model_runner.state.allocate(kv_cache_config, self.device)
         if self.vllm_config.kv_transfer_config is not None:
-            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-            get_kv_transfer_group().register_kv_caches(
+            # The strict FL Worker owns its TP collectives. vLLM's global KV
+            # initializer assumes its own model-parallel TP group exists.
+            self.pd_connector = DeepseekV41FLConnector(
+                self.vllm_config, KVConnectorRole.WORKER, kv_cache_config
+            )
+            self.pd_connector.register_kv_caches(
                 {"fl_request_state": self.model_runner.state.storage}
             )
         torch.cuda.empty_cache()
@@ -323,9 +324,9 @@ class WorkerFL028(WorkerBase):
         return self.model_runner.state.page_bytes
 
     def execute_model(self, scheduler_output):
-        if not has_kv_transfer_group():
+        connector = self.pd_connector
+        if connector is None:
             return self.model_runner.execute_model(scheduler_output)
-        connector = get_kv_transfer_group()
         connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
         try:
             connector.start_load_kv(None)
@@ -347,8 +348,9 @@ class WorkerFL028(WorkerBase):
         torch.cuda.synchronize(self.device)
 
     def shutdown(self):
-        if has_kv_transfer_group():
-            ensure_kv_transfer_shutdown()
+        if self.pd_connector is not None:
+            self.pd_connector.shutdown()
+            self.pd_connector = None
         if dist.is_initialized():
             dist.destroy_process_group()
         self.model_runner = None
