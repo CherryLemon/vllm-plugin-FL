@@ -20,6 +20,8 @@ from .ops import (
     decode_mean,
     decode_sum,
     dense_linear,
+    prefill_linear,
+    prefill_uses_tiled_hc,
     fp4_act_quant,
     gathered_decode_batch,
     grouped_output_projection,
@@ -1023,7 +1025,7 @@ class Gate(nn.Module):
         self, x: torch.Tensor, image_mask: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """x: [n, dim]; image_mask: [n] bool, True for tokens inside an image span."""
-        scores = linear(x.float(), self.weight.float()) / self.gate_temp
+        scores = prefill_linear(x.float(), self.weight.float()) / self.gate_temp
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
@@ -1247,7 +1249,7 @@ class Block(nn.Module):
         """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
         pre / post / comb coefficients, split out of one projection of the flattened stream."""
         # normalized over the whole flattened hc*d stream, one statistic per token
-        if x.size(1) > 4096:
+        if x.size(1) > 4096 or prefill_uses_tiled_hc():
             # Both the FP32 stream and its square otherwise span several GiB.
             # The normalization and projection are independent per token.
             mixes = torch.empty(
@@ -1274,14 +1276,14 @@ class Block(nn.Module):
             )
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(decode_mean(x.square(), -1, keepdim=True) + self.norm_eps)
-        mixes = dense_linear(x, hc_fn) * rsqrt
+        mixes = prefill_linear(x, hc_fn) * rsqrt
         return hc_split_sinkhorn(
             mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
         )
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor):
         """Collapse the hc copies into one, weighted by pre_mix. [b,s,hc,d] x [b,s,hc] -> [b,s,d]"""
-        if x.size(1) > 4096:
+        if x.size(1) > 4096 or prefill_uses_tiled_hc():
             # A full 32K BF16 stream expands to several GiB in FP32. Keep the
             # reduction order intact while bounding its temporary per slice.
             y = torch.empty(
@@ -1306,7 +1308,7 @@ class Block(nn.Module):
     ):
         """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
         x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]"""
-        if x.size(1) > 4096:
+        if x.size(1) > 4096 or prefill_uses_tiled_hc():
             # The broadcast product [b,s,hc,hc,d] would exceed the H100's
             # remaining memory at the 32K prompt. Slices preserve the original
             # per-token arithmetic and only retain the BF16 result.

@@ -67,10 +67,15 @@ class DeepseekV41FlashFLForCausalLM(nn.Module):
     @torch.inference_mode()
     def forward_prefill_chunk(self, input_ids, start_pos, prompt_length):
         from vllm_fl.strict028.chunked_prefill import ChunkPrefill
+        from .ops import prefill_geometry
 
         if prompt_length > self.args.max_seq_len:
             raise ValueError("Prefill exceeds allocated context state")
-        with torch.device(input_ids.device), set_dtype(torch.bfloat16):
+        with (
+            torch.device(input_ids.device),
+            set_dtype(torch.bfloat16),
+            prefill_geometry(prompt_length),
+        ):
             context = ChunkPrefill(
                 start_pos, input_ids.numel(), prompt_length, input_ids.device
             )

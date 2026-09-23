@@ -12,6 +12,39 @@ from contextlib import contextmanager
 import torch
 
 _decode_batch_size = 1
+_prefill_prompt_length = 0
+
+
+@contextmanager
+def prefill_geometry(prompt_length):
+    """Retain the complete prefix's unquantized reduction geometry."""
+    global _prefill_prompt_length
+    previous, _prefill_prompt_length = _prefill_prompt_length, prompt_length
+    try:
+        yield
+    finally:
+        _prefill_prompt_length = previous
+
+
+def prefill_uses_tiled_hc():
+    return _prefill_prompt_length > 4096
+
+
+def prefill_linear(x, weight, reference_rows=None):
+    """Pad independent rows to preserve the reference cuBLAS algorithm.
+
+    Changing M changes FP32 accumulation in routers and compressors. Those
+    ULP differences can cross later low-precision quantization boundaries.
+    Padding is confined to Prefill and never changes Decode Graph execution.
+    """
+    rows = _prefill_prompt_length if reference_rows is None else reference_rows
+    count = x.numel() // x.shape[-1]
+    if rows > count:
+        padded = x.new_zeros((rows, x.shape[-1]))
+        padded[:count].copy_(x.reshape(count, -1))
+        out = torch.nn.functional.linear(padded, weight)[:count]
+        return out.reshape(*x.shape[:-1], weight.shape[0]).clone()
+    return dense_linear(x, weight)
 
 
 @contextmanager

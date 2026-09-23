@@ -7,6 +7,7 @@ from test_batched_decode import make_model
 
 from vllm_fl.strict028.chunked_prefill import ChunkPrefill
 from vllm_fl.strict028.models.deepseek_v41.model import set_dtype
+from vllm_fl.strict028.models.deepseek_v41.ops import prefill_geometry, prefill_linear
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -27,8 +28,9 @@ def test_chunked_prefix_matches_full_prefix_and_next_decode(sizes):
         start = 0
         for size in sizes:
             context = ChunkPrefill(start, size, ids.shape[1], ids.device)
-            _, logits, hidden = model.core(ids[:, start : start + size], context)
-            model.core.store_spec_context(hidden, context)
+            with prefill_geometry(ids.shape[1]):
+                _, logits, hidden = model.core(ids[:, start : start + size], context)
+                model.core.store_spec_context(hidden, context)
             hiddens.append(hidden)
             start += size
         torch.testing.assert_close(logits, expected_logits, rtol=1e-4, atol=1e-4)
@@ -56,6 +58,23 @@ def test_chunked_prefix_matches_full_prefix_and_next_decode(sizes):
             state.bind(2)
             _, logits, _ = model.core(token, position)
             torch.testing.assert_close(logits, expected_logits, rtol=1e-4, atol=1e-4)
+
+
+@torch.inference_mode()
+def test_chunked_fp32_router_preserves_full_prefix_and_resets_context():
+    torch.manual_seed(732)
+    x = torch.randn(128, 5120, device="cuda", dtype=torch.bfloat16).float()
+    weight = torch.randn(384, 5120, device="cuda", dtype=torch.bfloat16).float()
+    expected = torch.nn.functional.linear(x, weight)
+    with prefill_geometry(128):
+        actual = torch.cat([prefill_linear(part, weight) for part in x.split(32)])
+    assert torch.equal(actual, expected)
+    # A following Decode retains its own M, including after an exception.
+    with pytest.raises(RuntimeError, match="probe"):
+        with prefill_geometry(128):
+            raise RuntimeError("probe")
+    token = x[:1]
+    assert torch.equal(prefill_linear(token, weight), torch.nn.functional.linear(token, weight))
 
 
 @torch.inference_mode()

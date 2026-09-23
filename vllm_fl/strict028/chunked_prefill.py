@@ -10,7 +10,9 @@ import torch
 
 from .collectives import all_reduce_
 from .models.deepseek_v41 import model as ref
-from .models.deepseek_v41.ops import act_quant, fp4_act_quant, grouped_output_projection
+from .models.deepseek_v41.ops import (
+    act_quant, fp4_act_quant, grouped_output_projection, prefill_linear,
+)
 
 
 class ChunkPrefill:
@@ -36,7 +38,8 @@ class ChunkPrefill:
         ratio = module.compress_ratio
         if ratio == 1:
             return module.norm(module.wkv(x))
-        kv, score = module.wkv(x.float()), module.wgate(x.float())
+        kv = prefill_linear(x.float(), module.wkv.weight, self.prompt_length)
+        score = prefill_linear(x.float(), module.wgate.weight, self.prompt_length)
         pending = self.start % ratio
         if pending:
             kv = torch.cat([module.kv_state[:, :pending], kv], 1)
