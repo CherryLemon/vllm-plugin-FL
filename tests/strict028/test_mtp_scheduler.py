@@ -174,3 +174,33 @@ def test_dp_rejection_or_idle_lane_keeps_remote_verification_aligned(monkeypatch
     assert result.sampled_token_ids == ([] if idle else [[14]])
     assert runner.graphs.commits == ({} if idle else {1: [(3, 13)]})
     assert runner.spec_stats["target_forward_calls"] == (0 if idle else 1)
+
+
+def test_partial_prefill_never_samples_or_enters_decode_graph(monkeypatch):
+    monkeypatch.setenv("VLLM_FL_CHUNKED_PREFILL", "1")
+    monkeypatch.setenv("VLLM_FL_DECODE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_FL_BATCHED_DECODE", "1")
+    target = Target()
+    chunks = []
+
+    def chunk(ids, start, length):
+        chunks.append((start, ids.tolist(), length))
+        return target.forward_with_aux(ids, start_pos=start)
+
+    target.forward_prefill_chunk = chunk
+    runner = ModelRunnerFL028(target, NS(bind=lambda *a, **kw: None), "cpu")
+    runner.requests["a"] = Request([10, 11, 12, 13, 14], 1, 0)
+    for start, count in ((0, 2), (2, 2), (4, 1)):
+        output = scheduled([], start=start)
+        output.num_scheduled_tokens["a"] = count
+        result = runner.execute_model(output)
+        assert result.sampled_token_ids == ([[15]] if start == 4 else [[]])
+        assert runner.take_draft_token_ids().draft_token_ids == [[]]
+    assert chunks == [(0, [10, 11], 5), (2, [12, 13], 5), (4, [14], 5)]
+    assert runner.requests["a"].computed == 5
+    assert runner.requests["a"].tokens == [10, 11, 12, 13, 14, 15]
+    # Only the subsequent Decode call uses the graph and creates proposals.
+    runner.graphs = BatchedOracle()
+    result = runner.execute_model(scheduled([], start=5))
+    assert result.sampled_token_ids == [[16]]
+    assert runner.take_draft_token_ids().draft_token_ids == [[17, 18, 19, 20, 21]]

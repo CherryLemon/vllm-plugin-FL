@@ -29,6 +29,13 @@ class Request:
     tokens: list[int]
     block: int
     computed: int
+    prefill_length: int | None = None
+
+    def __post_init__(self):
+        if self.prefill_length is None:
+            # A PD request includes the P output token, which belongs to the
+            # first Decode step rather than to the remotely computed prefix.
+            self.prefill_length = self.computed or len(self.tokens)
 
 
 class ModelRunnerFL028:
@@ -38,6 +45,7 @@ class ModelRunnerFL028:
         self.device = device
         self.pd_enabled = pd_enabled
         self.data_parallel = parallel_layout().data_size > 1
+        self.chunked_prefill_enabled = os.environ.get("VLLM_FL_CHUNKED_PREFILL") == "1"
         self.requests = {}
         self.drafting_enabled = model.speculative_config is not None
         self.draft_token_ids = None
@@ -127,6 +135,7 @@ class ModelRunnerFL028:
                         "resumed request must recompute from position zero"
                     )
                 request.block = self.request_block(blocks)
+                request.prefill_length = len(request.tokens)
             elif blocks is not None and any(blocks):
                 raise ValueError("a request cannot acquire a second state block")
             request.computed = cached.num_computed_tokens[i]
@@ -134,7 +143,10 @@ class ModelRunnerFL028:
         if (
             self.batched_decode_enabled
             and output.num_scheduled_tokens
-            and all(self.requests[r].computed > 0 for r in output.num_scheduled_tokens)
+            and all(
+                self.requests[r].computed >= self.requests[r].prefill_length
+                for r in output.num_scheduled_tokens
+            )
         ):
             return self.execute_decode_batch(output)
 
@@ -142,14 +154,35 @@ class ModelRunnerFL028:
         for req_id, count in output.num_scheduled_tokens.items():
             request = self.requests[req_id]
             start = request.computed
+            prefill_step = start < request.prefill_length
             drafts = output.scheduled_spec_decode_tokens.get(req_id, [])
             self.state.bind(request.block, reset=start == 0)
-            if start == 0:
-                if count != len(request.tokens) or not count or drafts:
-                    raise ValueError("chunked prefill is not supported")
-                token, hidden = self.target_forward(request.tokens, 0)
-                generated = [token]
-                request.computed = count
+            if prefill_step:
+                if not 0 < count <= request.prefill_length - start or drafts:
+                    raise ValueError("invalid scheduled Prefill span")
+                if self.chunked_prefill_enabled:
+                    ids = torch.tensor(
+                        request.tokens[start : start + count],
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    logits, hidden = self.model.forward_prefill_chunk(
+                        ids, start, request.prefill_length
+                    )
+                    if not bool(torch.isfinite(logits).all().item()):
+                        raise FloatingPointError("non-finite chunked Prefill logits")
+                    token = int(logits[0].argmax().item())
+                    self.spec_stats["target_forward_calls"] += 1
+                else:
+                    if start or count != request.prefill_length:
+                        raise ValueError(
+                            "chunked Prefill requires VLLM_FL_CHUNKED_PREFILL=1"
+                        )
+                    token, hidden = self.target_forward(request.tokens, 0)
+                request.computed += count
+                generated = (
+                    [token] if request.computed == request.prefill_length else []
+                )
             else:
                 if count != 1 + len(drafts) or len(request.tokens) != start + 1:
                     raise ValueError(f"invalid scheduled decode span for {req_id}")
@@ -175,7 +208,8 @@ class ModelRunnerFL028:
             draft = []
             if (
                 self.drafting_enabled
-                and start > 0
+                and generated
+                and not prefill_step
                 and request.computed + 5 <= self.model.args.max_seq_len
             ):
                 last_token = torch.tensor([generated[-1]], device=self.device)

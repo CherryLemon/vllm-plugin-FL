@@ -65,6 +65,21 @@ class DeepseekV41FlashFLForCausalLM(nn.Module):
             self.core.store_spec_context(hidden, start_pos)
 
     @torch.inference_mode()
+    def forward_prefill_chunk(self, input_ids, start_pos, prompt_length):
+        from vllm_fl.strict028.chunked_prefill import ChunkPrefill
+
+        if prompt_length > self.args.max_seq_len:
+            raise ValueError("Prefill exceeds allocated context state")
+        with torch.device(input_ids.device), set_dtype(torch.bfloat16):
+            context = ChunkPrefill(
+                start_pos, input_ids.numel(), prompt_length, input_ids.device
+            )
+            _, logits, hidden = self.core(input_ids.reshape(1, -1), context)
+            if self.speculative_config is not None:
+                self.core.store_spec_context(hidden, context)
+        return logits, hidden
+
+    @torch.inference_mode()
     def propose_draft(self, token, hidden, start_pos):
         with torch.device(hidden.device), set_dtype(torch.bfloat16):
             return self.core.forward_spec(token.reshape(-1), hidden, start_pos)

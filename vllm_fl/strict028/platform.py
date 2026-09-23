@@ -93,22 +93,30 @@ class PlatformFL028(Platform):
             raise ValueError(
                 "the FL reference profile requires dtype=bfloat16 and enforce_eager=True"
             )
+        chunked_prefill = os.environ.get("VLLM_FL_CHUNKED_PREFILL") == "1"
+        long_limit = 33792
+        transfer = vllm_config.kv_transfer_config
+        if chunked_prefill or (
+            transfer is not None
+            and transfer.kv_role == "kv_consumer"
+            and os.environ.get("VLLM_FL_BATCHED_DECODE") == "1"
+            and os.environ.get("VLLM_FL_DECODE_GRAPH") == "1"
+        ):
+            long_limit = 139264
         if model.max_model_len > 4096 and (
             os.environ.get("VLLM_FL_EXPERIMENTAL_LONG_CONTEXT") != "1"
-            or model.max_model_len > 33792
+            or model.max_model_len > long_limit
         ):
             raise ValueError(
                 "FL long-context admission requires "
-                "VLLM_FL_EXPERIMENTAL_LONG_CONTEXT=1 and max_model_len<=33792"
+                f"VLLM_FL_EXPERIMENTAL_LONG_CONTEXT=1 and max_model_len<={long_limit}"
             )
         if (
             parallel.pipeline_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
         ):
-            raise ValueError(
-                "pipeline and context parallelism are not admitted"
-            )
+            raise ValueError("pipeline and context parallelism are not admitted")
         if parallel.data_parallel_size != 1:
             transfer = vllm_config.kv_transfer_config
             if (
@@ -166,9 +174,13 @@ class PlatformFL028(Platform):
                 != parallel.tensor_parallel_size
             ):
                 raise ValueError("FL DSpark shares the target checkpoint and TP ranks")
-        if scheduler.enable_chunked_prefill or scheduler.async_scheduling:
+        if (
+            scheduler.async_scheduling
+            or scheduler.enable_chunked_prefill != chunked_prefill
+        ):
             raise ValueError(
-                "disable chunked prefill and async scheduling for FL Eager reference"
+                "FL requires synchronous scheduling and matching "
+                "VLLM_FL_CHUNKED_PREFILL / enable_chunked_prefill settings"
             )
         if cache.enable_prefix_caching:
             raise ValueError(

@@ -79,6 +79,7 @@ def test_mixed_axis_decode_requires_explicit_graph_pd_contract(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(ValueError, match="experimental DP"):
         PlatformFL028.check_and_update_config(cfg)
+
     for name in (
         "VLLM_FL_EXPERIMENTAL_DP",
         "VLLM_FL_BATCHED_DECODE",
@@ -90,3 +91,38 @@ def test_mixed_axis_decode_requires_explicit_graph_pd_contract(monkeypatch):
     cfg.kv_transfer_config.kv_role = "kv_producer"
     with pytest.raises(ValueError, match="experimental DP"):
         PlatformFL028.check_and_update_config(cfg)
+
+
+def test_128k_prefill_requires_chunked_execution(monkeypatch):
+    monkeypatch.setenv("VLLM_FL_EXPERIMENTAL_LONG_CONTEXT", "1")
+    monkeypatch.delenv("VLLM_FL_CHUNKED_PREFILL", raising=False)
+    cfg = config(139264)
+    with pytest.raises(ValueError, match="max_model_len<=33792"):
+        PlatformFL028.check_and_update_config(cfg)
+    monkeypatch.setenv("VLLM_FL_CHUNKED_PREFILL", "1")
+    with pytest.raises(ValueError, match="matching"):
+        PlatformFL028.check_and_update_config(cfg)
+    cfg.scheduler_config.enable_chunked_prefill = True
+    PlatformFL028.check_and_update_config(cfg)
+    assert cfg.cache_config.block_size == 139264
+    cfg.model_config.max_model_len += 1
+    with pytest.raises(ValueError, match="max_model_len<=139264"):
+        PlatformFL028.check_and_update_config(cfg)
+
+
+def test_128k_consumer_requires_batched_graph(monkeypatch):
+    monkeypatch.setenv("VLLM_FL_EXPERIMENTAL_LONG_CONTEXT", "1")
+    monkeypatch.setenv("VLLM_FL_TP_BACKEND", "flagcx")
+    cfg = config(139264)
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="DeepseekV41FLConnector",
+        kv_connector_module_path="vllm_fl.strict028.pd_connector",
+        kv_role="kv_consumer",
+    )
+    for name in ("VLLM_FL_BATCHED_DECODE", "VLLM_FL_DECODE_GRAPH"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="max_model_len<=33792"):
+        PlatformFL028.check_and_update_config(cfg)
+    for name in ("VLLM_FL_BATCHED_DECODE", "VLLM_FL_DECODE_GRAPH"):
+        monkeypatch.setenv(name, "1")
+    PlatformFL028.check_and_update_config(cfg)

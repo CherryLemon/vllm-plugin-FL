@@ -144,7 +144,9 @@ class BatchedDecodeGraphs:
             self.target_replays += 1
         else:
             self.draft_replays += 1
-        return tuple(value[:real_batch] for value in record.result)
+        return tuple(
+            None if value is None else value[:real_batch] for value in record.result
+        )
 
     def target_batch(self, tokens, pages, positions, active):
         return self._replay(tokens, pages, positions, active)

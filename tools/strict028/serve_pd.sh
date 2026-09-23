@@ -48,6 +48,9 @@ fi
 if [[ "${VLLM_FL_EXPERIMENTAL_DP:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_EXPERIMENTAL_DP=1)
 fi
+if [[ "${VLLM_FL_CHUNKED_PREFILL:-0}" == 1 ]]; then
+  docker_args+=(-e VLLM_FL_CHUNKED_PREFILL=1)
+fi
 
 # The Docker daemon on 10.8.2.68 records --gpus all without injecting devices.
 # Explicit mappings mirror the verified GPU preflight on that host.
@@ -67,6 +70,11 @@ if [[ "${FL_PD_EXPLICIT_DEVICES:-0}" == 1 ]]; then
 fi
 
 server_args=()
+if [[ "${VLLM_FL_CHUNKED_PREFILL:-0}" == 1 ]]; then
+  server_args+=(--enable-chunked-prefill)
+else
+  server_args+=(--no-enable-chunked-prefill)
+fi
 if [[ "$data_parallel_size" != 1 ]]; then
   server_args+=(--data-parallel-size "$data_parallel_size" --data-parallel-size-local "$data_parallel_size" --data-parallel-backend mp --enable-expert-parallel)
 fi
@@ -99,7 +107,7 @@ exec docker run "${docker_args[@]}" "$image" /models/DeepSeek-V4.1-Flash \
   --max-model-len "$max_model_len" --max-num-seqs "$max_num_seqs" \
   --max-num-batched-tokens "$max_num_batched_tokens" \
   --gpu-memory-utilization 0.95 --enforce-eager \
-  --no-enable-prefix-caching --no-enable-chunked-prefill --no-async-scheduling \
+  --no-enable-prefix-caching --no-async-scheduling \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
   --kv-transfer-config "$kv_config" \
   "${server_args[@]}" "$@"
