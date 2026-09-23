@@ -333,7 +333,8 @@ def measure_steady_window(samples, requests, origin):
 
 
 def run_burst(
-    opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1
+    opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1,
+    sample_path=None,
 ):
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
@@ -353,10 +354,13 @@ def run_burst(
     samples = []
     monitor_stop = threading.Event()
     profile_events = []
+    if sample_path is not None:
+        sample_path.write_text("")
 
     def monitor():
         while not monitor_stop.is_set():
             stamp = time.perf_counter()
+            sample_begin = len(samples)
             try:
                 with opener.open(d_url + "/metrics", timeout=5) as response:
                     metrics = response.read().decode()
@@ -394,6 +398,10 @@ def run_burst(
                     )
             except Exception as error:
                 samples.append({"time_s": stamp, "error": repr(error)})
+            if sample_path is not None:
+                with sample_path.open("a") as journal:
+                    for sample in samples[sample_begin:]:
+                        journal.write(json.dumps(sample) + "\n")
             monitor_stop.wait(0.5)
 
     monitor_thread = threading.Thread(target=monitor, daemon=True)
@@ -438,6 +446,8 @@ def run_burst(
             row[key] -= start
     return {
         "concurrency": concurrency,
+        "monotonic_origin_s": start,
+        "occupancy_journal": None if sample_path is None else str(sample_path),
         "requests": requests,
         "prefill_phase_s": prefill_end - prefill_start,
         "min_request_decode_tps": min(rates),
@@ -599,6 +609,7 @@ def main():
                     args.output_tokens,
                     args.profile_label,
                     admission["decode_dp_metric_groups"],
+                    args.output.with_suffix(f".c{concurrency}.r{round_index}.metrics.jsonl"),
                 )
                 result.update(round=round_index, warmup=round_index < 0)
                 report["rounds"].append(result)
@@ -654,6 +665,16 @@ def main():
                     result["prefill_phase_s"] for result in measured
                 ),
             }
+            steady = [r["steady_window"] for r in measured if r["steady_window"]]
+            if steady:
+                report["summary"][str(concurrency)].update(
+                    median_common_window_aggregate_tps=statistics.median(
+                        r["aggregate_tps"] for r in steady
+                    ),
+                    median_common_window_request_tps=statistics.median(
+                        r["median_request_tps"] for r in steady
+                    ),
+                )
             save()
         report["after"] = {
             "prefill_pd": rpc(opener, p_url, "fl_pd_stats", args.timeout),
