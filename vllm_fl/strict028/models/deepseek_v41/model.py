@@ -1146,6 +1146,31 @@ class Block(nn.Module):
         """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
         pre / post / comb coefficients, split out of one projection of the flattened stream."""
         # normalized over the whole flattened hc*d stream, one statistic per token
+        if x.size(1) > 4096:
+            # Both the FP32 stream and its square otherwise span several GiB.
+            # The normalization and projection are independent per token.
+            mixes = torch.empty(
+                x.size(0),
+                x.size(1),
+                hc_fn.size(0),
+                device=x.device,
+                dtype=torch.float32,
+            )
+            for begin in range(0, x.size(1), 256):
+                end = min(begin + 256, x.size(1))
+                part = x[:, begin:end].flatten(2).float()
+                rsqrt = torch.rsqrt(
+                    part.square().mean(-1, keepdim=True) + self.norm_eps
+                )
+                mixes[:, begin:end] = dense_linear(part, hc_fn) * rsqrt
+            return hc_split_sinkhorn(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = dense_linear(x, hc_fn) * rsqrt
