@@ -52,6 +52,9 @@ fi
 if [[ "${VLLM_FL_CHUNKED_PREFILL:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_CHUNKED_PREFILL=1)
 fi
+if [[ "${VLLM_FL_PREFILL_PREFIX_CACHE:-0}" == 1 ]]; then
+  docker_args+=(-e VLLM_FL_PREFILL_PREFIX_CACHE=1)
+fi
 
 # The Docker daemon on 10.8.2.68 records --gpus all without injecting devices.
 # Explicit mappings mirror the verified GPU preflight on that host.
@@ -85,6 +88,9 @@ elif [[ -n "${FL_TRITON_CACHE_DIR:-}" ]]; then
 fi
 
 server_args=()
+if [[ -n "${FL_MAX_NUM_SCHEDULED_TOKENS:-}" ]]; then
+  server_args+=(--max-num-scheduled-tokens "$FL_MAX_NUM_SCHEDULED_TOKENS")
+fi
 if [[ "${VLLM_FL_CHUNKED_PREFILL:-0}" == 1 ]]; then
   server_args+=(--enable-chunked-prefill)
 else

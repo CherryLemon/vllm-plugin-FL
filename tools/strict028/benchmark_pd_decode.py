@@ -468,6 +468,10 @@ def main():
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument(
+        "--prefill-cache", action="store_true",
+        help="record and require the producer's exact-prefix state cache",
+    )
+    parser.add_argument(
         "--profile-label",
         help="capture 10 steps per rank after C80 occupancy is steady; run separately from throughput",
     )
@@ -550,6 +554,7 @@ def main():
         "decode_tps_definition": "(Decode completion_tokens - first_chunk_tokens)/(last_token_chunk - first_token_chunk)",
         "aggregate_decode_tps_definition": "sum(Decode completion_tokens - 1)/(last_content_any - first_content_any)",
         "prefill_phase_excluded": True,
+        "prefill_prefix_state_cache": args.prefill_cache,
         "pd_handoff_excluded_from_decode_tps": True,
     }
     report = {"status": "running", "metadata": metadata, "rounds": [], "summary": {}}
@@ -567,6 +572,11 @@ def main():
         }
         if any(not row["enabled"] for row in report["before"]["decode_graph"]):
             raise AssertionError("Decode Graph is not enabled on every rank")
+        if args.prefill_cache:
+            cache = rpc(opener, p_url, "fl_prefill_cache_stats", args.timeout)
+            if len(cache) != 8 or any(not r["enabled"] for r in cache):
+                raise AssertionError("Prefill prefix cache is not enabled on all ranks")
+            report["before"]["prefill_cache"] = cache
         save()
         for concurrency in args.concurrency:
             measured = []
@@ -642,6 +652,10 @@ def main():
             "decode_tp": rpc(opener, d_url, "fl_tp_stats", args.timeout),
             "decode_graph": rpc(opener, d_url, "fl_graph_stats", args.timeout),
         }
+        if args.prefill_cache:
+            report["after"]["prefill_cache"] = rpc(
+                opener, p_url, "fl_prefill_cache_stats", args.timeout
+            )
         expected = sum((args.warmups + args.rounds) * c for c in args.concurrency)
         p_before = report["before"]["prefill_pd"]
         p_after = report["after"]["prefill_pd"]

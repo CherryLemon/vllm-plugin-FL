@@ -204,3 +204,52 @@ def test_partial_prefill_never_samples_or_enters_decode_graph(monkeypatch):
     result = runner.execute_model(scheduled([], start=5))
     assert result.sampled_token_ids == [[16]]
     assert runner.take_draft_token_ids().draft_token_ids == [[17, 18, 19, 20, 21]]
+
+
+def test_cached_prefill_restores_state_and_only_computes_distinct_tail(monkeypatch):
+    monkeypatch.setenv("VLLM_FL_CHUNKED_PREFILL", "1")
+    monkeypatch.setenv("VLLM_FL_PREFILL_PREFIX_CACHE", "1")
+    state = NS(storage=torch.zeros(4, 1, dtype=torch.int64))
+
+    def bind(block, reset=False):
+        state.block = block
+        if reset:
+            state.storage[block].zero_()
+
+    state.bind = bind
+    target = Target()
+
+    def chunk(ids, start, length):
+        state.storage[state.block] += ids.sum()
+        return target.forward_with_aux(ids, start_pos=start)
+
+    target.forward_prefill_chunk = chunk
+    runner = ModelRunnerFL028(target, state, "cpu")
+
+    def run(tokens, block, sizes):
+        runner.requests["a"] = Request(tokens.copy(), block, 0)
+        start = 0
+        for count in sizes:
+            output = scheduled([], start=start)
+            output.num_scheduled_tokens["a"] = count
+            result = runner.execute_model(output)
+            start += count
+            assert bool(result.sampled_token_ids[0]) == (start == len(tokens))
+        assert state.storage[block].item() == sum(tokens)
+
+    run([10, 11, 12, 13, 14], 1, (2, 2, 1))
+    entry = runner.prefill_cache.entry
+    assert entry.tokens == (10, 11, 12, 13)
+    # A scheduler span can cross the saved boundary: only its suffix executes.
+    run([10, 11, 12, 13, 99], 2, (3, 2))
+    assert target.inputs == [(0, [10, 11]), (2, [12, 13]), (4, [14]), (4, [99])]
+    assert runner.prefill_cache.stats()["reused_tokens"] == 4
+    assert entry.page.item() == 46
+    # A different prefix and a different reference M must each miss the cache.
+    run([10, 11, 42, 13, 14], 3, (2, 2, 1))
+    assert target.inputs[-3:] == [(0, [10, 11]), (2, [42, 13]), (4, [14])]
+    run([10, 11, 42, 13, 14, 15], 1, (4, 2))
+    assert target.inputs[-2:] == [(0, [10, 11, 42, 13]), (4, [14, 15])]
+    assert runner.prefill_cache.stats()["hits"] == 1
+    # Eviction cannot invalidate an entry held by another in-flight request.
+    assert entry.page.item() == 46

@@ -109,3 +109,50 @@ def test_prefill_diagnostics_restore_hooks_and_only_touch_null_page():
     assert all(
         not m._forward_hooks and not m._forward_pre_hooks for m in model.core.modules()
     )
+
+
+@torch.inference_mode()
+def test_cpu_prefix_snapshot_preserves_compressor_tail_and_next_decode():
+    from vllm_fl.strict028.prefill_cache import PrefillPrefixCache
+
+    model, state = make_model()
+    cache = PrefillPrefixCache()
+    length, boundary = 137, 111  # Includes incomplete compression groups.
+    ids = (torch.arange(length, device="cuda") * 7).remainder(64)[None]
+
+    def forward(tokens, start, end):
+        context = ChunkPrefill(start, end - start, length, ids.device)
+        with prefill_geometry(length):
+            _, logits, hidden = model.core(tokens[:, start:end], context)
+            model.core.store_spec_context(hidden, context)
+        return logits
+
+    with torch.device("cuda"), set_dtype(torch.bfloat16):
+        state.bind(1, reset=True)
+        forward(ids, 0, boundary)
+        cache.record(ids[0].tolist(), length, boundary, state, 1)
+        entry = cache.entry
+        expected_page = entry.page.clone()
+        assert entry.page.device.type == "cpu"
+        for variant in (1, 2):
+            tokens = ids.clone()
+            tokens[:, -5:] = (tokens[:, -5:] + variant) % 64
+            # Recompute the same prefix independently as the reference.
+            state.bind(1, reset=True)
+            forward(tokens, 0, boundary)
+            expected = forward(tokens, boundary, length)
+            state.bind(2, reset=True)
+            hit = cache.lookup(tokens[0].tolist(), length)
+            assert hit is entry
+            cache.restore(state, 2, hit)
+            actual = forward(tokens, boundary, length)
+            assert torch.equal(actual, expected)
+            assert torch.equal(state.storage[1], state.storage[2])
+            for position in range(length, length + 3):
+                token = expected.argmax(-1)[:, None]
+                state.bind(1)
+                _, expected, _ = model.core(token, position)
+                state.bind(2)
+                _, actual, _ = model.core(token, position)
+                assert torch.equal(actual, expected)
+            assert torch.equal(entry.page, expected_page)

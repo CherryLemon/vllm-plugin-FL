@@ -30,6 +30,7 @@ class Request:
     block: int
     computed: int
     prefill_length: int | None = None
+    cached_prefix: object | None = None
 
     def __post_init__(self):
         if self.prefill_length is None:
@@ -46,6 +47,14 @@ class ModelRunnerFL028:
         self.pd_enabled = pd_enabled
         self.data_parallel = parallel_layout().data_size > 1
         self.chunked_prefill_enabled = os.environ.get("VLLM_FL_CHUNKED_PREFILL") == "1"
+        self.prefill_cache = None
+        self.prefill_chunk_sizes = {}
+        if os.environ.get("VLLM_FL_PREFILL_PREFIX_CACHE") == "1":
+            if not self.chunked_prefill_enabled or self.data_parallel:
+                raise ValueError("prefix snapshots require chunked Prefill without DP")
+            from .prefill_cache import PrefillPrefixCache
+
+            self.prefill_cache = PrefillPrefixCache()
         self.requests = {}
         self.drafting_enabled = model.speculative_config is not None
         self.draft_token_ids = None
@@ -161,18 +170,43 @@ class ModelRunnerFL028:
                 if not 0 < count <= request.prefill_length - start or drafts:
                     raise ValueError("invalid scheduled Prefill span")
                 if self.chunked_prefill_enabled:
-                    ids = torch.tensor(
-                        request.tokens[start : start + count],
-                        device=self.device,
-                        dtype=torch.long,
+                    self.prefill_chunk_sizes[count] = (
+                        self.prefill_chunk_sizes.get(count, 0) + 1
                     )
-                    logits, hidden = self.model.forward_prefill_chunk(
-                        ids, start, request.prefill_length
-                    )
-                    if not bool(torch.isfinite(logits).all().item()):
-                        raise FloatingPointError("non-finite chunked Prefill logits")
-                    token = int(logits[0].argmax().item())
-                    self.spec_stats["target_forward_calls"] += 1
+                    compute_start = start
+                    if self.prefill_cache is not None:
+                        if start == 0:
+                            request.cached_prefix = self.prefill_cache.lookup(
+                                request.tokens, request.prefill_length
+                            )
+                            if request.cached_prefix is not None:
+                                self.prefill_cache.restore(
+                                    self.state, request.block, request.cached_prefix
+                                )
+                        if request.cached_prefix is not None:
+                            compute_start = min(
+                                start + count,
+                                max(start, len(request.cached_prefix.tokens)),
+                            )
+                            self.prefill_cache.reused_tokens += compute_start - start
+                    if compute_start < start + count:
+                        ids = torch.tensor(
+                            request.tokens[compute_start : start + count],
+                            device=self.device,
+                            dtype=torch.long,
+                        )
+                        logits, hidden = self.model.forward_prefill_chunk(
+                            ids, compute_start, request.prefill_length
+                        )
+                        if not bool(torch.isfinite(logits).all().item()):
+                            raise FloatingPointError("non-finite chunked Prefill logits")
+                        token = int(logits[0].argmax().item())
+                        self.spec_stats["target_forward_calls"] += 1
+                        if self.prefill_cache is not None:
+                            self.prefill_cache.record(
+                                request.tokens, request.prefill_length, start + count,
+                                self.state, request.block,
+                            )
                 else:
                     if start or count != request.prefill_length:
                         raise ValueError(

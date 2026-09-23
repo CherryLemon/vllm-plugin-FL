@@ -332,6 +332,12 @@ class ReferenceProbeExtension:
             state.storage[1:3].copy_(saved)
             state.bind(0 if previous is None else previous)
 
+    def fl_prefill_cache_stats(self):
+        cache = self.model_runner.prefill_cache
+        return dict(rank=self.global_rank, enabled=cache is not None,
+                    scheduled_chunk_sizes=self.model_runner.prefill_chunk_sizes,
+                    **({} if cache is None else cache.stats()))
+
     def fl_pd_stats(self):
         if self.pd_connector is None:
             return {"rank": self.global_rank, "enabled": False}
