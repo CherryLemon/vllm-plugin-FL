@@ -8,6 +8,7 @@ import torch
 
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_fl.strict028.batch_diagnostics import compare_model_layers
 from vllm_fl.strict028.batched_decode import DecodeBatch
 from vllm_fl.strict028.batched_graph import BatchedDecodeGraphs
 from vllm_fl.strict028.cache import RequestState
@@ -249,3 +250,31 @@ def test_twenty_request_graph_keeps_cache_untouched_during_capture():
     torch.testing.assert_close(logits, ref_logits, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(hidden, ref_hidden, rtol=0, atol=0)
     torch.testing.assert_close(state.storage, expected, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_layer_probe_restores_state_and_removes_hooks():
+    model, state = make_model()
+    for page in (1, 2, 3):
+        state.bind(page, reset=True)
+        with torch.device("cuda"), set_dtype(torch.bfloat16):
+            model.core(torch.tensor([[page, 1, 2]], device="cuda"), 0)
+    saved = state.storage.clone()
+    runner = SimpleNamespace(
+        model=model,
+        state=state,
+        graphs=BatchedDecodeGraphs(model, state, torch.device("cuda")),
+    )
+    with torch.device("cuda"), set_dtype(torch.bfloat16):
+        report = compare_model_layers(
+            runner,
+            torch.tensor([4, 5, 6]),
+            torch.tensor([1, 2, 3]),
+            torch.tensor([3, 3, 3]),
+        )
+    assert report["serial_events"] > 0 and report["batch_events"] > 0
+    assert not report["first_differences"]
+    torch.testing.assert_close(state.storage, saved, rtol=0, atol=0)
+    assert not any(
+        m._forward_hooks or m._forward_pre_hooks for m in model.core.modules()
+    )

@@ -13,6 +13,15 @@ compositions at batch 3 and 20, target/draft replay across position/page changes
 exact persistent state, inactive-lane preservation, all six acceptance lengths,
 and previous request-state/PD/Graph tests. The dense FP32 compatibility path
 preserves per-request projection shape to avoid cuBLAS reduction changes.
+Real 8-rank checks on `79243d3` passed C1 PD repetition with the same 15 token
+IDs as the admitted serial reference. The heterogeneous 3-request differential
+did **not** pass: persistent-state differences first appear at layer 5 and
+the second target step selects a different token. Do not use this candidate's
+multi-request output for performance acceptance. `449965f` adds an optional
+eager activation probe (`diagnose_layers` in the differential RPC) to locate
+the first difference without changing model bindings. Its state restoration
+and hook cleanup passed a focused test.
+
 Real 8-rank acceptance and target topology/long-context work are tracked in
 `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`. Unit tests do not establish
 target-workload throughput. Existing admission limits remain in force.
