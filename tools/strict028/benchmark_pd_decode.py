@@ -106,11 +106,11 @@ def post(opener, url, body, timeout):
     return opener.open(request, timeout=timeout)
 
 
-def rpc(opener, url, method, timeout):
+def rpc(opener, url, method, timeout, args=None):
     with post(
         opener,
         url + "/collective_rpc",
-        {"method": method, "args": [], "timeout": timeout},
+        {"method": method, "args": args or [], "timeout": timeout},
         timeout,
     ) as response:
         results = json.load(response)["results"]
@@ -197,10 +197,12 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
         "max_tokens": output_tokens - 1,
         "ignore_eos": True,
         "stream": True,
+        "return_token_ids": True,
         "stream_options": {"include_usage": True},
         "kv_transfer_params": prepared["params"],
     }
     first = last = None
+    arrivals = []
     content = []
     usage = None
     finish_reason = None
@@ -220,6 +222,8 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
                 usage = event["usage"]
             for choice in event.get("choices", []):
                 chunk = choice.get("text")
+                if token_ids := choice.get("token_ids"):
+                    arrivals.append([time.perf_counter(), len(token_ids)])
                 if chunk:
                     now = time.perf_counter()
                     first = now if first is None else first
@@ -233,12 +237,17 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
             f"incomplete Decode request {index}: {done=} {usage=} {finish_reason=}"
         )
     tokens = usage["completion_tokens"]
+    if sum(n for _, n in arrivals) != tokens:
+        raise RuntimeError(
+            f"streamed token IDs disagree with completion usage: {index}"
+        )
     if tokens != output_tokens - 1 or last <= first:
         raise RuntimeError(
             f"unexpected Decode output {index}: {tokens=} {first=} {last=}"
         )
     return {
         "index": index,
+        "token_arrivals": arrivals,
         "prefill_prompt_tokens": len(prepared["prompt_ids"]),
         "decode_prompt_tokens": usage["prompt_tokens"],
         "prefill_first_token": prepared["first_token"],
@@ -249,7 +258,8 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
         "prefill_s": prepared["prefill_s"],
         "first_content_from_decode_start_s": first - start,
         "generation_s": last - first,
-        "decode_tps": (tokens - 1) / (last - first),
+        "decode_tps": (tokens - arrivals[0][1]) / (arrivals[-1][0] - arrivals[0][0]),
+        "first_chunk_tokens": arrivals[0][1],
         "start_offset_s": start,
         "first_offset_s": first,
         "last_offset_s": last,
@@ -257,7 +267,30 @@ def decode_one(opener, url, prepared, index, barrier, timeout, output_tokens):
     }
 
 
-def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
+def longest_steady_window(samples):
+    """Keep one uninterrupted 4x20 interval, without waiting or preemption."""
+    longest, current = [], []
+    for sample in samples:
+        valid = (
+            sample.get("running") == [20.0] * 4 and sample.get("waiting") == [0.0] * 4
+        )
+        if not valid:
+            current = []
+            continue
+        if current and (
+            sample.get("preemptions") != current[-1].get("preemptions")
+            or sample["time_s"] - current[-1]["time_s"] > 2
+        ):
+            current = []
+        current.append(sample)
+        if len(current) > len(longest):
+            longest = list(current)
+    return longest
+
+
+def run_burst(
+    opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None
+):
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -271,6 +304,7 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
     barrier = threading.Barrier(concurrency + 1)
     samples = []
     monitor_stop = threading.Event()
+    profile_events = []
 
     def monitor():
         while not monitor_stop.is_set():
@@ -288,7 +322,28 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
                             re.M,
                         )
                     ]
-                samples.append({"time_s": stamp, **values})
+                preemptions = sum(
+                    float(v)
+                    for v in re.findall(
+                        r"^vllm:num_preemptions_total\{[^}]*\}\s+(\S+)", metrics, re.M
+                    )
+                )
+                samples.append({"time_s": stamp, "preemptions": preemptions, **values})
+                steady = len(samples) >= 5 and all(
+                    s.get("running") == [20.0] * 4
+                    and s.get("waiting") == [0.0] * 4
+                    and s.get("preemptions") == preemptions
+                    for s in samples[-5:]
+                )
+                if profile_label and steady and not profile_events:
+                    profile_events.append({"armed_at_s": time.perf_counter()})
+                    profile_events[-1]["response"] = rpc(
+                        opener,
+                        d_url,
+                        "fl_profile_decode",
+                        120,
+                        [dict(label=profile_label, steps=10, active=20)],
+                    )
             except Exception as error:
                 samples.append({"time_s": stamp, "error": repr(error)})
             monitor_stop.wait(0.5)
@@ -316,20 +371,34 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
         monitor_stop.set()
         monitor_thread.join(timeout=10)
     active = [sum(s.get("running", [])) for s in samples]
-    steady_samples = [
-        s
-        for s in samples
-        if len(s.get("running", [])) == 4
-        and min(s["running"]) >= 20
-        and len(s.get("waiting", [])) == 4
-        and sum(s.get("waiting", [])) == 0
-    ]
+    steady_samples = longest_steady_window(samples)
     first = min(row["first_offset_s"] for row in requests)
     last = max(row["last_offset_s"] for row in requests)
     start = min(row["start_offset_s"] for row in requests)
     end = max(row["end_offset_s"] for row in requests)
     rates = [row["decode_tps"] for row in requests]
+    steady_rate = None
+    if steady_samples:
+        steady_start = steady_samples[0]["time_s"]
+        steady_end = steady_samples[-1]["time_s"]
+        if steady_end > steady_start:
+            emitted = [
+                sum(
+                    n
+                    for t, n in row["token_arrivals"]
+                    if steady_start <= t <= steady_end
+                )
+                for row in requests
+            ]
+            steady_rate = dict(
+                start_s=steady_start - start,
+                end_s=steady_end - start,
+                duration_s=steady_end - steady_start,
+                tokens_per_request=emitted,
+                aggregate_tps=sum(emitted) / (steady_end - steady_start),
+            )
     for row in requests:
+        row["token_arrivals"] = [[t - start, n] for t, n in row["token_arrivals"]]
         for key in (
             "start_offset_s",
             "first_offset_s",
@@ -358,6 +427,8 @@ def run_burst(opener, p_url, d_url, prompts, timeout, output_tokens):
         ),
         "peak_active_decode_requests": max(active, default=0),
         "steady_c80_dp4_samples": len(steady_samples),
+        "steady_window": steady_rate,
+        "profile_events": profile_events,
         "occupancy_samples": samples,
     }
 
@@ -375,6 +446,10 @@ def main():
     parser.add_argument("--warmups", type=int, default=0)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument(
+        "--profile-label",
+        help="capture 10 steps per rank after C80 occupancy is steady; run separately from throughput",
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -400,6 +475,9 @@ def main():
             "8192 output, and 80 active requests; use --smoke for a smaller functional run"
         )
 
+    if args.profile_label and (args.rounds != 1 or args.warmups or args.smoke):
+        parser.error("profiling requires one target round without warmups")
+
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     p_url = args.prefill_url.rstrip("/")
     d_url = args.decode_url.rstrip("/")
@@ -423,6 +501,8 @@ def main():
     if max(map(len, prompts)) + args.output_tokens > args.max_model_len:
         raise ValueError("a request variant exceeds max_model_len")
     metadata = {
+        "profiler_enabled": bool(args.profile_label),
+        "throughput_comparable": not args.smoke and not args.profile_label,
         "measurement_scope": "functional_smoke"
         if args.smoke
         else "steady_decode_80_active",
@@ -446,7 +526,7 @@ def main():
         if args.smoke
         else "attention TP2 x DP4; global TP8/EP8",
         "deployment_admission": admission,
-        "decode_tps_definition": "(Decode completion_tokens - 1)/(last_content - first_content)",
+        "decode_tps_definition": "(Decode completion_tokens - first_chunk_tokens)/(last_token_chunk - first_token_chunk)",
         "aggregate_decode_tps_definition": "sum(Decode completion_tokens - 1)/(last_content_any - first_content_any)",
         "prefill_phase_excluded": True,
         "pd_handoff_excluded_from_decode_tps": True,
@@ -477,6 +557,7 @@ def main():
                     prompts[:concurrency],
                     args.timeout,
                     args.output_tokens,
+                    args.profile_label,
                 )
                 result.update(round=round_index, warmup=round_index < 0)
                 report["rounds"].append(result)
