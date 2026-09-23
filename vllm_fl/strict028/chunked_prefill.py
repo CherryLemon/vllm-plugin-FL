@@ -37,7 +37,9 @@ class ChunkPrefill:
     def compress(self, module, x):
         ratio = module.compress_ratio
         if ratio == 1:
-            return module.norm(module.wkv(x))
+            return module.norm(
+                prefill_linear(x, module.wkv.weight, self.prompt_length)
+            )
         kv = prefill_linear(x.float(), module.wkv.weight, self.prompt_length)
         score = prefill_linear(x.float(), module.wgate.weight, self.prompt_length)
         pending = self.start % ratio

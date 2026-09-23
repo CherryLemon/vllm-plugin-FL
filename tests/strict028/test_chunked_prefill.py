@@ -61,10 +61,11 @@ def test_chunked_prefix_matches_full_prefix_and_next_decode(sizes):
 
 
 @torch.inference_mode()
-def test_chunked_fp32_router_preserves_full_prefix_and_resets_context():
+@pytest.mark.parametrize("dtype,outputs", [(torch.float32, 384), (torch.bfloat16, 512)])
+def test_chunked_projection_preserves_full_prefix_and_resets_context(dtype, outputs):
     torch.manual_seed(732)
-    x = torch.randn(128, 5120, device="cuda", dtype=torch.bfloat16).float()
-    weight = torch.randn(384, 5120, device="cuda", dtype=torch.bfloat16).float()
+    x = torch.randn(128, 5120, device="cuda", dtype=torch.bfloat16).to(dtype)
+    weight = torch.randn(outputs, 5120, device="cuda", dtype=torch.bfloat16).to(dtype)
     expected = torch.nn.functional.linear(x, weight)
     with prefill_geometry(128):
         actual = torch.cat([prefill_linear(part, weight) for part in x.split(32)])
