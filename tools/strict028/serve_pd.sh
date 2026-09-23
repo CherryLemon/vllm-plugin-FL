@@ -75,7 +75,10 @@ if [[ -n "${FL_PROFILE_DIR:-}" ]]; then
   docker_args+=(-v "$FL_PROFILE_DIR:/profiles" -e FL_PROFILE_DIR=/profiles)
 fi
 
-if [[ -n "${FL_TRITON_CACHE_DIR:-}" ]]; then
+if [[ -n "${FL_TRITON_CACHE_VOLUME:-}" ]]; then
+  docker_args+=(--mount "type=volume,source=$FL_TRITON_CACHE_VOLUME,target=/root/.triton/cache"
+                -e TRITON_CACHE_DIR=/root/.triton/cache)
+elif [[ -n "${FL_TRITON_CACHE_DIR:-}" ]]; then
   mkdir -p "$FL_TRITON_CACHE_DIR"
   docker_args+=(-v "$FL_TRITON_CACHE_DIR:/root/.triton/cache"
                 -e TRITON_CACHE_DIR=/root/.triton/cache)
