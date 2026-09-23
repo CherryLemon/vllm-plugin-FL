@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.distributed as dist
 import zmq
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -29,6 +28,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.request import RequestStatus
 
 from .cache import FLRequestStateSpec
+from .collectives import parallel_layout
 from vllm_fl.distributed.kv_transfer.flagcx_connector import (
     FlagCXConnectorMetadata,
     FlagCXConnectorScheduler,
@@ -58,6 +58,26 @@ def _one_block(groups: list[list[int]]) -> int:
     return groups[0][0]
 
 
+def source_plan(global_rank, tensor_size, world_size, remote_tp_size):
+    """One source copy per D worker; its TP lane owns unused P copies.
+
+    For TP2 x DP4, D ranks [4,5] pull P copies [4,5], then release [0,2,6]
+    and [1,3,7], respectively. Every P copy receives exactly one completion.
+    """
+    if (
+        tensor_size < 1
+        or world_size % tensor_size
+        or remote_tp_size != world_size
+        or not 0 <= global_rank < world_size
+    ):
+        raise ValueError("PD requires matching global worker counts and divisible TP")
+    return global_rank, [
+        rank
+        for rank in range(global_rank % tensor_size, remote_tp_size, tensor_size)
+        if rank != global_rank
+    ]
+
+
 def _model_signature(model_path: str) -> str:
     digest = hashlib.sha256()
     root = Path(model_path)
@@ -79,6 +99,7 @@ class DeepseekV41Scheduler(FlagCXConnectorScheduler):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self.state_spec = _state_spec(kv_cache_config)
         self.model_signature = _model_signature(vllm_config.model_config.model)
+        self.data_parallel = vllm_config.parallel_config.data_parallel_size > 1
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         params = request.kv_transfer_params
@@ -86,6 +107,13 @@ class DeepseekV41Scheduler(FlagCXConnectorScheduler):
             return 0, False
         if self.kv_role != "kv_consumer":
             raise ValueError("only the Decode role may load remote state")
+        if (
+            getattr(self, "data_parallel", False)
+            and params.get("state_transfer_protocol") != 2
+        ):
+            raise ValueError(
+                "mixed-axis PD requires a producer with release protocol v2"
+            )
         prompt_len = request.num_prompt_tokens
         count = int(params["num_external_tokens"])
         if not 0 < count < prompt_len:
@@ -112,6 +140,7 @@ class DeepseekV41Scheduler(FlagCXConnectorScheduler):
                 state_page_bytes=self.state_spec.state_page_bytes,
                 model_id=str(self.vllm_config.model_config.model),
                 model_signature=self.model_signature,
+                state_transfer_protocol=2,
             )
         return delay_free, params
 
@@ -124,8 +153,11 @@ class DeepseekV41Scheduler(FlagCXConnectorScheduler):
 class FullStateFlagCXWorker:
     def __init__(self, vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"):
         self.spec = _state_spec(kv_cache_config)
-        self.rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        layout = parallel_layout()
+        self.rank = layout.global_rank
+        self.tp_size = layout.tensor_size
+        self.world_size = layout.world_size
+        self.model_signature = _model_signature(vllm_config.model_config.model)
         self.role = vllm_config.kv_transfer_config.kv_role
         if self.role not in ("kv_producer", "kv_consumer"):
             raise ValueError("FL PD supports one Prefill and one Decode engine")
@@ -153,6 +185,7 @@ class FullStateFlagCXWorker:
         self._fatal_error: str | None = None
         self.sent_pages = 0
         self.received_pages = 0
+        self.released_pages = 0
         self.sent_bytes = 0
         self.received_bytes = 0
         self._server_thread: threading.Thread | None = None
@@ -241,11 +274,17 @@ class FullStateFlagCXWorker:
             or request["page_bytes"] != self.spec.state_page_bytes
             or request["tp_size"] != self.tp_size
             or request["rank"] != self.rank
+            or request.get("model_signature") != self.model_signature
         ):
             raise ValueError("PD transfer layout or TP rank mismatch")
+        action = request.get("action", "transfer")
+        if action not in ("transfer", "release"):
+            raise ValueError("unsupported PD state action")
         transfer_id = request["transfer_id"]
         deadline = time.monotonic() + self.timeout
         with self._condition:
+            if transfer_id in self._seen_transfer_ids:
+                raise ValueError("duplicate PD transfer ID")
             while transfer_id not in self._pending_send and not self._stop.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -255,6 +294,15 @@ class FullStateFlagCXWorker:
                 raise ValueError("duplicate PD transfer ID")
             p_req_id, block = self._pending_send[transfer_id]
             self._seen_transfer_ids.add(transfer_id)
+        if action == "release":
+            # The D owner sends this only after installing its pulled copy.
+            # Official KVOutputAggregator waits for all P workers, including
+            # both transferred and released copies, before reusing the page.
+            with self._condition:
+                self._pending_send.pop(transfer_id)
+                self._sent_ids.add(p_req_id)
+                self.released_pages += 1
+            return
         self.staging[block].copy_(self.storage[block], non_blocking=False)
         torch.cuda.synchronize(self.device)
         session = f"{request['host']}:{request['rpc_port']}"
@@ -278,41 +326,53 @@ class FullStateFlagCXWorker:
         assert self.storage is not None and self.staging is not None
         assert self.device is not None
         torch.cuda.set_device(self.device)
-        socket = self._context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
-        socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+
+        def exchange(source_rank, action, block):
+            socket = self._context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.SNDTIMEO, self.timeout * 1000)
+            socket.setsockopt(zmq.RCVTIMEO, self.timeout * 1000)
+            try:
+                socket.connect(
+                    f"tcp://{meta.remote_host}:{meta.remote_port + source_rank}"
+                )
+                socket.send_json(
+                    {
+                        "action": action,
+                        "transfer_id": meta.transfer_id,
+                        "host": self.host,
+                        "rpc_port": self.rpc_port,
+                        "dst_addr": self.staging[block].data_ptr(),
+                        "rank": source_rank,
+                        "tp_size": meta.remote_tp_size,
+                        "layout_hash": self.spec.state_layout_hash,
+                        "layout_version": self.spec.layout_version,
+                        "page_bytes": self.spec.state_page_bytes,
+                        "model_signature": self.model_signature,
+                    }
+                )
+                reply = socket.recv_json()
+                if reply.get("status") != "done":
+                    raise RuntimeError(f"Prefill {action} failed: {reply}")
+            finally:
+                socket.close()
+
         try:
-            if meta.remote_tp_size != self.tp_size:
-                raise ValueError("FL PD requires equal Prefill and Decode TP")
-            block = _one_block(meta.local_block_ids)
-            socket.connect(f"tcp://{meta.remote_host}:{meta.remote_port + self.rank}")
-            socket.send_json(
-                {
-                    "transfer_id": meta.transfer_id,
-                    "host": self.host,
-                    "rpc_port": self.rpc_port,
-                    "dst_addr": self.staging[block].data_ptr(),
-                    "rank": self.rank,
-                    "tp_size": self.tp_size,
-                    "layout_hash": self.spec.state_layout_hash,
-                    "layout_version": self.spec.layout_version,
-                    "page_bytes": self.spec.state_page_bytes,
-                }
+            source, releases = source_plan(
+                self.rank, self.tp_size, self.world_size, meta.remote_tp_size
             )
-            reply = socket.recv_json()
-            if reply.get("status") != "done":
-                raise RuntimeError(f"Prefill transfer failed: {reply}")
+            block = _one_block(meta.local_block_ids)
+            exchange(source, "transfer", block)
             self.storage[block].copy_(self.staging[block], non_blocking=False)
             torch.cuda.synchronize(self.device)
+            for unused in releases:
+                exchange(unused, "release", block)
             with self._condition:
                 self._received_ids.add(req_id)
                 self.received_pages += 1
                 self.received_bytes += self.spec.state_page_bytes
         except Exception as error:
             self._fail(error)
-        finally:
-            socket.close()
 
     def start(self, metadata: FlagCXConnectorMetadata):
         if self.storage is None:
@@ -347,6 +407,9 @@ class FullStateFlagCXWorker:
                 "pinned_host_staging": self.staging is not None,
                 "sent_pages": self.sent_pages,
                 "received_pages": self.received_pages,
+                "released_pages": self.released_pages,
+                "tp_size": self.tp_size,
+                "world_size": self.world_size,
                 "sent_bytes": self.sent_bytes,
                 "received_bytes": self.received_bytes,
                 "pending_sends": len(self._pending_send),

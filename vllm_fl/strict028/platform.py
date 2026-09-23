@@ -103,13 +103,28 @@ class PlatformFL028(Platform):
             )
         if (
             parallel.pipeline_parallel_size != 1
-            or parallel.data_parallel_size != 1
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
         ):
             raise ValueError(
-                "the reference profile currently supports homogeneous TP only"
+                "pipeline and context parallelism are not admitted"
             )
+        if parallel.data_parallel_size != 1:
+            transfer = vllm_config.kv_transfer_config
+            if (
+                os.environ.get("VLLM_FL_EXPERIMENTAL_DP") != "1"
+                or os.environ.get("VLLM_FL_BATCHED_DECODE") != "1"
+                or os.environ.get("VLLM_FL_DECODE_GRAPH") != "1"
+                or parallel.tensor_parallel_size != 2
+                or parallel.data_parallel_size != 4
+                or not parallel.enable_expert_parallel
+                or transfer is None
+                or transfer.kv_role != "kv_consumer"
+            ):
+                raise ValueError(
+                    "experimental DP requires TP2/DP4/EP8, a PD consumer and "
+                    "VLLM_FL_EXPERIMENTAL_DP=1 with batched Decode Graph"
+                )
         if parallel.tensor_parallel_size not in (1, 2, 4, 8):
             raise ValueError("TP must divide the checkpoint's eight output groups")
         if parallel.nnodes_within_dp != 1:

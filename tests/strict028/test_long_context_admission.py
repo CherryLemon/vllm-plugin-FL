@@ -57,3 +57,36 @@ def test_long_context_needs_explicit_opt_in(monkeypatch):
 
     with pytest.raises(ValueError, match="max_model_len<=33792"):
         PlatformFL028.check_and_update_config(config(33793))
+
+
+def test_mixed_axis_decode_requires_explicit_graph_pd_contract(monkeypatch):
+    cfg = config(256)
+    cfg.parallel_config.tensor_parallel_size = 2
+    cfg.parallel_config.data_parallel_size = 4
+    cfg.parallel_config.enable_expert_parallel = True
+    cfg.scheduler_config.max_num_seqs = 20
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="DeepseekV41FLConnector",
+        kv_connector_module_path="vllm_fl.strict028.pd_connector",
+        kv_role="kv_consumer",
+    )
+    monkeypatch.setenv("VLLM_FL_TP_BACKEND", "flagcx")
+    for name in (
+        "VLLM_FL_EXPERIMENTAL_DP",
+        "VLLM_FL_BATCHED_DECODE",
+        "VLLM_FL_DECODE_GRAPH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="experimental DP"):
+        PlatformFL028.check_and_update_config(cfg)
+    for name in (
+        "VLLM_FL_EXPERIMENTAL_DP",
+        "VLLM_FL_BATCHED_DECODE",
+        "VLLM_FL_DECODE_GRAPH",
+    ):
+        monkeypatch.setenv(name, "1")
+    PlatformFL028.check_and_update_config(cfg)
+    assert cfg.cache_config.num_gpu_blocks_override == 21
+    cfg.kv_transfer_config.kv_role = "kv_producer"
+    with pytest.raises(ValueError, match="experimental DP"):
+        PlatformFL028.check_and_update_config(cfg)

@@ -11,6 +11,8 @@ port="${FL_PD_API_PORT:?set the API port}"
 max_model_len="${FL_MAX_MODEL_LEN:-256}"
 max_num_seqs="${FL_MAX_NUM_SEQS:-2}"
 max_num_batched_tokens="${FL_MAX_NUM_BATCHED_TOKENS:-256}"
+tensor_parallel_size="${FL_TP_SIZE:-8}"
+data_parallel_size="${FL_DP_SIZE:-1}"
 case "$role" in
   kv_producer|kv_consumer) ;;
   *) echo "invalid FL_PD_ROLE: $role" >&2; exit 2 ;;
@@ -43,6 +45,9 @@ fi
 if [[ "${VLLM_FL_BATCHED_DECODE:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_BATCHED_DECODE=1)
 fi
+if [[ "${VLLM_FL_EXPERIMENTAL_DP:-0}" == 1 ]]; then
+  docker_args+=(-e VLLM_FL_EXPERIMENTAL_DP=1)
+fi
 
 # The Docker daemon on 10.8.2.68 records --gpus all without injecting devices.
 # Explicit mappings mirror the verified GPU preflight on that host.
@@ -62,6 +67,9 @@ if [[ "${FL_PD_EXPLICIT_DEVICES:-0}" == 1 ]]; then
 fi
 
 server_args=()
+if [[ "$data_parallel_size" != 1 ]]; then
+  server_args+=(--data-parallel-size "$data_parallel_size" --data-parallel-size-local "$data_parallel_size" --data-parallel-backend mp --enable-expert-parallel)
+fi
 if [[ "${FL_VALIDATION_RPC:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_SERVER_DEV_MODE=1)
   server_args+=(--worker-extension-cls vllm_fl.strict028.validation.ReferenceProbeExtension)
@@ -87,7 +95,7 @@ exec docker run "${docker_args[@]}" "$image" /models/DeepSeek-V4.1-Flash \
   --hf-overrides '{"architectures":["DeepseekV41FlashFLForCausalLM"]}' \
   --load-format fl_dsv41 --dtype bfloat16 \
   --generation-config vllm --override-generation-config '{"temperature":0}' \
-  --tensor-parallel-size 8 --distributed-executor-backend mp \
+  --tensor-parallel-size "$tensor_parallel_size" --distributed-executor-backend mp \
   --max-model-len "$max_model_len" --max-num-seqs "$max_num_seqs" \
   --max-num-batched-tokens "$max_num_batched_tokens" \
   --gpu-memory-utilization 0.95 --enforce-eager \
