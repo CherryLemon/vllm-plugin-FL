@@ -410,6 +410,10 @@ def run_burst(
                 duration_s=steady_end - steady_start,
                 tokens_per_request=emitted,
                 aggregate_tps=sum(emitted) / (steady_end - steady_start),
+                median_request_tps=statistics.median(emitted)
+                / (steady_end - steady_start),
+                min_request_tps=min(emitted) / (steady_end - steady_start),
+                max_request_tps=max(emitted) / (steady_end - steady_start),
             )
     for row in requests:
         row["token_arrivals"] = [[t - start, n] for t, n in row["token_arrivals"]]
