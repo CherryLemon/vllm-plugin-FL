@@ -25,8 +25,10 @@ kernel through FlagTree on H100, captures it, mutates the static input buffer,
 and compares two graph replays against eager results. Both replays matched
 exactly. `FL_TEST_CUDA_GRAPH=1` in `smoke_flagcx_tp.py` separately captures and
 replays the eight-rank FlagCX TP all-reduce and all-gather wrappers; all ranks
-passed twice. These checks establish compiler and collective graph support,
-not a serving Decode graph.
+passed twice. Receipts are
+`/public-nvme/yjwu/dsv41-fl-028/evidence/flagtree-graph-operator-9879b76.json`
+and `flagtree-flagcx-tp-graph.log` in the same directory. These checks establish
+compiler and collective graph support, not a serving Decode graph.
 
 The current `ModelRunnerFL028` still executes each scheduled request and each
 MTP target verification token sequentially. `WorkerFL028.compile_or_warm_up_model`
@@ -36,5 +38,19 @@ branches and top-k widths; `RequestState.bind` changes GPU buffer addresses per
 request page. A useful Decode graph needs device-side position/page metadata,
 stable storage and a fixed kernel sequence before an end-to-end 32K/512/C1,4,16
 steady benchmark can be reported. `fl_cuda_graph_probe` in the validation Worker
-extension checks whether one fixed-position target step can be captured; it
-does not enable serving replay.
+extension attempted capture of one fixed-position target step at position 16 on
+all eight Decode ranks. It failed in `MoE.forward` at
+`torch.bincount(indices.flatten()).tolist()`: the GPU-to-CPU routing decision is
+illegal during capture. The subsequent `torch.where(indices == i)` also creates
+data-dependent expert work. The failure receipt is
+`/public-nvme/yjwu/dsv41-fl-028/evidence/flagtree-fixed-pos-graph-d68.json`.
+The serving graph remains disabled; the failed probe did not make the D service
+unhealthy.
+
+The next implementation boundary is a graph-safe, device-routed expert path in
+FlagGems with the checkpoint's packed E2M1/UE8M0 layout and the exact clamp and
+router-weight semantics. A fixed-position capture must then pass before
+rewriting position and request-state page selection as device-side metadata.
+Finally, MTP target verification must use a fixed, GPU-controlled kernel
+sequence rather than Python breaking on the first rejected draft. None of
+these changes can be supplied by a vLLM `--no-enforce-eager` flag alone.

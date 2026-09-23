@@ -31,6 +31,9 @@ docker_args=(
   -e OMP_NUM_THREADS=1
   -v "$model_path:/models/DeepSeek-V4.1-Flash:ro"
 )
+if [[ "${FL_PD_DETACH:-0}" == 1 ]]; then
+  docker_args=(-d "${docker_args[@]}")
+fi
 if [[ "${VLLM_FL_EXPERIMENTAL_LONG_CONTEXT:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_EXPERIMENTAL_LONG_CONTEXT=1)
 fi
