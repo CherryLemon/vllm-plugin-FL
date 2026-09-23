@@ -7,13 +7,14 @@ from .batched_decode import DecodeBatch
 
 
 @torch.inference_mode()
-def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
+def compare_model_layers(runner, tokens, pages, positions, *, layers=None):
     """Find the first serial-vs-batch difference before attempting capture.
 
     Hooks only clone tensors in an eager diagnostic run. Request state is
     restored, hooks are removed, and no model or operator binding is replaced.
     """
     model, state = runner.model, runner.state
+    layers = len(model.core.layers) if layers is None else layers
     saved = state.storage[1:4].clone()
     previous = state.active_block
     recorded = []
@@ -49,10 +50,29 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
                     )
                 )
             )
-        state.bind(int(pages[0]))
-        model.core(tokens[:1, None], int(positions[0]))
-        serial = recorded
-        recorded = []
+        serial_runs = []
+        for i in range(tokens.numel()):
+            state.bind(int(pages[i]))
+            model.core(tokens[i : i + 1, None], int(positions[i]))
+            serial_runs.append(recorded)
+            recorded = []
+        serial = []
+        for events in zip(*serial_runs):
+            name, kind = events[0][:2]
+            if any(event[:2] != (name, kind) for event in events):
+                raise AssertionError(
+                    "serial requests took different diagnostic module paths"
+                )
+            serial.append(
+                (
+                    name,
+                    kind,
+                    tuple(
+                        torch.cat(parts)
+                        for parts in zip(*(event[2] for event in events))
+                    ),
+                )
+            )
         state.storage[1:4].copy_(saved)
         context = DecodeBatch(
             state,
@@ -74,7 +94,6 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
                 continue
             expected = lookup[key][index]
             for part, (a, e) in enumerate(zip(actual, expected)):
-                a, e = a[:1], e[:1]
                 if a.shape != e.shape or not torch.equal(a, e):
                     row = {
                         "module": name,
@@ -87,6 +106,12 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
                         row.update(
                             mismatched=int((a != e).sum()),
                             max_abs=float((a.float() - e.float()).abs().max()),
+                            different_requests=(a != e)
+                            .flatten(1)
+                            .any(1)
+                            .nonzero()
+                            .flatten()
+                            .tolist(),
                         )
                     result.append(row)
             if len(result) >= 24:
@@ -96,22 +121,24 @@ def compare_model_layers(runner, tokens, pages, positions, *, layers=8):
             if kind != "input" or len(name.split(".")) != 2 or not actual:
                 continue
             expected = lookup[(name, kind)][0]
-            if not torch.equal(actual[0][:1], expected[0]):
+            if not torch.equal(actual[0], expected[0]):
                 continue
             stream = actual[0].flatten(2).float().square()
-            serial_mean = stream[:1].mean(-1, keepdim=True)
-            batch_mean = stream.mean(-1, keepdim=True)[:1]
+            serial_mean = torch.cat(
+                [part.mean(-1, keepdim=True) for part in stream.split(1)]
+            )
+            batch_mean = stream.mean(-1, keepdim=True)
             statistics.append(
                 {
                     "module": name,
                     "input_equal": True,
-                    "serial_mean": float(serial_mean.flatten()[0]),
-                    "batch_mean": float(batch_mean.flatten()[0]),
+                    "serial_mean": serial_mean.flatten().tolist(),
+                    "batch_mean": batch_mean.flatten().tolist(),
                     "mean_equal": torch.equal(serial_mean, batch_mean),
                 }
             )
         return {
-            "scope": f"first {layers} layers, first request, eager serial vs batch",
+            "scope": f"first {layers} layers, all {tokens.numel()} requests, eager serial vs batch",
             "first_differences": result,
             "serial_events": len(serial),
             "batch_events": len(recorded),
