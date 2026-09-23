@@ -112,8 +112,22 @@ class PlatformFL028(Platform):
             raise ValueError(
                 "multi-node execution requires separate communication acceptance"
             )
-        if vllm_config.kv_transfer_config or vllm_config.lora_config:
-            raise ValueError("PD and LoRA require separate integration acceptance")
+        if vllm_config.lora_config:
+            raise ValueError("LoRA requires separate integration acceptance")
+        kv_transfer = vllm_config.kv_transfer_config
+        if kv_transfer is not None:
+            if (
+                kv_transfer.kv_connector != "DeepseekV41FLConnector"
+                or kv_transfer.kv_connector_module_path
+                != "vllm_fl.strict028.pd_connector"
+                or kv_transfer.kv_role not in ("kv_producer", "kv_consumer")
+            ):
+                raise ValueError(
+                    "FL PD requires the DeepseekV41FLConnector external module "
+                    "and a producer or consumer role"
+                )
+            if os.environ.get("VLLM_FL_TP_BACKEND", "nccl").lower() != "flagcx":
+                raise ValueError("FL PD requires VLLM_FL_TP_BACKEND=flagcx")
         spec = vllm_config.speculative_config
         if spec is not None:
             if spec.method != "dspark" or spec.num_speculative_tokens != 5:

@@ -6,6 +6,8 @@ RoPE, Engram lookup/gating and residual arithmetic. This is a declared reference
 profile, not a claim that all operations have migrated to FlagGems.
 """
 
+import os
+
 import torch
 
 
@@ -95,6 +97,10 @@ EXECUTION_PROFILE = {
         "FP8 cache dequantize",
         "vision",
     ],
-    "communication": "torch.distributed NCCL; homogeneous TP with local routed experts",
+    "communication": (
+        "FlagCX; homogeneous TP with local routed experts"
+        if os.environ.get("VLLM_FL_TP_BACKEND", "nccl").lower() == "flagcx"
+        else "torch.distributed NCCL; homogeneous TP with local routed experts"
+    ),
     "performance": "not_profiled",
 }

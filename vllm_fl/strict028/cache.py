@@ -6,9 +6,12 @@ window, compressed KV, index K, incomplete compressor state and Engram history.
 Prefix reuse/chunked prefill are not supported by this reference layout.
 """
 
+import hashlib
+import json
 from dataclasses import dataclass
 
 import torch
+
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
@@ -16,6 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 class FLRequestStateSpec(FullAttentionSpec):
     state_page_bytes: int
     layout_version: str = "dsv41-eager-state-v1"
+    state_layout_hash: str = ""
 
     @property
     def page_size_bytes(self):
@@ -75,12 +79,29 @@ class RequestState:
         if not self.fields:
             raise ValueError("model exposes no request state")
         self.page_bytes = (offset + 255) // 256 * 256
+        self.layout_hash = hashlib.sha256(
+            json.dumps(
+                [
+                    (
+                        field.module,
+                        field.name,
+                        field.shape,
+                        str(field.dtype),
+                        field.offset,
+                        field.nbytes,
+                    )
+                    for field in self.fields
+                ],
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         self.spec = FLRequestStateSpec(
             block_size=max_model_len,
             num_kv_heads=1,
             head_size=1,
             dtype=torch.uint8,
             state_page_bytes=self.page_bytes,
+            state_layout_hash=self.layout_hash,
         )
         self.storage = None
         self.active_block = None
@@ -99,7 +120,7 @@ class RequestState:
             raise ValueError(
                 f"cache allocation mismatch: {actual_bytes} != {expected_bytes}"
             )
-        self.storage = torch.empty(
+        self.storage = torch.zeros(
             kv_cache_config.num_blocks,
             self.page_bytes,
             dtype=torch.uint8,
@@ -113,6 +134,10 @@ class RequestState:
         if self.storage is None or not 0 <= block_id < self.storage.shape[0]:
             raise ValueError("invalid request-state block")
         page = self.storage[block_id]
+        if reset:
+            # PD copies the whole page, including alignment gaps. Never expose
+            # bytes left by the previous request that owned this block.
+            page.zero_()
         for field in self.fields:
             module = self.model.get_submodule(field.module)
             view = (
@@ -121,7 +146,7 @@ class RequestState:
                 .view(field.shape)
             )
             setattr(module, field.name, view)
-            if reset:
+            if reset and field.fill != 0:
                 view.fill_(field.fill)
         # Shared references must point to the current page even if no new
         # compression group completes on this decode token.

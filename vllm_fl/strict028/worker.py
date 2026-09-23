@@ -10,7 +10,13 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from .cache import RequestState
@@ -29,10 +35,11 @@ class Request:
 
 
 class ModelRunnerFL028:
-    def __init__(self, model, state, device):
+    def __init__(self, model, state, device, *, pd_enabled=False):
         self.model = model
         self.state = state
         self.device = device
+        self.pd_enabled = pd_enabled
         self.requests = {}
         self.drafting_enabled = model.speculative_config is not None
         self.draft_token_ids = None
@@ -76,8 +83,10 @@ class ModelRunnerFL028:
             raise ValueError("multimodal scheduling is not enabled in this profile")
         if output.scheduled_spec_decode_tokens and not self.drafting_enabled:
             raise ValueError("draft tokens scheduled while DSpark is disabled")
-        if getattr(output, "kv_connector_metadata", None) is not None:
-            raise ValueError("PD is not enabled in this profile")
+        if self.pd_enabled != (
+            getattr(output, "kv_connector_metadata", None) is not None
+        ):
+            raise ValueError("PD connector metadata does not match the runner mode")
         if getattr(output, "kv_cache_block_copies", None):
             raise ValueError("request-state prefix copy is not enabled")
         for item in output.scheduled_new_reqs:
@@ -86,10 +95,15 @@ class ModelRunnerFL028:
                 raise ValueError(
                     "FL reference profile accepts token-only requests without LoRA"
                 )
-            if item.num_computed_tokens:
+            computed = item.num_computed_tokens
+            if computed and (
+                not self.pd_enabled or computed != len(item.prompt_token_ids) - 1
+            ):
                 raise ValueError("a new request cannot reuse unvalidated cached state")
             self.requests[item.req_id] = Request(
-                list(item.prompt_token_ids), self.request_block(item.block_ids), 0
+                list(item.prompt_token_ids),
+                self.request_block(item.block_ids),
+                computed,
             )
         cached = output.scheduled_cached_reqs
         for i, req_id in enumerate(cached.req_ids):
@@ -211,7 +225,12 @@ class WorkerFL028(WorkerBase):
                 self.vllm_config, self.model_config
             )
         state = RequestState(model.core, self.model_config.max_model_len)
-        self.model_runner = ModelRunnerFL028(model, state, self.device)
+        self.model_runner = ModelRunnerFL028(
+            model,
+            state,
+            self.device,
+            pd_enabled=self.vllm_config.kv_transfer_config is not None,
+        )
         logger.warning(
             "FL rank %d loaded in %.1fs: %s; execution=%s",
             self.rank,
@@ -262,6 +281,11 @@ class WorkerFL028(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config):
         self.model_runner.state.allocate(kv_cache_config, self.device)
+        if self.vllm_config.kv_transfer_config is not None:
+            ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+            get_kv_transfer_group().register_kv_caches(
+                {"fl_request_state": self.model_runner.state.storage}
+            )
         torch.cuda.empty_cache()
 
     def compile_or_warm_up_model(self):
@@ -299,7 +323,22 @@ class WorkerFL028(WorkerBase):
         return self.model_runner.state.page_bytes
 
     def execute_model(self, scheduler_output):
-        return self.model_runner.execute_model(scheduler_output)
+        if not has_kv_transfer_group():
+            return self.model_runner.execute_model(scheduler_output)
+        connector = get_kv_transfer_group()
+        connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        try:
+            connector.start_load_kv(None)
+            output = self.model_runner.execute_model(scheduler_output)
+            connector.wait_for_save()
+            sent, received = connector.get_finished(scheduler_output.finished_req_ids)
+            output.kv_connector_output = KVConnectorOutput(
+                finished_sending=sent,
+                finished_recving=received,
+            )
+            return output
+        finally:
+            connector.clear_connector_metadata()
 
     def sample_tokens(self, grammar_output):
         raise RuntimeError("sampling is synchronous in execute_model for this profile")
@@ -308,6 +347,8 @@ class WorkerFL028(WorkerBase):
         torch.cuda.synchronize(self.device)
 
     def shutdown(self):
+        if has_kv_transfer_group():
+            ensure_kv_transfer_shutdown()
         if dist.is_initialized():
             dist.destroy_process_group()
         self.model_runner = None
