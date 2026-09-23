@@ -1085,6 +1085,52 @@ class MoE(nn.Module):
                 for i in range(self.n_routed_experts)
             ]
         )
+        # All routed parameters retain their checkpoint names, but their
+        # storage has an expert dimension. FlagGems can then load one selected
+        # expert on device without a host routing decision or a weight copy.
+        self.packed_gate_up = self.packed_gate_up_scale = None
+        self.packed_down = self.packed_down_scale = None
+        if expert_dtype == torch.float4_e2m1fn_x2:
+            inter = args.moe_inter_dim
+            self.packed_gate_up = torch.empty(
+                self.n_local_experts, 2 * inter, self.dim // 2, dtype=torch.uint8
+            )
+            self.packed_gate_up_scale = torch.empty(
+                self.n_local_experts, 2 * inter, self.dim // fp4_block_size,
+                dtype=torch.uint8,
+            )
+            self.packed_down = torch.empty(
+                self.n_local_experts, self.dim, inter // 2, dtype=torch.uint8
+            )
+            self.packed_down_scale = torch.empty(
+                self.n_local_experts, self.dim, inter // fp4_block_size,
+                dtype=torch.uint8,
+            )
+            for local in range(self.n_local_experts):
+                expert = self.experts[self.experts_start_idx + local]
+                for linear, start, end in (
+                    (expert.w1, 0, inter), (expert.w3, inter, 2 * inter)
+                ):
+                    linear.weight = nn.Parameter(
+                        self.packed_gate_up[local, start:end].view(expert_dtype),
+                        requires_grad=False,
+                    )
+                    linear.scale = nn.Parameter(
+                        self.packed_gate_up_scale[local, start:end].view(
+                            torch.float8_e8m0fnu
+                        ),
+                        requires_grad=False,
+                    )
+                    linear.weight.scale = linear.scale
+                expert.w2.weight = nn.Parameter(
+                    self.packed_down[local].view(expert_dtype),
+                    requires_grad=False,
+                )
+                expert.w2.scale = nn.Parameter(
+                    self.packed_down_scale[local].view(torch.float8_e8m0fnu),
+                    requires_grad=False,
+                )
+                expert.w2.weight.scale = expert.w2.scale
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(
             args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit
@@ -1098,16 +1144,27 @@ class MoE(nn.Module):
         weights, indices = self.gate(
             x, None if image_mask is None else image_mask.flatten()
         )
-        y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(
-            indices.flatten(), minlength=self.n_routed_experts
-        ).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
+        if self.packed_gate_up is not None and x.size(0) <= 16:
+            from flag_gems.fused.block_scaled_mxfp4_moe import block_scaled_mxfp4_moe
+
+            y = block_scaled_mxfp4_moe(
+                x, indices, weights,
+                self.packed_gate_up, self.packed_gate_up_scale,
+                self.packed_down, self.packed_down_scale,
+                local_start=self.experts_start_idx,
+                swiglu_limit=self.experts[self.experts_start_idx].swiglu_limit,
+            )
+        else:
+            y = torch.zeros_like(x, dtype=torch.float32)
+            counts = torch.bincount(
+                indices.flatten(), minlength=self.n_routed_experts
+            ).tolist()
+            for i in range(self.experts_start_idx, self.experts_end_idx):
+                if counts[i] == 0:
+                    continue
+                expert = self.experts[i]
+                idx, top = torch.where(indices == i)
+                y[idx] += expert(x[idx], weights[idx, top, None])
         if world_size > 1:
             all_reduce_(y)
         y += self.shared_experts(x)
