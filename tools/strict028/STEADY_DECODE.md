@@ -1,9 +1,11 @@
 # DeepSeek V4.1 Flash steady Decode validation
 
-Status at 2026-09-23 14:29 UTC: chunked Prefill and target-capacity Decode
-have passed real-weight differential checks on all eight ranks, using runtime
-`c01ebde`. Full-length PD validation is retrying after moving the compiler
-cache to node-local storage. Target-workload throughput is not yet measured.
+Status at 2026-09-23 14:54 UTC: target-capacity Decode passed real-weight
+checks on all eight ranks. Two full 128K PD functional requests completed with
+identical greedy output. Their actual Prefill chunk was 4092 tokens, which
+subsequently failed numerical admission. The producer is restarting with an
+explicit 4096-token schedule and candidate prefix state cache `f800f8d`.
+Target-workload throughput is not yet measured.
 
 ## Workload and measurement
 
@@ -97,7 +99,27 @@ Artifacts are under `/public-nvme/yjwu/dsv41-fl-028/campaign-steady/`.
   cache writers completed 800 writes successfully. Shared cache directories
   serve only as seeds/archives; live compilation uses the local volume.
 
-Next acceptance is a repeated full-length PD functional run, then the exact
-C80 unprofiled workload and a separate eight-rank profile.
+- `benchmark/pd-c01ebde-localcache-128k16-c1-r2.json`: full 128K PD C1
+  functional rounds completed; cold/warm Prefill took 544.7/208.3 seconds.
+  This proves transport/Graph execution, not admitted C80 performance.
+- `benchmark/real-chunked-c01ebde-8192-4092.json`: actual 4092-token Prefill
+  chunks failed numerical admission (relative RMS 0.1113). Official DSpark
+  scheduling reserves four additional input slots. The target deployment
+  therefore uses `FL_MAX_NUM_BATCHED_TOKENS=4100` together with
+  `FL_MAX_NUM_SCHEDULED_TOKENS=4096`. The 131072-token prefix divides evenly
+  into 32 admitted chunks; validate the runtime chunk histogram.
+- Producer candidate `f800f8d` adds an optional bounded CPU prefix state cache
+  (`VLLM_FL_PREFILL_PREFIX_CACHE=1`). Keys include exact prefix token IDs and
+  total prompt length. Each request restores an independent GPU page and
+  computes its distinct tail. Complete compressor, Engram and DSpark state
+  is preserved. One cache entry plus in-flight references is retained.
+  Twenty-one CPU/CUDA tests passed, including exact state/logits and three
+  subsequent Decode outputs for different tails and a partial compressor group.
+  Real-model repeated PD/cache admission is pending.
+
+Next acceptance is the corrected real Prefill schedule plus repeated full-length
+PD/cache validation, then the exact C80 workload and a separate eight-rank profile.
+Use `benchmark_pd_decode.py --prefill-cache` to record cache and chunk counters.
+Decode remains on admitted `c01ebde`; the new producer does not change its kernels.
 Detailed chronological evidence is in `humanize/model-loop-checkpoint.md`,
 `analysis/root-cause.md` and `history/attempts.jsonl` in the campaign directory.

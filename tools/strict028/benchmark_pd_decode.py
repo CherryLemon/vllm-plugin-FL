@@ -209,6 +209,7 @@ def decode_one(
     }
     first = last = None
     arrivals = []
+    generated_ids = []
     content = []
     usage = None
     finish_reason = None
@@ -236,6 +237,7 @@ def decode_one(
                 chunk = choice.get("text")
                 if token_ids := choice.get("token_ids"):
                     arrivals.append([time.perf_counter(), len(token_ids)])
+                    generated_ids.extend(token_ids)
                 if chunk:
                     now = time.perf_counter()
                     first = now if first is None else first
@@ -268,6 +270,9 @@ def decode_one(
         "full_completion_tokens": tokens + 1,
         "finish_reason": finish_reason,
         "content_sha256": hashlib.sha256("".join(content).encode()).hexdigest(),
+        "token_ids_sha256": hashlib.sha256(
+            json.dumps(generated_ids, separators=(",", ":")).encode()
+        ).hexdigest(),
         "prefill_s": prepared["prefill_s"],
         "first_content_from_decode_start_s": first - start,
         "generation_s": last - first,
@@ -333,13 +338,17 @@ def run_burst(
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        prepared = list(
-            pool.map(
-                lambda ids: prepare_one(opener, p_url, ids, timeout),
-                prompts,
-            )
-        )
+        prepared = []
+        for index, row in enumerate(pool.map(
+            lambda ids: prepare_one(opener, p_url, ids, timeout), prompts
+        )):
+            prepared.append(row)
+            print(json.dumps(dict(
+                event="prefill_ready", request=index, total=concurrency,
+                prefill_s=row["prefill_s"],
+            )), flush=True)
     prefill_end = time.perf_counter()
+    print(json.dumps(dict(event="decode_burst_start", concurrency=concurrency)), flush=True)
     barrier = threading.Barrier(concurrency + 1)
     samples = []
     monitor_stop = threading.Event()
@@ -621,8 +630,9 @@ def main():
             rows = [row for result in measured for row in result["requests"]]
             if args.smoke and concurrency == 1 and len(measured) > 1:
                 hashes = {row["content_sha256"] for row in rows}
+                token_hashes = {row["token_ids_sha256"] for row in rows}
                 first_tokens = {row["prefill_first_token"] for row in rows}
-                if len(hashes) != 1 or len(first_tokens) != 1:
+                if len(hashes) != 1 or len(token_hashes) != 1 or len(first_tokens) != 1:
                     raise AssertionError(
                         "identical greedy PD smoke requests produced different output"
                     )
