@@ -10,7 +10,6 @@ from functools import lru_cache
 from typing import Literal
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -21,16 +20,24 @@ from .ops import (
     decode_mean,
     dense_linear,
     fp4_act_quant,
+    gathered_decode_batch,
     hc_split_sinkhorn,
     lowp_linear,
     sparse_attn,
 )
 from .vision import Aligner, ViT
-from vllm_fl.strict028.collectives import all_gather_last, all_reduce_
+from vllm_fl.strict028.collectives import (
+    all_gather,
+    all_gather_last,
+    all_reduce_,
+    parallel_layout,
+)
 
 # Set once by Transformer.__init__; one model per process, so layers just read them.
 world_size = 1
 rank = 0
+expert_size = 1
+expert_rank = 0
 default_dtype = (
     torch.float8_e4m3fn
 )  # storage dtype for Linear weights, from ModelArgs.dtype
@@ -321,8 +328,8 @@ class ParallelEngramEmbedding(nn.Module):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.dim = dim
-        self.part_num_embeddings = (num_embeddings + world_size - 1) // world_size
-        self.vocab_start_idx = rank * self.part_num_embeddings
+        self.part_num_embeddings = (num_embeddings + expert_size - 1) // expert_size
+        self.vocab_start_idx = expert_rank * self.part_num_embeddings
         self.vocab_end_idx = self.vocab_start_idx + self.part_num_embeddings
 
         self.block_size = fp8_block_size
@@ -337,6 +344,9 @@ class ParallelEngramEmbedding(nn.Module):
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        local_batch = indices.shape[0]
+        layout = parallel_layout()
+        indices = all_gather(indices, axis="dp")
         mask = (indices < self.vocab_start_idx) | (indices >= self.vocab_end_idx)
         local_indices = indices - self.vocab_start_idx
         local_indices = local_indices.masked_fill(mask, 0)
@@ -349,8 +359,10 @@ class ParallelEngramEmbedding(nn.Module):
         values = values.flatten(-2).to(torch.bfloat16)
         values = values.masked_fill(mask.unsqueeze(-1), 0)
 
-        if world_size > 1:
-            all_reduce_(values)
+        if expert_size > 1:
+            all_reduce_(values, axis="ep")
+        if layout.data_size > 1:
+            values = values.narrow(0, layout.data_rank * local_batch, local_batch)
         return values
 
 
@@ -1065,13 +1077,13 @@ class MoE(nn.Module):
         n_routed_experts, n_activated_experts = args.get_moe_config(layer_id)
         self.layer_id = layer_id
         self.dim = args.dim
-        assert n_routed_experts % world_size == 0, (
-            f"Number of experts must be divisible by world size (world_size={world_size})"
+        assert n_routed_experts % expert_size == 0, (
+            f"Number of experts must be divisible by expert size ({expert_size})"
         )
         self.n_routed_experts = n_routed_experts
-        self.n_local_experts = n_routed_experts // world_size
+        self.n_local_experts = n_routed_experts // expert_size
         self.n_activated_experts = n_activated_experts
-        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_start_idx = expert_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
         expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
@@ -1144,9 +1156,13 @@ class MoE(nn.Module):
     ) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(
-            x, None if image_mask is None else image_mask.flatten()
-        )
+        local_x, local_rows = x, x.shape[0]
+        layout = parallel_layout()
+        x = all_gather(x, axis="dp")
+        if image_mask is not None:
+            image_mask = all_gather(image_mask.flatten(), axis="dp")
+        with gathered_decode_batch(layout.data_size):
+            weights, indices = self.gate(x, image_mask)
         if self.packed_gate_up is not None and (
             x.size(0) <= 16 or getattr(self, "device_routing", False)
         ):
@@ -1170,10 +1186,12 @@ class MoE(nn.Module):
                 expert = self.experts[i]
                 idx, top = torch.where(indices == i)
                 y[idx] += expert(x[idx], weights[idx, top, None])
-        if world_size > 1:
-            all_reduce_(y)
-        y += self.shared_experts(x)
-        return y.type_as(x).view(shape)
+        if expert_size > 1:
+            all_reduce_(y, axis="ep")
+        if layout.data_size > 1:
+            y = y.narrow(0, layout.data_rank * local_rows, local_rows)
+        y += self.shared_experts(local_x)
+        return y.type_as(local_x).view(shape)
 
 
 class Block(nn.Module):
@@ -1562,9 +1580,10 @@ class Transformer(nn.Module):
     this sets the globals at the top of the file. The tokenizer only feeds the engram token map."""
 
     def __init__(self, args: ModelArgs, tokenizer=None, *, enable_mtp=False):
-        global world_size, rank, default_dtype
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        global world_size, rank, expert_size, expert_rank, default_dtype
+        layout = parallel_layout()
+        world_size, rank = layout.tensor_size, layout.tensor_rank
+        expert_size, expert_rank = layout.world_size, layout.global_rank
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
         self.max_seq_len = args.max_seq_len
@@ -1689,10 +1708,11 @@ class DSparkTransformer(Transformer):
     """Standalone draft graph; the serving Worker shares these layers in Transformer."""
 
     def __init__(self, args):
-        global world_size, rank, default_dtype
+        global world_size, rank, expert_size, expert_rank, default_dtype
         nn.Module.__init__(self)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank() if dist.is_initialized() else 0
+        layout = parallel_layout()
+        world_size, rank = layout.tensor_size, layout.tensor_rank
+        expert_size, expert_rank = layout.world_size, layout.global_rank
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         self.hc_mult = args.hc_mult
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)

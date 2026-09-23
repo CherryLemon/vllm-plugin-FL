@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
+
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 
@@ -13,17 +14,18 @@ class FLDeepseekV41Loader(BaseModelLoader):
             raise ValueError("fl_dsv41 requires an original local checkpoint")
 
     def load_weights(self, model, model_config):
+        from .collectives import parallel_layout
         from .models.deepseek_v41.loader import load_original_checkpoint
 
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        size = (
-            torch.distributed.get_world_size()
-            if torch.distributed.is_initialized()
-            else 1
-        )
+        layout = parallel_layout()
         with torch.no_grad():
             model.load_manifest = load_original_checkpoint(
-                model.core, model_config.model, rank, size
+                model.core,
+                model_config.model,
+                layout.tensor_rank,
+                layout.tensor_size,
+                expert_rank=layout.global_rank,
+                expert_size=layout.world_size,
             )
 
     def load_model(self, vllm_config, model_config, prefix=""):

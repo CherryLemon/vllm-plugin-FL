@@ -22,7 +22,7 @@ from vllm_fl.strict028.models.deepseek_v41.ops import decode_dense_batch, decode
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def make_model(num_pages=5):
+def make_model(num_pages=5, parallel=None):
     torch.manual_seed(20260923)
     args = ModelArgs(
         max_batch_size=1,
@@ -34,12 +34,12 @@ def make_model(num_pages=5):
         n_layers=5,
         n_mtp_layers=1,
         n_heads=4,
-        n_routed_experts=4,
+        n_routed_experts=4 if parallel is None else parallel.world_size,
         n_activated_experts=2,
         q_lora_rank=64,
         head_dim=64,
         rope_head_dim=32,
-        o_groups=1,
+        o_groups=1 if parallel is None else parallel.tensor_size,
         o_lora_rank=32,
         window_size=8,
         compress_ratios=(0, 2, 2, 1, 1, 0),

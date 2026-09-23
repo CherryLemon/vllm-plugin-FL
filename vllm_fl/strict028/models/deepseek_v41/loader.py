@@ -44,7 +44,9 @@ def shard_axis(name):
     }.get(key)
 
 
-def load_original_checkpoint(model, root, rank, world_size):
+def load_original_checkpoint(
+    model, root, rank, world_size, *, expert_rank=None, expert_size=None
+):
     with ExitStack() as stack:
         handles = {}
 
@@ -56,10 +58,22 @@ def load_original_checkpoint(model, root, rank, world_size):
                 )
             return handles[path]
 
-        return _load_original_checkpoint(model, root, rank, world_size, opened)
+        return _load_original_checkpoint(
+            model,
+            root,
+            rank,
+            world_size,
+            opened,
+            expert_rank=expert_rank,
+            expert_size=expert_size,
+        )
 
 
-def _load_original_checkpoint(model, root, rank, world_size, opened):
+def _load_original_checkpoint(
+    model, root, rank, world_size, opened, *, expert_rank=None, expert_size=None
+):
+    expert_rank = rank if expert_rank is None else expert_rank
+    expert_size = world_size if expert_size is None else expert_size
     root = Path(root)
     index_bytes = (root / "model.safetensors.index.json").read_bytes()
     weight_map = json.loads(index_bytes)["weight_map"]
@@ -86,20 +100,25 @@ def _load_original_checkpoint(model, root, rank, world_size, opened):
         shape = tuple(opened(root / weight_map[source]).get_slice(source).get_shape())
         axis = shard_axis(name)
         eng = ".engram.embed." in name
+        shard_rank, shard_size = (
+            (expert_rank, expert_size) if eng else (rank, world_size)
+        )
         if ".experts." in name:
             axis = None  # EP, not TP: only locally owned experts exist in this module.
         bounds = [slice(None)] * len(shape)
         expected = list(shape)
         if axis is not None:
             size = (
-                math.ceil(shape[axis] / world_size)
+                math.ceil(shape[axis] / shard_size)
                 if eng
-                else shape[axis] // world_size
+                else shape[axis] // shard_size
             )
-            if not eng and shape[axis] % world_size:
+            if not eng and shape[axis] % shard_size:
                 raise ValueError(f"unaligned TP weight: {name} {shape}")
             expected[axis] = size
-            bounds[axis] = slice(rank * size, min((rank + 1) * size, shape[axis]))
+            bounds[axis] = slice(
+                shard_rank * size, min((shard_rank + 1) * size, shape[axis])
+            )
         if tuple(expected) != tuple(target.shape):
             raise ValueError(
                 f"{name}: checkpoint shard {expected} != parameter {list(target.shape)}"
@@ -169,8 +188,8 @@ def _load_original_checkpoint(model, root, rank, world_size, opened):
         elif ".experts." in name:
             expert = int(name.split(".experts.")[1].split(".")[0])
             owner = model.get_submodule(name.split(".experts.")[0])
-            count = owner.n_routed_experts // world_size
-            if rank * count <= expert < (rank + 1) * count:
+            count = owner.n_routed_experts // expert_size
+            if expert_rank * count <= expert < (expert_rank + 1) * count:
                 raise ValueError(f"unconsumed local expert weight: {name}")
             reason = "owned by another expert rank"
         else:
@@ -180,6 +199,8 @@ def _load_original_checkpoint(model, root, rank, world_size, opened):
     return {
         "rank": rank,
         "world_size": world_size,
+        "expert_rank": expert_rank,
+        "expert_size": expert_size,
         "loaded_tensors": len(params),
         "parameter_bytes": copied_bytes,
         "skipped_tensor_counts": skipped,

@@ -31,6 +31,13 @@ def decode_dense_batch(batch_size):
         _decode_batch_size = previous
 
 
+@contextmanager
+def gathered_decode_batch(data_size):
+    """Preserve request grouping after gathering equal batches across DP."""
+    with decode_dense_batch(_decode_batch_size * data_size):
+        yield
+
+
 def dense_linear(x, weight):
     # Preserve the published reduction for unquantized mHC, compressor and
     # head projections. Small changes amplify at subsequent quantization ties.
