@@ -235,6 +235,78 @@ class ReferenceProbeExtension:
             prompt_ids = json.loads(prompt_ids)
         return mtp_differential(self, prompt_ids)
 
+    def fl_cuda_graph_probe(self, prompt_ids):
+        """Capture one fixed-position target step on the real distributed model.
+
+        This checks whole-model capture compatibility. It is not the serving
+        runner's dynamic-position decode graph.
+        """
+        import json
+
+        import torch
+
+        if isinstance(prompt_ids, str):
+            prompt_ids = json.loads(prompt_ids)
+        if (
+            not isinstance(prompt_ids, list)
+            or not 1 <= len(prompt_ids) < self.model_config.max_model_len - 1
+        ):
+            raise ValueError("graph probe needs a nonempty prompt with decode room")
+        model = self.get_model()
+        state = self.model_runner.state
+        ids = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+        position = len(prompt_ids)
+        original_temperature = model.core.temperature
+        model.core.temperature = 0
+
+        def prepare():
+            state.bind(0, reset=True)
+            logits, hidden = model.forward_with_aux(ids, start_pos=0)
+            if self.model_runner.drafting_enabled:
+                model.store_draft_context(hidden, 0)
+            return logits[0].argmax().view(1)
+
+        try:
+            with torch.inference_mode():
+                token = prepare()
+                logits, hidden = model.forward_with_aux(token, start_pos=position)
+                if self.model_runner.drafting_enabled:
+                    model.store_draft_context(hidden, position)
+                torch.cuda.synchronize(self.device)
+                token = prepare()
+                free_before, _ = torch.cuda.mem_get_info(self.device)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                    captured_logits, captured_hidden = model.forward_with_aux(
+                        token, start_pos=position
+                    )
+                    if self.model_runner.drafting_enabled:
+                        model.store_draft_context(captured_hidden, position)
+                free_after, _ = torch.cuda.mem_get_info(self.device)
+                matches = []
+                for _ in range(2):
+                    fresh_token = prepare()
+                    token.copy_(fresh_token)
+                    graph.replay()
+                    graph_logits = captured_logits.clone()
+                    fresh_token = prepare()
+                    reference_logits, _ = model.forward_with_aux(
+                        fresh_token, start_pos=position
+                    )
+                    matches.append(bool(torch.equal(graph_logits, reference_logits)))
+                return {
+                    "rank": self.rank,
+                    "position": position,
+                    "graph_replay_count": len(matches),
+                    "logits_exact_match": matches,
+                    "graph_reserved_bytes": free_before - free_after,
+                    "scope": "one fixed-position target step; not a serving decode graph",
+                }
+        finally:
+            model.core.temperature = original_temperature
+            state.bind(0, reset=True)
+            torch.cuda.empty_cache()
+
 
 def mtp_differential(worker, prompt_ids):
     """Compare real-weight DSpark stages, Markov heads and context with the publisher."""

@@ -2,13 +2,12 @@ ARG BASE_IMAGE=vllm/vllm-openai:v0.28.0-cu129
 FROM ${BASE_IMAGE} AS flagtree
 COPY flagtree/flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl /tmp/flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl
 RUN echo '14e12e5c33864b37ebad2f1b654546a1472d6abee824633c1120952e30686adf  /tmp/flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl' | sha256sum -c - && \
-    uv pip install --target /opt/flagtree --no-index --no-deps /tmp/flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl
+    python3 -m pip install --no-index --no-deps --target=/opt/flagtree /tmp/flagtree-0.6.0+nv37.dbf18423-cp312-cp312-linux_x86_64.whl
 
 FROM ${BASE_IMAGE}
 ARG FL_PLUGIN_VERSION
 ARG FL_GEMS_VERSION
 
-# Stage the pinned empty-build vLLM wheel, FL wheels, and FlagCX CUDA 12.9 runtime.
 COPY wheels/ /opt/fl-wheels/
 COPY --from=flagtree /opt/flagtree /opt/flagtree
 COPY flagcx-runtime/ /opt/flagcx/
@@ -16,7 +15,7 @@ COPY deployment-manifest.json /opt/fl-deployment-manifest.json
 RUN test -n "${FL_PLUGIN_VERSION}" && test -n "${FL_GEMS_VERSION}" && \
     test -f /opt/flagcx/build/lib/libflagcx.so && \
     python3 -m venv --system-site-packages /opt/fl-venv && \
-    uv pip install --python /opt/fl-venv/bin/python --no-index --no-deps \
+    /opt/fl-venv/bin/python -m pip install --no-index --no-deps \
       --find-links /opt/fl-wheels \
       'vllm==0.28.0+empty' "vllm-plugin-fl==${FL_PLUGIN_VERSION}" "flag-gems==${FL_GEMS_VERSION}" \
       'PyYAML==6.0.1' 'packaging==26.3' 'SQLAlchemy==2.0.54' \
@@ -31,6 +30,7 @@ ENV PATH="/opt/fl-venv/bin:${PATH}" \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENGINE_READY_TIMEOUT_S=1800 \
     CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=4
 RUN /opt/fl-venv/bin/python -c "import importlib.util, triton; from vllm_fl.strict028.bootstrap import validate_host; validate_host(); assert triton.__version__ == '3.7.1' and triton.__file__.startswith('/opt/flagtree/'); assert importlib.util.find_spec('vllm._C') is None; assert importlib.util.find_spec('vllm._C_stable_libtorch') is None"
 ENTRYPOINT ["/opt/fl-venv/bin/vllm", "serve"]
