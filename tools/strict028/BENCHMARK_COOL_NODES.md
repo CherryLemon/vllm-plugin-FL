@@ -33,3 +33,5 @@ P 在两轮对应窗口均为 30–35°C、1830 MHz，无采样到的降频或�
 - `benchmark/launch_node1_p.sh`、`launch_node3_d.sh`、`launch_node3_d_baseline.sh`：固定参数。首次 P 启动误设 `FL_PD_HOST_SNAPSHOTS=0`，只产生 4 个 handoff 后队列停住；该尝试单独留档，修正为 80 后才开始上述有效测量。
 
 测试结束已停止并移除本次新建的 P/D 容器，`.1` 和 `.3` 的 8 张卡分别回到约 4 MiB 和 0 MiB 占用；其它容器未改动。
+
+剩余约 14 倍的 SGLang Decode 差距已进一步按 target/draft Graph、逐层调用数和 M=160 routed MoE 同卡算子对照拆解，见 [Decode 差距定位](DIAGNOSE_COOL_NODE_DECODE_GAP.md)。
