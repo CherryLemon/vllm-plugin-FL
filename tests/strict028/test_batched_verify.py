@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("verify_width", [3, 6])
+@pytest.mark.parametrize("verify_width", [2, 3, 6])
 def test_verify_graph_commits_only_accepted_prefix_and_reuses_metadata(
     monkeypatch, verify_width
 ):

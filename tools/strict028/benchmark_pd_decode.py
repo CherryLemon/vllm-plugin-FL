@@ -193,7 +193,7 @@ def prepare_one(opener, url, prompt_ids, timeout):
 
 def decode_one(
     opener, url, prepared, index, barrier, timeout, output_tokens, dp_rank=0,
-    profile_stop=None,
+    profile_stop=None, reference_request=None,
 ):
     barrier.wait(timeout=60)
     start = time.perf_counter()
@@ -269,7 +269,23 @@ def decode_one(
         raise RuntimeError(
             f"unexpected Decode output {index}: {tokens=} {first=} {last=}"
         )
+    prefix_comparison = None
+    if reference_request is not None:
+        n = reference_request["decode_completion_tokens"]
+        actual = hashlib.sha256(
+            json.dumps(generated_ids[:n], separators=(",", ":")).encode()
+        ).hexdigest()
+        prefix_comparison = {
+            "reference_tokens": n,
+            "enough_tokens": len(generated_ids) >= n,
+            "expected_sha256": reference_request["token_ids_sha256"],
+            "actual_sha256": actual,
+            "passed": len(generated_ids) >= n
+            and actual == reference_request["token_ids_sha256"]
+            and prepared["first_token"] == reference_request["prefill_first_token"],
+        }
     return {
+        "reference_prefix_comparison": prefix_comparison,
         "index": index,
         "data_parallel_rank": dp_rank,
         "token_arrivals": arrivals,
@@ -348,6 +364,7 @@ def measure_steady_window(samples, requests, origin):
 def run_burst(
     opener, p_url, d_url, prompts, timeout, output_tokens, profile_label=None, dp_size=1,
     sample_path=None, profile_directory=None, prepared=None,
+    preprofile_observation_seconds=0,
 ):
     concurrency = len(prompts)
     prefill_start = time.perf_counter()
@@ -374,6 +391,7 @@ def run_burst(
     profile_events = []
     profile_stop = threading.Event() if profile_label else None
     profile_errors = []
+    observation = {}
     profile_started = time.perf_counter()
     if sample_path is not None:
         sample_path.write_text("")
@@ -409,6 +427,7 @@ def run_burst(
                         metrics, re.M,
                     )
                 ]
+                samples[-1]["generation"] = generation
                 steady = len(samples) >= 5 and all(
                     s.get("running") == [20.0] * 4
                     and s.get("waiting") == [0.0] * 4
@@ -426,7 +445,18 @@ def run_burst(
                     end - begin >= 20 * 6 * 10
                     for begin, end in zip(warmup_generation, generation)
                 )
+                if profile_label and not steady and observation and not profile_events:
+                    raise RuntimeError("C80 occupancy changed during unprofiled window")
                 if profile_label and steady and warmed and not profile_events:
+                    now = time.perf_counter()
+                    if not observation:
+                        observation.update(start_s=now, generation_start=generation)
+                ready_to_profile = observation and (
+                    time.perf_counter() - observation["start_s"]
+                    >= preprofile_observation_seconds
+                )
+                if profile_label and steady and warmed and ready_to_profile and not profile_events:
+                    observation.update(end_s=time.perf_counter(), generation_end=generation)
                     profile_events.append({
                         "armed_at_s": time.perf_counter(),
                         "warmup_generation_before": warmup_generation,
@@ -517,6 +547,23 @@ def run_burst(
             raise RuntimeError("Decode did not drain after bounded profiling")
         if profile_errors:
             raise RuntimeError(f"bounded Decode profiling failed: {profile_errors}")
+    if observation and preprofile_observation_seconds > 0:
+        elapsed = observation["end_s"] - observation["start_s"]
+        counts = [sum(n for t, n in row["token_arrivals"]
+                      if observation["start_s"] < t <= observation["end_s"])
+                  for row in requests]
+        observation.update(
+            duration_s=elapsed, profiler_enabled=False,
+            completed_output_benchmark=False,
+            stream_tokens_per_request=counts,
+            stream_tps_per_request=[n / elapsed for n in counts],
+            stream_median_tps=statistics.median(counts) / elapsed,
+            stream_mean_tps=sum(counts) / concurrency / elapsed,
+            stream_aggregate_tps=sum(counts) / elapsed,
+            counter_aggregate_tps=sum(end - begin for begin, end in zip(
+                observation["generation_start"], observation["generation_end"]
+            )) / elapsed,
+        )
     active = [sum(s.get("running", [])) for s in samples]
     steady_samples = longest_steady_window(samples)
     first = min(row["first_offset_s"] for row in requests)
@@ -559,6 +606,7 @@ def run_burst(
         "steady_c80_dp4_samples": len(steady_samples),
         "steady_window": steady_rate,
         "profile_events": profile_events,
+        "unprofiled_observation_window": observation,
         "occupancy_samples": samples,
     }
 
