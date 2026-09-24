@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bounded CUDA Graph cache keyed by batch size, never absolute token position."""
 
+import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,6 +11,23 @@ import torch
 from .batched_decode import DecodeBatch
 from .models.deepseek_v41.model import MoE, set_dtype
 from .models.deepseek_v41.ops import decode_dense_batch
+
+logger = logging.getLogger(__name__)
+
+
+def reclaim_capture_cache(device, stage):
+    # CUDA graph instantiation allocates outside PyTorch's allocator. It cannot
+    # reclaim the default pool's unused warmup blocks on an allocation failure.
+    # Live state and graph-owned allocations remain retained by empty_cache().
+    torch.cuda.empty_cache()
+    logger.warning(
+        "FL graph %s: device=%s free=%d allocated=%d reserved=%d",
+        stage,
+        device,
+        torch.cuda.mem_get_info(device)[0],
+        torch.cuda.memory_allocated(device),
+        torch.cuda.memory_reserved(device),
+    )
 
 
 @contextmanager
@@ -99,9 +117,13 @@ class BatchedDecodeGraphs:
         # device; it is updated to real activity before the first replay.
         self._forward(ids, context, static_hidden)
         torch.cuda.synchronize(self.device)
-        graph = torch.cuda.CUDAGraph()
+        reclaim_capture_cache(self.device, "before capture")
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph, capture_error_mode="thread_local"):
             result = self._forward(ids, context, static_hidden)
+        reclaim_capture_cache(self.device, "before instantiate")
+        graph.instantiate()
+        reclaim_capture_cache(self.device, "after instantiate")
         record = _Graph(graph, ids, context, static_hidden, result)
         self.capture_seconds += time.monotonic() - begin
         return record

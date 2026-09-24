@@ -135,6 +135,8 @@ def _forward(owner, ids, context):
 
 @torch.inference_mode()
 def capture_verify(owner, tokens, pages, positions, active):
+    from .batched_graph import reclaim_capture_cache
+
     ids = tokens.clone()
     context = VerifyBatch(
         owner.state, pages.clone(), positions.clone(), torch.zeros_like(active)
@@ -143,9 +145,13 @@ def capture_verify(owner, tokens, pages, positions, active):
     # Warmup's journal must not retain temporary GPU allocations during capture.
     context.journal = []
     torch.cuda.synchronize(owner.device)
-    graph = torch.cuda.CUDAGraph()
+    reclaim_capture_cache(owner.device, "verify before capture")
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph, capture_error_mode="thread_local"):
         result = _forward(owner, ids, context)
+    reclaim_capture_cache(owner.device, "verify before instantiate")
+    graph.instantiate()
+    reclaim_capture_cache(owner.device, "verify after instantiate")
     journal_bytes = sum(
         old.numel() * old.element_size() for _, _, old, _, _ in context.journal
     )
