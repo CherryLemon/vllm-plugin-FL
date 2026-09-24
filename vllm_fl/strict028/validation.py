@@ -539,6 +539,11 @@ class ReferenceProbeExtension:
             prompt_ids = json.loads(prompt_ids)
         return mtp_differential(self, prompt_ids)
 
+    def fl_verify_differential(self, prompt_ids):
+        from .verify_diagnostics import verify_differential
+
+        return verify_differential(self, prompt_ids)
+
     def fl_cuda_graph_probe(self, prompt_ids):
         """Capture one fixed-position target step on the real distributed model.
 

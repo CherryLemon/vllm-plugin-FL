@@ -41,6 +41,8 @@ class BatchedDecodeGraphs:
         self.model, self.state, self.device = model, state, device
         self.batch_capacity = batch_capacity
         self.targets, self.drafts = {}, {}
+        self.verifiers = {}
+        self.verify_replays = 0
         self.target_replays = self.draft_replays = 0
         self.capture_seconds = 0.0
 
@@ -48,15 +50,23 @@ class BatchedDecodeGraphs:
         return {
             "enabled": True,
             "mode": "device_position_batch",
-            "target_graphs": len(self.targets),
+            "target_graphs": len(self.targets) + len(self.verifiers),
             "draft_graphs": len(self.drafts),
-            "target_batch_sizes": sorted(self.targets),
+            "target_batch_sizes": sorted(
+                set(self.targets) | {b for b, _ in self.verifiers}
+            ),
             "draft_batch_sizes": sorted(self.drafts),
             "target_replays": self.target_replays,
             "draft_replays": self.draft_replays,
             "capture_seconds": self.capture_seconds,
             "page_copy_bytes": 0,
             "batch_capacity": self.batch_capacity,
+            "verify_graphs": len(self.verifiers),
+            "verify_replays": self.verify_replays,
+            "verify_widths": sorted({s for _, s in self.verifiers}),
+            "verify_journal_bytes": sum(
+                r.journal_bytes for r in self.verifiers.values()
+            ),
         }
 
     def _forward(self, token, context, hidden):
@@ -150,6 +160,62 @@ class BatchedDecodeGraphs:
 
     def target_batch(self, tokens, pages, positions, active):
         return self._replay(tokens, pages, positions, active)
+
+    @torch.inference_mode()
+    def verify_batch(self, tokens, pages, positions, active):
+        """Return per-position selections, committed lengths and final context."""
+        from .verify_graph import capture_verify
+
+        if (
+            tokens.ndim != 2
+            or not 1 <= tokens.shape[1] <= 6
+            or tokens.dtype != torch.int64
+            or pages.shape != tokens.shape[:1]
+            or pages.dtype != torch.int64
+            or positions.shape != tokens.shape
+            or positions.dtype != torch.int64
+            or active.shape != tokens.shape
+            or active.dtype != torch.bool
+            or any(t.device != tokens.device for t in (pages, positions, active))
+        ):
+            raise ValueError(
+                "expected device ids/positions/active[B,S], pages[B], S<=6"
+            )
+        real, width = tokens.shape
+        batch = real if self.batch_capacity is None else self.batch_capacity
+        if real > batch or not batch:
+            raise ValueError("verify batch exceeds graph capacity")
+        if real < batch:
+
+            def pad(value):
+                out = value.new_zeros((batch, *value.shape[1:]))
+                out[:real].copy_(value)
+                return out
+
+            tokens, pages, positions, active = map(
+                pad, (tokens, pages, positions, active)
+            )
+        key = (batch, width)
+        record = self.verifiers.get(key)
+        if record is None:
+            begin = time.monotonic()
+            record = capture_verify(self, tokens, pages, positions, active)
+            self.verifiers[key] = record
+            self.capture_seconds += time.monotonic() - begin
+        record.ids.copy_(tokens)
+        record.context.pages.copy_(pages)
+        record.context.positions.copy_(positions)
+        record.context.active.copy_(active)
+        record.graph.replay()
+        self.target_replays += 1
+        self.verify_replays += 1
+        selected, kept, hidden, finite = record.result
+        return (
+            selected[:real],
+            kept[:real],
+            None if hidden is None else hidden[:real],
+            finite,
+        )
 
     def draft_batch(self, tokens, hidden, pages, positions, active):
         return self._replay(tokens, pages, positions, active, hidden)

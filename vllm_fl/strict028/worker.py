@@ -62,6 +62,13 @@ class ModelRunnerFL028:
         self.batched_decode_enabled = os.environ.get("VLLM_FL_BATCHED_DECODE") == "1"
         if self.batched_decode_enabled and not self.graph_enabled:
             raise ValueError("batched Decode requires VLLM_FL_DECODE_GRAPH=1")
+        self.batched_verify_enabled = os.environ.get("VLLM_FL_BATCHED_VERIFY") == "1"
+        if self.batched_verify_enabled and not (
+            self.batched_decode_enabled and self.drafting_enabled
+        ):
+            raise ValueError(
+                "batched verification requires batched Graph Decode and DSpark"
+            )
         self.graphs = None
         self.spec_stats = {
             "draft_steps": 0,
@@ -199,13 +206,18 @@ class ModelRunnerFL028:
                             ids, compute_start, request.prefill_length
                         )
                         if not bool(torch.isfinite(logits).all().item()):
-                            raise FloatingPointError("non-finite chunked Prefill logits")
+                            raise FloatingPointError(
+                                "non-finite chunked Prefill logits"
+                            )
                         token = int(logits[0].argmax().item())
                         self.spec_stats["target_forward_calls"] += 1
                         if self.prefill_cache is not None:
                             self.prefill_cache.record(
-                                request.tokens, request.prefill_length, start + count,
-                                self.state, request.block,
+                                request.tokens,
+                                request.prefill_length,
+                                start + count,
+                                self.state,
+                                request.block,
                             )
                 else:
                     if start or count != request.prefill_length:
@@ -287,9 +299,9 @@ class ModelRunnerFL028:
     def _execute_decode_batch(self, output):
         """Verify request prefixes together, masking a lane after rejection.
 
-        Target verification remains sequential across draft positions for now;
-        different requests share each model forward and graph. A rejected lane
-        never commits its suffix to Engram, compressor, or window state.
+        Batched verification shares one target graph across draft positions and
+        rolls back rejected state rows. The admitted sequential path remains
+        available for differential checks and deployments without the opt-in.
         """
         req_ids = list(output.num_scheduled_tokens)
         requests = [self.requests[r] for r in req_ids]
@@ -316,34 +328,64 @@ class ModelRunnerFL028:
         samples = [[] for _ in requests]
         last_hidden = None
         last_tokens = inputs.clone()
-        max_steps = (
-            (6 if self.drafting_enabled else 1)
-            if self.data_parallel
-            else 1 + max(map(len, drafts), default=0)
-        )
-        for offset in range(max_steps):
-            if not self.any_decode_active(any(active_host)):
-                break
-            positions = torch.where(active, starts + offset, 0)
-            logits, hidden = self.graphs.target_batch(inputs, pages, positions, active)
-            if not bool(torch.isfinite(logits[active]).all().item()):
-                raise FloatingPointError("non-finite batched target logits")
-            selected = logits.argmax(-1)
-            selected_host = selected.tolist()
-            last_tokens = torch.where(active, selected, last_tokens)
-            if self.drafting_enabled:
-                if last_hidden is None:
-                    last_hidden = torch.zeros_like(hidden)
-                last_hidden = torch.where(active[:, None, None], hidden, last_hidden)
-            self.spec_stats["target_forward_calls"] += sum(active_host)
-            for i, enabled in enumerate(active_host):
-                if not enabled:
-                    continue
-                token = selected_host[i]
-                samples[i].append(token)
-                active_host[i] = offset < len(drafts[i]) and token == drafts[i][offset]
-            active.copy_(torch.tensor(active_host, device=self.device))
-            inputs = selected
+        if self.batched_verify_enabled:
+            candidates = torch.zeros(
+                (len(requests), 6), device=self.device, dtype=torch.long
+            )
+            for i, (request, draft) in enumerate(zip(requests, drafts)):
+                candidates[i, : 1 + len(draft)] = torch.tensor(
+                    [request.tokens[request.computed], *draft], device=self.device
+                )
+            lengths = torch.tensor(
+                [1 + len(draft) for draft in drafts], device=self.device
+            )
+            offsets = torch.arange(6, device=self.device)
+            mask = offsets[None] < lengths[:, None]
+            positions = torch.where(mask, starts[:, None] + offsets, 0)
+            selected, kept, last_hidden, finite = self.graphs.verify_batch(
+                candidates, pages, positions, mask
+            )
+            if not bool(finite.item()):
+                raise FloatingPointError("non-finite batched verify logits")
+            kept_host = kept.tolist()
+            samples = [row[:count] for row, count in zip(selected.tolist(), kept_host)]
+            last_tokens = selected.gather(1, (kept - 1).clamp_min(0)[:, None]).flatten()
+            self.spec_stats["target_forward_calls"] += sum(kept_host)
+        else:
+            max_steps = (
+                (6 if self.drafting_enabled else 1)
+                if self.data_parallel
+                else 1 + max(map(len, drafts), default=0)
+            )
+            for offset in range(max_steps):
+                if not self.any_decode_active(any(active_host)):
+                    break
+                positions = torch.where(active, starts + offset, 0)
+                logits, hidden = self.graphs.target_batch(
+                    inputs, pages, positions, active
+                )
+                if not bool(torch.isfinite(logits[active]).all().item()):
+                    raise FloatingPointError("non-finite batched target logits")
+                selected = logits.argmax(-1)
+                selected_host = selected.tolist()
+                last_tokens = torch.where(active, selected, last_tokens)
+                if self.drafting_enabled:
+                    if last_hidden is None:
+                        last_hidden = torch.zeros_like(hidden)
+                    last_hidden = torch.where(
+                        active[:, None, None], hidden, last_hidden
+                    )
+                self.spec_stats["target_forward_calls"] += sum(active_host)
+                for i, enabled in enumerate(active_host):
+                    if not enabled:
+                        continue
+                    token = selected_host[i]
+                    samples[i].append(token)
+                    active_host[i] = (
+                        offset < len(drafts[i]) and token == drafts[i][offset]
+                    )
+                active.copy_(torch.tensor(active_host, device=self.device))
+                inputs = selected
         next_drafts = [[] for _ in requests]
         for request, generated, draft in zip(requests, samples, drafts):
             request.computed += len(generated)
@@ -593,9 +635,16 @@ class WorkerFL028(WorkerBase):
             tokens = torch.zeros(count, device=self.device, dtype=torch.long)
             active = torch.zeros(count, device=self.device, dtype=torch.bool)
             with torch.inference_mode():
-                _, hidden = self.model_runner.graphs.target_batch(
-                    tokens, tokens, tokens, active
-                )
+                if self.model_runner.batched_verify_enabled:
+                    ids = tokens[:, None].expand(-1, 6).contiguous()
+                    mask = active[:, None].expand(-1, 6).contiguous()
+                    _, _, hidden, _ = self.model_runner.graphs.verify_batch(
+                        ids, tokens, ids, mask
+                    )
+                else:
+                    _, hidden = self.model_runner.graphs.target_batch(
+                        tokens, tokens, tokens, active
+                    )
                 if self.model_runner.drafting_enabled:
                     self.model_runner.graphs.draft_batch(
                         tokens, hidden, tokens, tokens, active
