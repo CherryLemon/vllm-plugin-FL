@@ -27,7 +27,10 @@ def main():
     layout = parallel_layout()
     assert layout.world_size == 8
     model, state = make_model(parallel=layout)
-    graphs = BatchedDecodeGraphs(model, state, device, batch_capacity=3)
+    graphs = BatchedDecodeGraphs(
+        model, state, device, batch_capacity=3,
+        verify_width=int(os.environ.get("VLLM_FL_VERIFY_WIDTH", "6")),
+    )
     pages = torch.tensor([1, 2, 3], device=device)
     starts = torch.tensor([7, 8, 127], device=device)
     for page, length in zip(pages.tolist(), starts.tolist()):

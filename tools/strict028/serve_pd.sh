@@ -48,6 +48,7 @@ if [[ "${VLLM_FL_BATCHED_DECODE:-0}" == 1 ]]; then
 fi
 if [[ "${VLLM_FL_BATCHED_VERIFY:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_BATCHED_VERIFY=1)
+  docker_args+=(-e "VLLM_FL_VERIFY_WIDTH=${VLLM_FL_VERIFY_WIDTH:-6}")
 fi
 if [[ "${VLLM_FL_EXPERIMENTAL_DP:-0}" == 1 ]]; then
   docker_args+=(-e VLLM_FL_EXPERIMENTAL_DP=1)

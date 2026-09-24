@@ -15,9 +15,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @torch.inference_mode()
-def test_verify_graph_commits_only_accepted_prefix_and_reuses_metadata(monkeypatch):
+@pytest.mark.parametrize("verify_width", [3, 6])
+def test_verify_graph_commits_only_accepted_prefix_and_reuses_metadata(
+    monkeypatch, verify_width
+):
     model, state = make_model()
-    graph = BatchedDecodeGraphs(model, state, torch.device("cuda"), batch_capacity=4)
+    graph = BatchedDecodeGraphs(
+        model, state, torch.device("cuda"), batch_capacity=4, verify_width=verify_width
+    )
     for page, length in ((1, 7), (2, 8), (3, 127)):
         state.bind(page, reset=True)
         with torch.device("cuda"), set_dtype(torch.bfloat16):
@@ -135,7 +140,7 @@ def test_verify_graph_commits_only_accepted_prefix_and_reuses_metadata(monkeypat
                 atol=1e-4,
             )
         torch.testing.assert_close(state.storage, expected_after_draft, rtol=0, atol=0)
-    assert graph.stats()["verify_replays"] == 3
+    assert graph.stats()["verify_replays"] == 3 * (6 // verify_width)
     assert graph.stats()["verify_graphs"] == 1
     assert graph.stats()["verify_journal_bytes"] < state.storage.numel()
     assert graph.stats()["page_copy_bytes"] == 0

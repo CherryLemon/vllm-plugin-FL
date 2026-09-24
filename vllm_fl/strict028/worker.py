@@ -582,6 +582,7 @@ class WorkerFL028(WorkerBase):
                     batch_capacity=self.scheduler_config.max_num_seqs
                     if self.model_runner.data_parallel
                     else None,
+                    verify_width=int(os.environ.get("VLLM_FL_VERIFY_WIDTH", "6")),
                 )
             else:
                 from .decode_graph import DecodeGraphs

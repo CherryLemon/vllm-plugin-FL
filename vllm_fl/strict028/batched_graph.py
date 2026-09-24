@@ -53,11 +53,14 @@ class _Graph:
 
 
 class BatchedDecodeGraphs:
-    def __init__(self, model, state, device, *, batch_capacity=None):
+    def __init__(self, model, state, device, *, batch_capacity=None, verify_width=6):
         if batch_capacity is not None and batch_capacity < 1:
             raise ValueError("a fixed graph batch must have positive capacity")
+        if verify_width not in (1, 2, 3, 6):
+            raise ValueError("verify width must divide the six-position draft block")
         self.model, self.state, self.device = model, state, device
         self.batch_capacity = batch_capacity
+        self.verify_width = verify_width
         self.targets, self.drafts = {}, {}
         self.verifiers = {}
         self.verify_replays = 0
@@ -82,6 +85,7 @@ class BatchedDecodeGraphs:
             "verify_graphs": len(self.verifiers),
             "verify_replays": self.verify_replays,
             "verify_widths": sorted({s for _, s in self.verifiers}),
+            "max_verify_width": self.verify_width,
             "verify_journal_bytes": sum(
                 r.journal_bytes for r in self.verifiers.values()
             ),
@@ -183,6 +187,36 @@ class BatchedDecodeGraphs:
     def target_batch(self, tokens, pages, positions, active):
         return self._replay(tokens, pages, positions, active)
 
+    def _verify_partitioned(self, tokens, pages, positions, active):
+        # Reuse one graph for consecutive position blocks. Clone its outputs
+        # before replaying it again: every replay writes the same result buffers.
+        selections = []
+        total = torch.zeros_like(pages)
+        alive = active[:, 0]
+        last_hidden = None
+        all_finite = None
+        previous = None
+        for begin in range(0, tokens.shape[1], self.verify_width):
+            end = min(begin + self.verify_width, tokens.shape[1])
+            if previous is not None:
+                alive = alive & (previous == tokens[:, begin])
+            mask = active[:, begin:end] & alive[:, None]
+            selected, kept, hidden, finite = self.verify_batch(
+                tokens[:, begin:end], pages, positions[:, begin:end], mask
+            )
+            selected, kept, finite = selected.clone(), kept.clone(), finite.clone()
+            hidden = None if hidden is None else hidden.clone()
+            selections.append(selected)
+            total = total + kept
+            if hidden is not None:
+                last_hidden = hidden if last_hidden is None else torch.where(
+                    (kept > 0)[:, None, None], hidden, last_hidden
+                )
+            all_finite = finite if all_finite is None else all_finite & finite
+            alive = alive & (kept == end - begin)
+            previous = selected[:, -1]
+        return torch.cat(selections, 1), total, last_hidden, all_finite
+
     @torch.inference_mode()
     def verify_batch(self, tokens, pages, positions, active):
         """Return per-position selections, committed lengths and final context."""
@@ -203,6 +237,8 @@ class BatchedDecodeGraphs:
             raise ValueError(
                 "expected device ids/positions/active[B,S], pages[B], S<=6"
             )
+        if tokens.shape[1] > self.verify_width:
+            return self._verify_partitioned(tokens, pages, positions, active)
         real, width = tokens.shape
         batch = real if self.batch_capacity is None else self.batch_capacity
         if real > batch or not batch:
