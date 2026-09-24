@@ -110,6 +110,15 @@ def decode_mean(x, dim, keepdim=False):
     if _decode_batch_size > 1:
         if x.shape[0] % _decode_batch_size:
             raise ValueError("decode reduction must retain its request grouping")
+        if _use_batched_row_reduce(x, dim):
+            from flag_gems.fused.decode_row_reduce import decode_row_reduce
+
+            return decode_row_reduce(
+                x,
+                reference_rows=x.numel() // x.shape[-1] // _decode_batch_size,
+                mean=True,
+                keepdim=keepdim,
+            )
         return torch.cat(
             [
                 part.mean(dim=dim, keepdim=keepdim)
@@ -125,6 +134,15 @@ def decode_sum(x, dim, keepdim=False):
     if _decode_batch_size > 1:
         if x.shape[0] % _decode_batch_size:
             raise ValueError("decode sum must retain its request grouping")
+        if _use_batched_row_reduce(x, dim):
+            from flag_gems.fused.decode_row_reduce import decode_row_reduce
+
+            return decode_row_reduce(
+                x,
+                reference_rows=x.numel() // x.shape[-1] // _decode_batch_size,
+                mean=False,
+                keepdim=keepdim,
+            )
         return torch.cat(
             [
                 part.sum(dim=dim, keepdim=keepdim)
@@ -133,6 +151,22 @@ def decode_sum(x, dim, keepdim=False):
             dim=0,
         )
     return x.sum(dim=dim, keepdim=keepdim)
+
+
+def _use_batched_row_reduce(x, dim):
+    """Only the admitted contiguous FP32 last-axis geometry is specialized."""
+    return (
+        os.environ.get("VLLM_FL_BATCHED_REDUCTIONS", "1") == "1"
+        and isinstance(dim, int)
+        and dim in (-1, x.ndim - 1)
+        and x.is_cuda
+        and x.dtype == torch.float32
+        and x.is_contiguous()
+        and 128 <= x.shape[-1] <= 32768
+        and x.shape[-1] % 4 == 0
+        and x.storage_offset() % 4 == 0
+        and x.numel() > 0
+    )
 
 
 def lowp_linear(x, weight, scale):
@@ -209,6 +243,7 @@ EXECUTION_PROFILE = {
         "fp4_quantize_reference",
         "sparse_attention_with_sink",
         "hc_split_sinkhorn_reference",
+        "decode_row_reduce (per-request FP32 association, batched launch)",
     ],
     "torch_reference": [
         "unquantized projections (mHC, compressor and head)",
