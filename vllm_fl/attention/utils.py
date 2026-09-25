@@ -125,3 +125,32 @@ def patch_mm_encoder_attention():
             return None
 
     mm_mod.maybe_get_vit_flash_attn_backend = _patched_maybe_get_vit_flash_attn_backend
+
+
+def patch_oot_apply_rotary_emb():
+    """
+    Route ``ApplyRotaryEmb`` through vLLM's CUDA kernel on this OOT platform.
+
+    PlatformFL reports ``is_out_of_tree() == True``, and ``ApplyRotaryEmb`` is
+    constructed with ``enforce_enable=True``, so ``CustomOp.dispatch_forward``
+    binds it to ``forward_oot`` -> ``forward_native`` -> ``forward_static``.
+    ``forward_static`` assumes the whole head is rotated (it chunks the FULL
+    ``head_size`` but takes ``cos`` of ``rotary_dim / 2``). MiniMax-M3 vision
+    uses partial RoPE (head_dim=80, rotary_dim=78 per vision_tower.py), so it
+    feeds ``(..., 80)`` against ``cos (..., 39)`` and dies with a genuine
+    39-vs-40 broadcast error. ``forward_cuda`` (vllm_flash_attn rotary) supports
+    ``rotary_dim <= head_dim`` and rotates only the first rotary_dim, which is
+    what the model expects. Mirrors the MMEncoderAttention fix above.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return
+
+    from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+    ApplyRotaryEmb.forward_oot = ApplyRotaryEmb.forward_cuda
+    logger.info_once(
+        "Patched ApplyRotaryEmb.forward_oot -> forward_cuda "
+        "(partial-RoPE support on OOT platform)."
+    )
