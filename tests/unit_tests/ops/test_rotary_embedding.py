@@ -76,15 +76,12 @@ def test_apply_rotary_emb_patch_routes_through_dispatch(monkeypatch):
 
 def test_apply_rotary_emb_has_separate_dispatch_backends():
     from vllm_fl.dispatch import PREFER_DEFAULT, PREFER_REFERENCE, PREFER_VENDOR
-    from vllm_fl.dispatch.backends.flaggems.flaggems import FlagGemsBackend
     from vllm_fl.dispatch.backends.flaggems.register_ops import (
         register_builtins as register_flaggems,
     )
-    from vllm_fl.dispatch.backends.reference.reference import ReferenceBackend
     from vllm_fl.dispatch.backends.reference.register_ops import (
         register_builtins as register_reference,
     )
-    from vllm_fl.dispatch.backends.vendor.cuda.cuda import CudaBackend
     from vllm_fl.dispatch.backends.vendor.cuda.register_ops import (
         register_builtins as register_cuda,
     )
@@ -100,22 +97,21 @@ def test_apply_rotary_emb_has_separate_dispatch_backends():
         register_flaggems(registry)
     register_reference(registry)
     register_cuda(registry)
+    # Availability is bound at registration time. Make each implementation
+    # selectable here, regardless of which vendor runs the unit test.
+    for impl in registry.get_implementations("apply_rotary_emb"):
+        impl.fn._is_available = lambda: True
     manager = OpManager(registry)
     manager._state.initialized = True
     manager._state.init_pid = os.getpid()
 
-    with (
-        patch.object(FlagGemsBackend, "is_available", return_value=True),
-        patch.object(ReferenceBackend, "is_available", return_value=True),
-        patch.object(CudaBackend, "is_available", return_value=True),
+    for prefer, expected in (
+        (PREFER_DEFAULT, "default.flagos"),
+        (PREFER_VENDOR, "vendor.cuda"),
+        (PREFER_REFERENCE, "reference.torch"),
     ):
-        for prefer, expected in (
-            (PREFER_DEFAULT, "default.flagos"),
-            (PREFER_VENDOR, "vendor.cuda"),
-            (PREFER_REFERENCE, "reference.torch"),
-        ):
-            with policy_context(SelectionPolicy(prefer=prefer)):
-                assert manager._resolve_impl("apply_rotary_emb").impl_id == expected
+        with policy_context(SelectionPolicy(prefer=prefer)):
+            assert manager._resolve_impl("apply_rotary_emb").impl_id == expected
 
     # The FlagGems rotary_embedding switch keeps its existing meaning for
     # both Q/K RoPE and the single-tensor interface.
