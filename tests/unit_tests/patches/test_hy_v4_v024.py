@@ -342,9 +342,9 @@ def test_hy4_moe_constructor_wires_fallback_runner_and_sp(monkeypatch):
             observed.append(("fused", kwargs))
             self.routed_experts = SimpleNamespace(local_num_experts=16)
 
-    monkeypatch.setattr(hy_v4, "GateLinear", FakeGate)
+    monkeypatch.setattr(hy_v4.fused_moe_layers, "GateLinear", FakeGate)
     monkeypatch.setattr(hy_v4, "HYV4DenseMLP", FakeDense)
-    monkeypatch.setattr(hy_v4, "FusedMoE", FakeFused)
+    monkeypatch.setattr(hy_v4.fused_moe_layers, "FusedMoE", FakeFused)
 
     config = SimpleNamespace(
         hidden_act="silu",

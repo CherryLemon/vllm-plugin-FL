@@ -11,10 +11,6 @@ from __future__ import annotations
 import logging
 from importlib.metadata import PackageNotFoundError, version as package_version
 
-from vllm_fl.configs.hy_v4_quantization import (
-    _patch_mxfp8_override_order as _patch_mxfp8_override_order,
-)
-
 logger = logging.getLogger(__name__)
 
 _ARCHITECTURE = "HYV4ForCausalLM"
@@ -80,6 +76,10 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name == "_patch_mxfp8_override_order":
+        from vllm_fl.configs.hy_v4_quantization import _patch_mxfp8_override_order
+
+        return _patch_mxfp8_override_order
     if name == "HYV4ModelArchConfigConvertor":
         from vllm_fl.configs.hy_v4_convertor import HYV4ModelArchConfigConvertor
 
