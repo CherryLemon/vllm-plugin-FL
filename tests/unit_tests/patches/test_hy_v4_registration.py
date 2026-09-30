@@ -5,6 +5,8 @@ from torch import nn
 
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
+from vllm_fl.configs import hy_v4_convertor
+from vllm_fl.configs.hy_v4 import HYV4Config
 from vllm_fl.model_loader.hy_v4_loader import (
     HYV4SafetensorsLoader,
     _contiguous_runs,
@@ -18,7 +20,7 @@ from vllm_fl.models.hy_v4 import (
     _HYV4FP32RoutedOutput,
     _try_load_mxfp8_indexer_wk,
 )
-from vllm_fl.patches import hy_v4_v024 as compat
+from vllm_fl.patches import hy_v4_registration as registration
 
 
 def test_hy4_convertor_uses_compressed_mla_dimensions():
@@ -36,7 +38,7 @@ def test_hy4_convertor_uses_compressed_mla_dimensions():
         max_position_embeddings=1048576,
         quantization_config=None,
     )
-    converted = compat.HYV4ModelArchConfigConvertor(config, config).convert()
+    converted = hy_v4_convertor.HYV4ModelArchConfigConvertor(config, config).convert()
 
     assert converted.head_size == 576
     assert converted.total_num_kv_heads == 8
@@ -58,7 +60,7 @@ def test_hy4_convertor_normalizes_mxfp8_for_override_detection(monkeypatch):
         model_type="hy_v4",
         quantization_config=quant_config,
     )
-    converted = compat.HYV4ModelArchConfigConvertor(
+    converted = hy_v4_convertor.HYV4ModelArchConfigConvertor(
         config, config
     ).get_quantization_config()
 
@@ -89,7 +91,7 @@ def test_mxfp8_alias_is_probed_after_canonical_override():
     }
     quantization = SimpleNamespace(get_quantization_config=lambda name: configs[name])
 
-    compat._patch_mxfp8_override_order(quantization)
+    hy_v4_convertor._patch_mxfp8_override_order(quantization)
     alias = quantization.get_quantization_config("mxfp8")
     canonical = quantization.get_quantization_config("modelopt_mxfp8")
 
@@ -104,7 +106,7 @@ def test_mxfp8_alias_is_probed_after_canonical_override():
 
     # Re-applying the runtime hook must not stack wrappers.
     getter = quantization.get_quantization_config
-    compat._patch_mxfp8_override_order(quantization)
+    hy_v4_convertor._patch_mxfp8_override_order(quantization)
     assert quantization.get_quantization_config is getter
 
 
@@ -132,23 +134,22 @@ def test_apply_registers_plugin_owned_hy4_components(monkeypatch):
 
         return register
 
-    monkeypatch.setattr(compat, "is_vllm_024", lambda: True)
     monkeypatch.setattr(transformers_config, "_CONFIG_REGISTRY", {})
     monkeypatch.setattr(model_arch_config_convertor, "MODEL_ARCH_CONFIG_CONVERTORS", {})
     monkeypatch.setattr(model_registry, "ModelRegistry", fake_registry)
     monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", {})
     monkeypatch.setattr(model_loader, "register_model_loader", register_loader)
 
-    assert compat.apply_hy_v4_v024_patches() is True
+    assert registration.register_hy_v4_support() is True
 
-    assert {"hy_v4": compat.HYV4Config} == transformers_config._CONFIG_REGISTRY
+    assert {"hy_v4": HYV4Config} == transformers_config._CONFIG_REGISTRY
     assert {
-        "hy_v4": compat.HYV4ModelArchConfigConvertor
+        "hy_v4": hy_v4_convertor.HYV4ModelArchConfigConvertor
     } == model_arch_config_convertor.MODEL_ARCH_CONFIG_CONVERTORS
     assert registered_models == {
         "HYV4ForCausalLM": "vllm_fl.models.hy_v4:HYV4ForCausalLM"
     }
-    assert registered_loaders == {"hy4_safetensors": compat.HYV4SafetensorsLoader}
+    assert registered_loaders == {"hy4_safetensors": HYV4SafetensorsLoader}
 
 
 def test_flagos_oot_platform_inherits_mxfp8_linear_candidates():

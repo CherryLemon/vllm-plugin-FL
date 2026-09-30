@@ -321,11 +321,11 @@ def register_model():
         install_arm_cpu_packed_w4a8()
         return
 
-    # HY4 is not present in vLLM 0.24.  Keep its config/model/loader
-    # registration in the plugin; the adapter itself refuses non-0.24 ABIs.
-    from vllm_fl.patches.hy_v4_v024 import apply_hy_v4_v024_patches
+    # Register plugin-owned HY4 components; framework pairing is declared
+    # by the package dependencies rather than a model-specific version gate.
+    from vllm_fl.patches.hy_v4_registration import register_hy_v4_support
 
-    apply_hy_v4_v024_patches()
+    register_hy_v4_support()
 
     _register_flagcx_connector()
 

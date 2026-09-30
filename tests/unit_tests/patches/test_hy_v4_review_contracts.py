@@ -5,8 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_fl.configs import hy_v4_convertor
 from vllm_fl.models import hy_v4_attention as attention, hy_v4_flashmla_sparse as sparse
-from vllm_fl.patches import hy_v4_runtime as runtime, hy_v4_v024 as compat
+from vllm_fl.patches import hy_v4_registration as registration, hy_v4_runtime as runtime
 
 
 @pytest.mark.parametrize("kind", ["selection", "capability", "configuration"])
@@ -158,7 +159,7 @@ def test_quantization_wrapper_is_lazy_and_preserves_other_models():
         return Config
 
     quant = SimpleNamespace(get_quantization_config=get)
-    compat._patch_mxfp8_override_order(quant)
+    hy_v4_convertor._patch_mxfp8_override_order(quant)
     assert not calls
     alias = quant.get_quantization_config("mxfp8")
     assert (
@@ -200,8 +201,7 @@ def test_registration_never_calls_quantization_getter(monkeypatch):
         dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER),
     )
     monkeypatch.setattr(registry.ModelRegistry, "register_model", lambda *a: None)
-    monkeypatch.setattr(compat, "is_vllm_024", lambda *_: True)
-    assert compat.apply_hy_v4_v024_patches()
+    assert registration.register_hy_v4_support()
 
 
 def test_fallback_failure_rolls_back_real_module_attributes(monkeypatch):
