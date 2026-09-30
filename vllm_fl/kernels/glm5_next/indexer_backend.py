@@ -203,7 +203,7 @@ def _load_flaggems_op(module: str, name: str) -> Callable | None:
         if module in {"top_k_per_row_prefill", "top_k_per_row_decode"}:
             _bind_tle_compat(loaded)
         function = getattr(loaded, name)
-        if module == "fp8_fp4_paged_mqa_logits" and current_platform.is_cuda():
+        if module == "fp8_fp4_paged_mqa_logits":
             required = ("_mqa_logits_kernel", "_select_block_kv", "triton")
             if all(hasattr(loaded, attr) for attr in required):
                 logger.info_once(

@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 page addressing, numerical parity and changing-input graph replay."""
 
-import importlib
-
 import pytest
 import torch
 
 from vllm_fl.kernels.glm5_next.indexer_backend import (
-    _graph_safe_flaggems_paged_mqa_logits,
+    _load_flaggems_op,
 )
 
 pytestmark = pytest.mark.gpu
@@ -39,9 +37,11 @@ def make_case(page_size, padding=0, pool_pages=128, batch=3):
 
 def candidate(case):
     q, cache, weights, lens, table, _, _, max_len = case
-    loaded = importlib.import_module("flag_gems.fused.fp8_fp4_paged_mqa_logits")
-    return _graph_safe_flaggems_paged_mqa_logits(
-        loaded,
+    implementation = _load_flaggems_op(
+        "fp8_fp4_paged_mqa_logits", "fp8_fp4_paged_mqa_logits"
+    )
+    assert implementation is not None
+    return implementation(
         (q, None),
         cache,
         weights,
