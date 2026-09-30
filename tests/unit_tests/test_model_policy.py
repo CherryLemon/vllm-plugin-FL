@@ -238,7 +238,7 @@ def worker_startup(monkeypatch):
     monkeypatch.setattr(PolicyManager, "_instance", manager)
     monkeypatch.setattr(manager, "policy_for_plan", lambda _: base_policy)
     monkeypatch.setattr(worker.fl_envs, "USE_FLAGGEMS", False)
-    monkeypatch.setattr(worker, "register_oot_ops", lambda: None)
+    monkeypatch.setattr("vllm_fl.ops.custom_ops.register_oot_ops", lambda: None)
     monkeypatch.setattr(worker, "_probe_device_capability", lambda: None)
     monkeypatch.setattr(attention_utils, "patch_mm_encoder_attention", lambda: None)
     monkeypatch.setattr(

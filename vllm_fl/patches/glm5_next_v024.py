@@ -601,12 +601,9 @@ def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
         return None
 
     provider = get_glm5_provider()
-    auto_portable = (
-        provider == "auto"
-        and current_platform.is_cuda()
-        and getattr(current_platform, "vendor_name", None) == "nvidia"
-        and not use_nvidia_reference()
-    )
+    # The model's auto provider selects portable kernels on non-NVIDIA too.
+    # The active GLM plan owns this override; generic dispatch stays unchanged.
+    auto_portable = provider == "auto" and not use_nvidia_reference()
     if provider != "flaggems" and not auto_portable:
         return None
 
@@ -795,10 +792,14 @@ def _glm5_runtime_plan(vllm_config, device_caps, user_policy):
 
 def _register_glm5_next_registrations() -> None:
     """Idempotent config/model registration (safe at plugin import time)."""
-    from vllm.model_executor.models import config as model_config
-    from vllm.model_executor.models import registry as model_registry
-    from vllm.transformers_utils import config as transformers_config
-    from vllm.transformers_utils import model_arch_config_convertor
+    from vllm.model_executor.models import (
+        config as model_config,
+        registry as model_registry,
+    )
+    from vllm.transformers_utils import (
+        config as transformers_config,
+        model_arch_config_convertor,
+    )
 
     from vllm_fl.configs.glm5_next import (
         Glm5NextConfig,

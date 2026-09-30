@@ -40,6 +40,11 @@ def apply_moe_activation(
         if clamp_limit is None:
             output.copy_(_silu_and_mul(None, input))
         else:
+            if input.device.type == "cpu":
+                # The imported GPU clamp kernel cannot accept CPU tensors.
+                return upstream_apply_moe_activation(
+                    activation, output, input, clamp_limit=clamp_limit
+                )
             dim = input.shape[-1] // 2
             try:
                 from flag_gems.fused.silu_and_mul_with_clamp import (

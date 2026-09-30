@@ -23,9 +23,13 @@ def test_clamped_activation_propagates_execution_failure(monkeypatch, error):
         raise error("clamp launch failed")
 
     monkeypatch.setattr(kernel, "silu_and_mul_with_clamp_out", fail)
+    # Meta tensors exercise launch dispatch without allocating accelerator memory.
     with pytest.raises(error, match="clamp launch failed"):
         apply_moe_activation(
-            MoEActivation.SILU, torch.empty(2, 3), torch.ones(2, 6), 7.0
+            MoEActivation.SILU,
+            torch.empty(2, 3, device="meta"),
+            torch.ones(2, 6, device="meta"),
+            clamp_limit=7.0,
         )
 
 

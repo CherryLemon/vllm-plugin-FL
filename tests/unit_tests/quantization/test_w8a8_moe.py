@@ -14,9 +14,14 @@
 import sys
 from types import SimpleNamespace
 
-import vllm.platforms as platforms
-
 from vllm_fl.quantization.w8a8 import moe as moe_adapter
+
+
+def _active_platform():
+    # Match the adapter's call-time lookup after platform-isolation tests.
+    from vllm.platforms import current_platform
+
+    return current_platform
 
 
 def _install_with_fake_modules(monkeypatch, upstream_selector, upstream_builder):
@@ -100,7 +105,7 @@ def test_w8a8_moe_selector_uses_fl_experts_on_non_nvidia_oot(monkeypatch):
         lambda **kwargs: kwargs,
     )
     monkeypatch.setattr(
-        type(platforms.current_platform),
+        type(_active_platform()),
         "is_out_of_tree",
         lambda self: True,
     )
@@ -110,7 +115,7 @@ def test_w8a8_moe_selector_uses_fl_experts_on_non_nvidia_oot(monkeypatch):
     monkeypatch.setattr(fl_utils, "is_oot_enabled", lambda: True)
     monkeypatch.setattr(fl_utils, "use_flaggems_op", lambda op_name: True)
     monkeypatch.setattr(
-        type(platforms.current_platform),
+        type(_active_platform()),
         "is_cuda",
         lambda self: False,
     )
@@ -148,7 +153,7 @@ def test_w8a8_moe_selector_uses_flaggems_on_nvidia(monkeypatch):
         lambda **kwargs: kwargs,
     )
     monkeypatch.setattr(
-        type(platforms.current_platform),
+        type(_active_platform()),
         "is_out_of_tree",
         lambda self: False,
     )
@@ -157,7 +162,7 @@ def test_w8a8_moe_selector_uses_flaggems_on_nvidia(monkeypatch):
 
     monkeypatch.setattr(fl_utils, "is_oot_enabled", lambda: True)
     monkeypatch.setattr(
-        type(platforms.current_platform),
+        type(_active_platform()),
         "is_cuda",
         lambda self: True,
     )
@@ -203,7 +208,7 @@ def test_w8a8_moe_selector_nvidia_policy_disable_uses_native_fallback(monkeypatc
     import vllm_fl.utils as fl_utils
 
     monkeypatch.setattr(
-        type(platforms.current_platform),
+        type(_active_platform()),
         "is_cuda",
         lambda self: True,
     )
@@ -250,7 +255,7 @@ def test_w8a8_moe_selector_nvidia_noncanonical_falls_back_without_flaggems(
     import vllm_fl.utils as fl_utils
 
     monkeypatch.setattr(
-        type(platforms.current_platform),
+        type(_active_platform()),
         "is_cuda",
         lambda self: True,
     )

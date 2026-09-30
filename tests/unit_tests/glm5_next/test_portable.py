@@ -197,6 +197,7 @@ def test_kpool_fp8_cache_layout_matches_returned_compression() -> None:
         cache_values[0, 1], quantized[0].view(torch.uint8), rtol=0, atol=0
     )
     torch.testing.assert_close(cache_scales[0, 1, 0], scales[0])
+    return None
 
 
 def test_pool_expansion_and_tail_append_keep_request_local_indices() -> None:

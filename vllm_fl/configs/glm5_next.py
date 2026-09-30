@@ -135,8 +135,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.moe_router_activation_func = scoring_func
 
         self.layer_types = layer_types or [
-            "deepseek_sparse_attention" if (i + 1) % 4 == 0
-            else "linear_attention"
+            "deepseek_sparse_attention" if (i + 1) % 4 == 0 else "linear_attention"
             for i in range(num_hidden_layers)
         ]
         self.mlp_layer_types = mlp_layer_types or [
@@ -146,9 +145,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.linear_attn_config = linear_attn_config
         self.linear_num_heads = linear_attn_config["num_heads"]
         self.linear_head_dim = linear_attn_config["head_dim"]
-        self.linear_conv_kernel_dim = linear_attn_config[
-            "short_conv_kernel_size"
-        ]
+        self.linear_conv_kernel_dim = linear_attn_config["short_conv_kernel_size"]
         self.linear_lower_bound = linear_attn_config.get("gate_lower_bound")
 
         self.index_topk = index_topk
@@ -170,14 +167,33 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.mhc_post_mult_value = mhc_post_mult_value
         self.swiglu_limit = swiglu_limit
         self.num_nextn_predict_layers = num_nextn_predict_layers
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            dtype=dtype,
-            **kwargs,
+        checkpoint_layer_types = self.layer_types
+        self.layer_types = self._validation_layer_types(checkpoint_layer_types)
+        try:
+            super().__init__(
+                pad_token_id=pad_token_id,
+                bos_token_id=bos_token_id,
+                eos_token_id=eos_token_id,
+                tie_word_embeddings=tie_word_embeddings,
+                dtype=dtype,
+                **kwargs,
+            )
+        finally:
+            # Keep the exact released schema after HF's construction checks.
+            self.layer_types = checkpoint_layer_types
+
+    @staticmethod
+    def _validation_layer_types(layer_types):
+        from transformers import configuration_utils
+
+        allowed = getattr(
+            configuration_utils,
+            "ALLOWED_ATTN_LAYER_TYPES",
+            getattr(configuration_utils, "ALLOWED_LAYER_TYPES", ()),
         )
+        alias = "deepseek_sparse_attention"
+        canonical = alias if not allowed or alias in allowed else "sparse"
+        return [canonical if kind == alias else kind for kind in layer_types]
 
     def validate_layer_type(self):
         """Validate the checkpoint's sparse alias without rewriting its schema."""
@@ -186,16 +202,8 @@ class Glm5NextTextConfig(PretrainedConfig):
         validate = getattr(super(), "validate_layer_type", None)
         if validate is None:
             return None
-        from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
-
-        # HF 5.x changed its accepted sparse names. Validate a temporary view
-        # only when the checkpoint alias is missing, preserving serialized names.
-        alias = "deepseek_sparse_attention"
-        canonical = alias if alias in ALLOWED_ATTN_LAYER_TYPES else "sparse"
         view = copy(self)
-        view.layer_types = [
-            canonical if kind == alias else kind for kind in self.layer_types
-        ]
+        view.layer_types = self._validation_layer_types(self.layer_types)
         return super(Glm5NextTextConfig, view).validate_layer_type()
 
     @property

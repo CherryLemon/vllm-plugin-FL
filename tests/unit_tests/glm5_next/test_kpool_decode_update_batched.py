@@ -28,11 +28,16 @@ import math
 import pytest
 import torch
 
+from vllm.platforms import current_platform
+
 from vllm_fl.kernels.glm5_next.kpool_compress import (
     kpool_compress_and_write_cache,
     kpool_decode_update_and_maybe_write_cache_batched,
 )
 
+pytestmark = pytest.mark.gpu
+
+DEVICE = current_platform.device_type
 HEAD_DIM = 128
 POOL_SIZE = 16
 PAGE_SIZE = 64
@@ -43,10 +48,10 @@ FP8_MAX = 448.0
 
 def _make_caches():
     kv = torch.zeros(
-        NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device="cuda"
+        NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device=DEVICE
     )
     tail = torch.zeros(
-        NUM_BLOCKS, 2, POOL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        NUM_BLOCKS, 2, POOL_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE
     )
     return kv, tail
 
@@ -197,8 +202,8 @@ def _torch_reference(
                 tail_cpu[block, 0, phys_slot] = cur_key
                 tail_cpu[block, 1, phys_slot] = cur_score
 
-    kv_out = kv_flat.view(NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4).to(device="cuda")
-    return kv_out, tail_cpu.to(torch.bfloat16).to(device="cuda")
+    kv_out = kv_flat.view(NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4).to(device=kv.device)
+    return kv_out, tail_cpu.to(torch.bfloat16).to(device=tail.device)
 
 
 def _assert_eq(r_ref, r_kern):
@@ -252,7 +257,7 @@ def test_decode_writer_matches_prefill_writer(pool_size):
     """
     n_pools, page, nblk = 8, 64, 4
     n_tok = n_pools * pool_size
-    dev = "cuda"
+    dev = DEVICE
     torch.manual_seed(0)
     k = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
     score = torch.randn(n_tok, HEAD_DIM, dtype=torch.bfloat16, device=dev)
@@ -319,18 +324,18 @@ def test_leading_invalid_tail_slot():
     # req 0: token 0 invalid (pos -1), tokens 1..3 valid, completion at pos 15
     # req 1: all valid, no completion
     pos = torch.tensor(
-        [[-1, 13, 14, 15], [4, 5, 6, 7]], dtype=torch.int32, device="cuda"
+        [[-1, 13, 14, 15], [4, 5, 6, 7]], dtype=torch.int32, device=DEVICE
     )
     safe_pos = torch.where(pos >= 0, pos, 0)
     tail_slot = _tail_slot_for(blocks, safe_pos)
     # leading invalid entry carries the -1 sentinel, as the scatter path emits
     tail_slot[0, 0] = -1
-    slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device="cuda")
+    slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device=DEVICE)
     slot_map[0, 3] = 15  # req 0 completes its pool on the last verify token
 
-    key = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    score = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
+    key = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
+    score = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
+    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device=DEVICE)
 
     kv, tail = _make_caches()
     _seed_prior(tail, blocks, 13)
@@ -354,43 +359,43 @@ def test_batched_matches_reference(case_id):
     if case_id == "no_completion":
         B, next_n, blocks = 3, 4, [0, 1, 2]
         pos = (
-            torch.arange(next_n, device="cuda", dtype=torch.int32)
+            torch.arange(next_n, device=DEVICE, dtype=torch.int32)
             .unsqueeze(0)
             .expand(B, -1)
             .contiguous()
         )
-        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device="cuda")
+        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device=DEVICE)
         n_prior = 0
     elif case_id == "completion_at_end":
         B, next_n, blocks = 2, 4, [0, 1]
         pos = torch.tensor(
-            [[12, 13, 14, 15], [12, 13, 14, 15]], dtype=torch.int32, device="cuda"
+            [[12, 13, 14, 15], [12, 13, 14, 15]], dtype=torch.int32, device=DEVICE
         )
-        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device="cuda")
+        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device=DEVICE)
         slot_map[:, 3] = torch.tensor(
-            [15, PAGE_SIZE + 15], dtype=torch.int32, device="cuda"
+            [15, PAGE_SIZE + 15], dtype=torch.int32, device=DEVICE
         )
         n_prior = POOL_SIZE - next_n
     elif case_id == "completion_mid_batch":
         B, next_n, blocks = 3, 4, [0, 1, 2]
-        pos = torch.tensor([[13, 14, 15, 16]] * B, dtype=torch.int32, device="cuda")
-        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device="cuda")
+        pos = torch.tensor([[13, 14, 15, 16]] * B, dtype=torch.int32, device=DEVICE)
+        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device=DEVICE)
         slot_map[:, 2] = torch.tensor(
-            [15, PAGE_SIZE + 15, 2 * PAGE_SIZE + 15], dtype=torch.int32, device="cuda"
+            [15, PAGE_SIZE + 15, 2 * PAGE_SIZE + 15], dtype=torch.int32, device=DEVICE
         )
         n_prior = 13
     elif case_id == "non_uniform_padding":
         B, next_n, blocks = 2, 4, [0, 1]
         pos = torch.tensor(
-            [[12, 13, 14, 15], [12, 13, -1, -1]], dtype=torch.int32, device="cuda"
+            [[12, 13, 14, 15], [12, 13, -1, -1]], dtype=torch.int32, device=DEVICE
         )
-        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device="cuda")
+        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device=DEVICE)
         slot_map[0, 3] = 15
         n_prior = POOL_SIZE - 4
     else:  # plain_decode
         B, next_n, blocks = 4, 1, [0, 1, 2, 3]
-        pos = torch.tensor([[5], [6], [7], [8]], dtype=torch.int32, device="cuda")
-        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device="cuda")
+        pos = torch.tensor([[5], [6], [7], [8]], dtype=torch.int32, device=DEVICE)
+        slot_map = torch.full((B, next_n), -1, dtype=torch.int32, device=DEVICE)
         n_prior = 0
 
     if case_id == "non_uniform_padding":
@@ -399,9 +404,9 @@ def test_batched_matches_reference(case_id):
     else:
         tail_slot = _tail_slot_for(blocks, pos)
 
-    key = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    score = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda")
+    key = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
+    score = torch.randn(B, next_n, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
+    ape = torch.randn(POOL_SIZE, HEAD_DIM, dtype=torch.float32, device=DEVICE)
 
     kv, tail = _make_caches()
     _seed_prior(tail, blocks, n_prior)
@@ -413,34 +418,34 @@ def test_batched_matches_reference(case_id):
 @pytest.mark.parametrize("seed", list(range(20)))
 def test_batched_matches_reference_fuzz(seed):
     """Random B / next_n / start positions; covers 0, 1, and multi completion."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    B = int(torch.randint(1, 6, (1,), generator=g, device="cuda").item())
-    next_n = int(torch.randint(1, 8, (1,), generator=g, device="cuda").item())
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    B = int(torch.randint(1, 6, (1,), generator=g, device=DEVICE).item())
+    next_n = int(torch.randint(1, 8, (1,), generator=g, device=DEVICE).item())
     blocks = list(range(B))
 
-    starts = torch.randint(0, 33, (B,), generator=g, device="cuda", dtype=torch.int32)
+    starts = torch.randint(0, 33, (B,), generator=g, device=DEVICE, dtype=torch.int32)
     pos = starts.unsqueeze(1) + torch.arange(
-        next_n, device="cuda", dtype=torch.int32
+        next_n, device=DEVICE, dtype=torch.int32
     ).unsqueeze(0)
     tail_slot = _tail_slot_for(blocks, pos)
 
     is_completion = pos % POOL_SIZE == POOL_SIZE - 1
-    blk = torch.tensor(blocks, device="cuda", dtype=torch.int32).unsqueeze(1)
+    blk = torch.tensor(blocks, device=DEVICE, dtype=torch.int32).unsqueeze(1)
     pool_slot = blk * PAGE_SIZE + (POOL_SIZE - 1)
     slot_map = torch.where(is_completion, pool_slot, torch.full_like(pos, -1))
 
     key = torch.randn(
-        B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda", generator=g
+        B, next_n, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE, generator=g
     )
     score = torch.randn(
-        B, next_n, HEAD_DIM, dtype=torch.bfloat16, device="cuda", generator=g
+        B, next_n, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE, generator=g
     )
     ape = torch.randn(
-        POOL_SIZE, HEAD_DIM, dtype=torch.float32, device="cuda", generator=g
+        POOL_SIZE, HEAD_DIM, dtype=torch.float32, device=DEVICE, generator=g
     )
 
     kv, tail = _make_caches()
-    prior_g = torch.Generator(device="cuda").manual_seed(seed + 1000)
+    prior_g = torch.Generator(device=DEVICE).manual_seed(seed + 1000)
     for b in range(B):
         n_prior = int(starts[b].item()) % POOL_SIZE
         if n_prior > 0:
@@ -448,14 +453,14 @@ def test_batched_matches_reference_fuzz(seed):
                 n_prior,
                 HEAD_DIM,
                 dtype=torch.bfloat16,
-                device="cuda",
+                device=DEVICE,
                 generator=prior_g,
             )
             ps = torch.randn(
                 n_prior,
                 HEAD_DIM,
                 dtype=torch.bfloat16,
-                device="cuda",
+                device=DEVICE,
                 generator=prior_g,
             )
             tail[blocks[b], 0, :n_prior, :] = pk

@@ -204,9 +204,7 @@ def test_translated_block_table_reuses_storage_across_batch_sizes(monkeypatch):
     outputs = []
     for rows in (1, 3, 2):
         table = torch.arange(rows * 16, dtype=torch.int32).reshape(rows, 16) + rows * 8
-        metadata = SimpleNamespace(
-            block_table_tensor=table, replace=lambda **kw: SimpleNamespace(**kw)
-        )
+        metadata = SimpleNamespace(block_table_tensor=table, replace=SimpleNamespace)
         out = build(builder, 0, metadata)
         torch.testing.assert_close(out, table[:, ::8] // 8)
         outputs.append(out)
