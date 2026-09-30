@@ -32,9 +32,7 @@ def _non_sigmoid_kernel():
 
 
 def _target(kernel):
-    return SimpleNamespace(
-        fused_recurrent_gated_delta_rule_packed_decode_kernel=kernel
-    )
+    return SimpleNamespace(fused_recurrent_gated_delta_rule_packed_decode_kernel=kernel)
 
 
 def test_kernel_detection_matches_only_legacy_sigmoid_cast():

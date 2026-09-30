@@ -23,9 +23,7 @@ def _architecture_config(architecture: str):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(model_type=""),
-            hf_config=SimpleNamespace(
-                model_type="", architectures=[architecture]
-            ),
+            hf_config=SimpleNamespace(model_type="", architectures=[architecture]),
             architectures=[architecture],
         )
     )
@@ -39,8 +37,14 @@ def test_qwen4_merges_native_index_select_with_platform_blacklist():
     )
     assert whitelist is None
     assert blacklist == [
-        "copy_", "index", "index_select", "conv1d", "_conv_depthwise2d",
-        "conv2d", "pad", "constant_pad_nd"
+        "copy_",
+        "index",
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
 
 
@@ -49,8 +53,12 @@ def test_policy_accepts_outer_multimodal_model_type(model_type):
     config = _config(model_type)
     _, blacklist = apply_native_index_select_policy(config, None, None)
     assert blacklist == [
-        "index_select", "conv1d", "_conv_depthwise2d", "conv2d", "pad",
-        "constant_pad_nd"
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
 
 
@@ -58,8 +66,12 @@ def test_policy_accepts_checkpoint_architecture_fallback():
     config = _architecture_config("Qwen4ExpForConditionalGeneration")
     _, blacklist = apply_native_index_select_policy(config, None, None)
     assert blacklist == [
-        "index_select", "conv1d", "_conv_depthwise2d", "conv2d", "pad",
-        "constant_pad_nd"
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
 
 
@@ -69,11 +81,25 @@ def test_policy_adds_measured_nvidia_decode_fast_paths():
         config, None, ["copy_"], vendor_name="nvidia"
     )
     assert blacklist == [
-        "copy_", "index_select", "conv1d", "_conv_depthwise2d", "conv2d",
-        "pad", "constant_pad_nd", "repeat_interleave_tensor",
-        "repeat_interleave_self_tensor", "linear", "mm", "mm_out", "addmm",
-        "addmm_out", "addmm_", "addmm_dtype", "addmm_dtype_out",
-        "sort", "sort_stable"
+        "copy_",
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
+        "repeat_interleave_tensor",
+        "repeat_interleave_self_tensor",
+        "linear",
+        "mm",
+        "mm_out",
+        "addmm",
+        "addmm_out",
+        "addmm_",
+        "addmm_dtype",
+        "addmm_dtype_out",
+        "sort",
+        "sort_stable",
     ]
 
 
@@ -118,12 +144,14 @@ def test_policy_is_idempotent_and_preserves_explicit_whitelist():
     config = _config("qwen3_8_flash_next_text")
     _, blacklist = apply_native_index_select_policy(config, None, ["index_select"])
     assert blacklist == [
-        "index_select", "conv1d", "_conv_depthwise2d", "conv2d", "pad",
-        "constant_pad_nd"
+        "index_select",
+        "conv1d",
+        "_conv_depthwise2d",
+        "conv2d",
+        "pad",
+        "constant_pad_nd",
     ]
-    whitelist, blacklist = apply_native_index_select_policy(
-        config, ["add"], ["copy_"]
-    )
+    whitelist, blacklist = apply_native_index_select_policy(config, ["add"], ["copy_"])
     assert whitelist == ["add"]
     assert blacklist == ["copy_"]
 
@@ -134,9 +162,7 @@ def test_policy_rejects_unsafe_explicit_whitelist():
         apply_native_index_select_policy(config, ["add", "index_select"], ["copy_"])
 
     with pytest.raises(ValueError, match="constant_pad_nd"):
-        apply_native_index_select_policy(
-            config, ["add", "constant_pad_nd"], ["copy_"]
-        )
+        apply_native_index_select_policy(config, ["add", "constant_pad_nd"], ["copy_"])
 
     with pytest.raises(ValueError, match="pad"):
         apply_native_index_select_policy(config, ["add", "pad"], ["copy_"])
@@ -169,9 +195,7 @@ def test_policy_does_not_change_other_models():
 def test_nvidia_qsa_selection_rejects_conflicting_dispatch(operator):
     config = _config("qwen4_exp_text")
     with pytest.raises(ValueError, match=operator):
-        apply_native_index_select_policy(
-            config, [operator], None, vendor_name="nvidia"
-        )
+        apply_native_index_select_policy(config, [operator], None, vendor_name="nvidia")
 
     # The measured NVIDIA policy must not override other vendors or models.
     whitelist, blacklist = apply_native_index_select_policy(

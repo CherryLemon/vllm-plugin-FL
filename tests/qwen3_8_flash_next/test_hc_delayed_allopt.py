@@ -88,11 +88,14 @@ def _inputs(
     packed = torch.randn(rows, 320 + hc_count, device="cuda", dtype=dtype)
     injection = packed[:, 320:]
     assert injection.stride() == (324, 1)
-    weight = torch.randn(
-        hidden_size if shared_weight else hc_count * hidden_size,
-        device="cuda",
-        dtype=dtype,
-    ) * 0.01
+    weight = (
+        torch.randn(
+            hidden_size if shared_weight else hc_count * hidden_size,
+            device="cuda",
+            dtype=dtype,
+        )
+        * 0.01
+    )
     return residual, block, injection, weight
 
 
@@ -163,9 +166,7 @@ def test_combine_norm_cuda_graph_replay_is_deterministic() -> None:
     first_ref = _reference_combine_norm(*first_inputs, eps, 4)
     _record_error("graph_warmup_combined", eager[0], first_ref[0])
     _record_error("graph_warmup_normed", eager[1], first_ref[1])
-    torch.testing.assert_close(
-        eager[0], first_ref[0], atol=2.0e-2, rtol=2.0e-2
-    )
+    torch.testing.assert_close(eager[0], first_ref[0], atol=2.0e-2, rtol=2.0e-2)
 
     for iteration in range(10):
         residual.copy_(torch.randn_like(residual))
@@ -212,7 +213,9 @@ def test_delayed_module_matches_eager_and_final_mixer() -> None:
     final = GatedResidualSimple(config, use_combine=False, role="final").cuda()
     module.pack_down_inject_weights()
     torch.manual_seed(733)
-    hidden = torch.randn(7, module.hyper_hidden_size, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        7, module.hyper_hidden_size, device="cuda", dtype=torch.bfloat16
+    )
     block = torch.randn(7, module.hidden_size, device="cuda", dtype=torch.bfloat16)
 
     _, eager_residuals = module.mix(hidden)
@@ -239,7 +242,9 @@ def test_delayed_module_matches_eager_and_final_mixer() -> None:
     )
     final_ref = module._normalize(eager_combined)
     torch.testing.assert_close(final_state, eager_combined, atol=5e-2, rtol=3e-2)
-    torch.testing.assert_close(final_input, final._mix_from_normed(final_ref)[0], atol=7e-2, rtol=4e-2)
+    torch.testing.assert_close(
+        final_input, final._mix_from_normed(final_ref)[0], atol=7e-2, rtol=4e-2
+    )
     assert final_injection is None
 
 
@@ -256,7 +261,9 @@ def test_production_c64_h2560_delayed_combine_and_mix_cuda_graph() -> None:
     assert module.pack_down_inject_weights()
     rows = 64
     torch.manual_seed(787)
-    hidden = torch.randn(rows, module.hyper_hidden_size, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(
+        rows, module.hyper_hidden_size, device="cuda", dtype=torch.bfloat16
+    )
     block = torch.randn(rows, module.hidden_size, device="cuda", dtype=torch.bfloat16)
     state, _, injection = module.mix_delayed(hidden)
     assert state.data_ptr() == hidden.data_ptr()

@@ -35,8 +35,12 @@ def request_json(url: str, payload: dict[str, Any] | None = None) -> tuple[int, 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "19821")))
-    parser.add_argument("--model", default=os.environ.get("SERVED_MODEL_NAME", "Qwen3.8-Flash-Next"))
+    parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("PORT", "19821"))
+    )
+    parser.add_argument(
+        "--model", default=os.environ.get("SERVED_MODEL_NAME", "Qwen3.8-Flash-Next")
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -57,7 +61,9 @@ def main() -> int:
     else:
         try:
             models = json.loads(models_body)
-            ids = [row.get("id") for row in models.get("data", []) if isinstance(row, dict)]
+            ids = [
+                row.get("id") for row in models.get("data", []) if isinstance(row, dict)
+            ]
             result["served_model_ids"] = ids
             if args.model not in ids:
                 errors.append(f"served model name absent from /v1/models: {args.model}")
@@ -90,7 +96,9 @@ def main() -> int:
                 errors.append("completion has no first choice")
             else:
                 text = choices[0].get("text")
-                result["choice_text_bytes"] = len(text.encode("utf-8")) if isinstance(text, str) else 0
+                result["choice_text_bytes"] = (
+                    len(text.encode("utf-8")) if isinstance(text, str) else 0
+                )
                 if not isinstance(text, str) or not text:
                     errors.append("completion first choice is empty")
             usage = completion.get("usage")

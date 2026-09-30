@@ -147,9 +147,7 @@ def test_serving_entry_registers_multimodal_architecture():
     ):
         module, class_name = model_registry._MULTIMODAL_MODELS[architecture]
         assert module == "vllm_fl.models.qwen3_8_flash_next"
-        resolved = getattr(
-            __import__(module, fromlist=[class_name]), class_name
-        )
+        resolved = getattr(__import__(module, fromlist=[class_name]), class_name)
         assert resolved is Qwen3_8FlashNextForConditionalGeneration
         assert architecture not in model_registry._TEXT_GENERATION_MODELS
     for architecture in ("Qwen4ExpForCausalLM", "Qwen3_8FlashNextForCausalLM"):
@@ -260,17 +258,15 @@ def test_embed_input_ids_merges_image_embeddings_at_token_positions():
             input_ids, table
         )
     )
-    model._embed_text_input_ids = (
-        lambda input_ids, embed_fn, *, is_multimodal=None: embed_fn(input_ids)
+    model._embed_text_input_ids = lambda input_ids, embed_fn, *, is_multimodal=None: (
+        embed_fn(input_ids)
     )
 
     input_ids = torch.tensor([1, _IMAGE_TOKEN_ID, _IMAGE_TOKEN_ID, 3])
     multimodal = torch.randn(2, 8)
     is_multimodal = torch.tensor([False, True, True, False])
 
-    merged = model.embed_input_ids(
-        input_ids, [multimodal], is_multimodal=is_multimodal
-    )
+    merged = model.embed_input_ids(input_ids, [multimodal], is_multimodal=is_multimodal)
 
     torch.testing.assert_close(merged[1:3], multimodal)
     torch.testing.assert_close(merged[[0, 3]], table[[1, 3]])

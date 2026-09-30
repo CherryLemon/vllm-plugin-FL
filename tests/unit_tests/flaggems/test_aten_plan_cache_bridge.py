@@ -117,7 +117,10 @@ def test_required_cache_rejects_no_warmup_reuse(monkeypatch):
     _fake_flaggems(
         monkeypatch,
         aten_plan_cache_stats=lambda: {
-            "enabled": True, "installed": True, "hits": 0, "misses": 1,
+            "enabled": True,
+            "installed": True,
+            "hits": 0,
+            "misses": 1,
         },
     )
     with pytest.raises(RuntimeError, match="no demonstrated cache reuse"):
@@ -130,7 +133,10 @@ def test_required_cache_accepts_real_warmup_reuse(monkeypatch):
     _fake_flaggems(
         monkeypatch,
         aten_plan_cache_stats=lambda: {
-            "enabled": True, "installed": True, "hits": 3, "misses": 1,
+            "enabled": True,
+            "installed": True,
+            "hits": 3,
+            "misses": 1,
         },
     )
     bridge.log_flaggems_aten_plan_cache_stats("post-warmup")

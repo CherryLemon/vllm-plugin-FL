@@ -17,7 +17,9 @@ def _load_qsa_ops():
     try:
         return importlib.import_module("vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa")
     except Exception as exc:
-        raise AssertionError(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}") from exc
+        raise AssertionError(
+            f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _reference(
@@ -185,7 +187,9 @@ def test_builder_fallback_does_not_require_common_token_to_request_api(
     assert torch.count_nonzero(builder.token_to_req_buffer) == 0
     query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
     common = SimpleNamespace(
-        block_table_tensor=torch.tensor([[2, 0, 4, 6], [1, 3, 5, 7]], dtype=torch.int32),
+        block_table_tensor=torch.tensor(
+            [[2, 0, 4, 6], [1, 3, 5, 7]], dtype=torch.int32
+        ),
         slot_mapping=torch.tensor([0, 1, 2, 3, -1, -1], dtype=torch.int64),
         seq_lens=torch.tensor([2, 5], dtype=torch.int32),
         query_start_loc=query_start_loc,
@@ -331,9 +335,9 @@ def test_kernel_graph_replay_updates_contents_at_fixed_addresses():
     token_to_req = torch.full((rows,), -99, dtype=torch.int32, device=device)
     query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
     seq_lens = torch.arange(1, num_reqs + 1, dtype=torch.int32, device=device)
-    block_table = torch.arange(
-        num_reqs * 8, dtype=torch.int32, device=device
-    ).reshape(num_reqs, 8)
+    block_table = torch.arange(num_reqs * 8, dtype=torch.int32, device=device).reshape(
+        num_reqs, 8
+    )
     common_slots = torch.arange(rows, dtype=torch.int64, device=device)
     logical = torch.empty(rows, dtype=torch.int64, device=device)
     slots = torch.empty_like(logical)
@@ -367,9 +371,7 @@ def test_kernel_graph_replay_updates_contents_at_fixed_addresses():
     first_logical = logical.cpu().clone()
     first_slots = slots.cpu().clone()
 
-    second_query_start_loc = (
-        torch.arange(num_reqs + 1, dtype=torch.int32) // 2 * 2
-    )
+    second_query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32) // 2 * 2
     second_seq_lens = torch.arange(5, num_reqs + 5, dtype=torch.int32)
     second_table = torch.flip(block_table.cpu(), dims=(1,))
     second_common_slots = common_slots.cpu().clone()

@@ -36,9 +36,13 @@ def test_qsa_backends_use_layered_identity_layout(
 
 
 def test_qsa_backend_owns_vendor_neutral_legacy_layout():
-    assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_shape(
-        3, 16, 2, 8
-    ) == (3, 2, 16, 2, 8)
+    assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_shape(3, 16, 2, 8) == (
+        3,
+        2,
+        16,
+        2,
+        8,
+    )
     assert Qwen3_8FlashNextQSAAttentionBackend.get_kv_cache_stride_order() == (
         0,
         1,
@@ -71,19 +75,15 @@ def test_unpack_legacy_vllm_024_cache_layout():
     # decode.
     flat_key = key.reshape(3, 16, 1, 16)
     flat_value = value.reshape(3, 16, 1, 16)
-    assert (
-        flat_key.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
-    )
-    assert (
-        flat_value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
-    )
+    assert flat_key.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    assert flat_value.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
     assert flat_key.storage_offset() == key.storage_offset()
     assert flat_value.storage_offset() == value.storage_offset()
 
     key_update = torch.arange(flat_key.numel(), dtype=cache.dtype).reshape_as(flat_key)
-    value_update = -torch.arange(
-        flat_value.numel(), dtype=cache.dtype
-    ).reshape_as(flat_value)
+    value_update = -torch.arange(flat_value.numel(), dtype=cache.dtype).reshape_as(
+        flat_value
+    )
     flat_key.copy_(key_update)
     flat_value.copy_(value_update)
     torch.testing.assert_close(cache[:, 0], key_update.reshape_as(cache[:, 0]))
@@ -173,7 +173,9 @@ def test_side_cache_binds_padded_block_stride_view():
 
     # Writes must land only in the logical page of each padded block.
     key_cache[1].fill_(1.0)
-    torch.testing.assert_close(raw[1, :logical_page], torch.ones(logical_page, dtype=torch.bfloat16))
+    torch.testing.assert_close(
+        raw[1, :logical_page], torch.ones(logical_page, dtype=torch.bfloat16)
+    )
     assert raw[1, logical_page:].count_nonzero().item() == 0
     assert raw[0].count_nonzero().item() == 0
     assert raw[2].count_nonzero().item() == 0
@@ -191,9 +193,7 @@ def test_padded_slot_mapping_decomposes_to_physical_block_and_offset():
     positions = torch.tensor([0, 15, 16, 31, 32], dtype=torch.int64)
     requests = torch.zeros(5, dtype=torch.int64)
 
-    slots = _logical_to_physical_qsa_slots(
-        block_table, requests, positions, block_size
-    )
+    slots = _logical_to_physical_qsa_slots(block_table, requests, positions, block_size)
     expected_blocks = torch.tensor([2, 2, 0, 0, 5])
     expected_offsets = torch.tensor([0, 15, 0, 15, 0])
     torch.testing.assert_close(slots // block_size, expected_blocks)

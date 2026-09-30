@@ -108,9 +108,7 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, ven
 @pytest.mark.parametrize("backend", ["auto", "triton"])
 def test_fl_provider_uses_flaggems_experts_for_auto_and_triton(monkeypatch, backend):
     fused_moe_utils = _import_fused_moe_utils()
-    monkeypatch.setattr(
-        fused_moe_utils, "_get_current_platform", lambda: _oot_platform()
-    )
+    monkeypatch.setattr(fused_moe_utils, "_get_current_platform", _oot_platform)
     monkeypatch.setattr(fused_moe_utils, "use_flaggems", lambda: True)
 
     selected_backend, experts_cls = fused_moe_utils.select_unquantized_moe_backend_oot(
@@ -124,9 +122,7 @@ def test_fl_provider_uses_flaggems_experts_for_auto_and_triton(monkeypatch, back
 
 def test_explicit_non_triton_backend_remains_authoritative(monkeypatch):
     fused_moe_utils = _import_fused_moe_utils()
-    monkeypatch.setattr(
-        fused_moe_utils, "_get_current_platform", lambda: _oot_platform()
-    )
+    monkeypatch.setattr(fused_moe_utils, "_get_current_platform", _oot_platform)
     monkeypatch.setattr(fused_moe_utils, "use_flaggems", lambda: True)
     monkeypatch.setattr(
         fused_moe_utils,
@@ -150,9 +146,7 @@ def test_explicit_non_triton_backend_remains_authoritative(monkeypatch):
 
 def test_native_oracle_does_not_reenable_flaggems_experts(monkeypatch):
     fused_moe_utils = _import_fused_moe_utils()
-    monkeypatch.setattr(
-        fused_moe_utils, "_get_current_platform", lambda: _oot_platform()
-    )
+    monkeypatch.setattr(fused_moe_utils, "_get_current_platform", _oot_platform)
     monkeypatch.setattr(fused_moe_utils, "use_flaggems", lambda: True)
     monkeypatch.setattr(
         fused_moe_utils,

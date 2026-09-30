@@ -60,7 +60,9 @@ def _make_case(
     a = torch.randn((batch, HV), device=DEVICE, dtype=dtype, generator=generator)
     b = torch.randn((batch, HV), device=DEVICE, dtype=dtype, generator=generator)
     A_log = torch.randn((HV,), device=DEVICE, dtype=torch.float32, generator=generator)
-    dt_bias = torch.randn((HV,), device=DEVICE, dtype=torch.float32, generator=generator)
+    dt_bias = torch.randn(
+        (HV,), device=DEVICE, dtype=torch.float32, generator=generator
+    )
     state = torch.randn(
         (batch + 2, HV, value_size, key_size),
         device=DEVICE,
@@ -68,9 +70,7 @@ def _make_case(
         generator=generator,
     )
     indices = torch.arange(1, batch + 1, device=DEVICE, dtype=torch.int32)
-    out = torch.empty(
-        (batch, 1, HV, value_size), device=DEVICE, dtype=dtype
-    )
+    out = torch.empty((batch, 1, HV, value_size), device=DEVICE, dtype=dtype)
     return mixed_qkv, a, b, A_log, dt_bias, state, indices, out
 
 
@@ -116,9 +116,7 @@ def _reference(
                 k = k / torch.sqrt(torch.sum(k * k) + 1e-6)
             q = q * scale
             x = a[n, hv].float() + dt_bias[hv].float()
-            softplus_x = torch.where(
-                x <= 20.0, torch.log(1.0 + torch.exp(x)), x
-            )
+            softplus_x = torch.where(x <= 20.0, torch.log(1.0 + torch.exp(x)), x)
             decay = torch.exp(-torch.exp(A_log[hv].float()) * softplus_x)
             beta = torch.sigmoid(b[n, hv].float())
             h = h * decay
@@ -160,13 +158,8 @@ def _assert_close(actual_out, actual_state, expected_out, expected_state):
     )
     assert torch.allclose(
         actual_out.float(), expected_out.float(), atol=1e-3, rtol=1e-3
-    ), (
-        "packed-GDN output mismatch: "
-        f"out_max_abs={out_max:.8g}, out_rmse={out_rmse:.8g}"
-    )
-    assert torch.allclose(
-        actual_state, expected_state, atol=1e-5, rtol=1e-5
-    ), (
+    ), f"packed-GDN output mismatch: out_max_abs={out_max:.8g}, out_rmse={out_rmse:.8g}"
+    assert torch.allclose(actual_state, expected_state, atol=1e-5, rtol=1e-5), (
         "packed-GDN FP32 state mismatch: "
         f"state_max_abs={state_max:.8g}, state_rmse={state_rmse:.8g}"
     )
@@ -279,9 +272,7 @@ def test_long_decode_preserves_fp32_state_update():
             f"long decode output mismatch at step {step}: "
             f"out_max_abs={out_max:.8g}, out_rmse={out_rmse:.8g}"
         )
-        assert torch.allclose(
-            actual_state, expected_state, atol=1e-5, rtol=1e-5
-        ), (
+        assert torch.allclose(actual_state, expected_state, atol=1e-5, rtol=1e-5), (
             f"long decode FP32 state mismatch at step {step}: "
             f"state_max_abs={state_max:.8g}, state_rmse={state_rmse:.8g}"
         )
@@ -297,9 +288,7 @@ def test_long_decode_preserves_fp32_state_update():
 def test_cuda_graph_replay_accepts_changed_inputs_and_indices():
     wrapper = _install_candidate()
     case = list(
-        _make_case(
-            8, key_size=128, value_size=128, dtype=torch.bfloat16, seed=12001
-        )
+        _make_case(8, key_size=128, value_size=128, dtype=torch.bfloat16, seed=12001)
     )
     # Warm up and restore the captured state before graph construction.
     initial_state = case[5].clone()
@@ -311,9 +300,7 @@ def test_cuda_graph_replay_accepts_changed_inputs_and_indices():
         _run(wrapper, tuple(case))
 
     replay_case = list(
-        _make_case(
-            8, key_size=128, value_size=128, dtype=torch.bfloat16, seed=12002
-        )
+        _make_case(8, key_size=128, value_size=128, dtype=torch.bfloat16, seed=12002)
     )
     replay_initial_state = replay_case[5].clone()
     expected_out, expected_state = _reference(
@@ -336,11 +323,11 @@ def test_cuda_graph_replay_accepts_changed_inputs_and_indices():
     torch.cuda.synchronize()
     _assert_close(case[7], case[5], expected_out, expected_state)
 
-    invalid_indices = torch.tensor([0, -1, 3, 4, 5, 6, 7, 8], device=DEVICE, dtype=torch.int32)
+    invalid_indices = torch.tensor(
+        [0, -1, 3, 4, 5, 6, 7, 8], device=DEVICE, dtype=torch.int32
+    )
     invalid_case = list(
-        _make_case(
-            8, key_size=128, value_size=128, dtype=torch.bfloat16, seed=12003
-        )
+        _make_case(8, key_size=128, value_size=128, dtype=torch.bfloat16, seed=12003)
     )
     invalid_case[6] = invalid_indices
     invalid_initial_state = invalid_case[5].clone()

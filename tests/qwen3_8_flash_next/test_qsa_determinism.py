@@ -69,8 +69,14 @@ def test_qsa_selection_graph_replay_budget_boundary(rows):
     def forward():
         select()
         ops.qsa_sparse_paged_attention(
-            attn_q, attn_k, attn_v, out, table, req,
-            out=attn_out, split_workspace=workspace,
+            attn_q,
+            attn_k,
+            attn_v,
+            out,
+            table,
+            req,
+            out=attn_out,
+            split_workspace=workspace,
         )
 
     forward()
@@ -85,7 +91,9 @@ def test_qsa_selection_graph_replay_budget_boundary(rows):
                 q.zero_()
             else:
                 q.normal_()
-            scores, visible = ops.qsa_mqa_paged(q, key, table, req, positions, lengths, 4)
+            scores, visible = ops.qsa_mqa_paged(
+                q, key, table, req, positions, lengths, 4
+            )
             expected_blocks = reference(scores.cpu(), visible.cpu(), 512).to(device)
             expected = ops.expand_qsa_block_indices(
                 expected_blocks, positions, lengths, req, 4, 2048

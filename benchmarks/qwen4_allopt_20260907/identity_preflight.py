@@ -33,7 +33,12 @@ def tree_identity(root: Path) -> dict[str, Any]:
     total_bytes = 0
     file_count = 0
     if not root.is_dir():
-        return {"exists": False, "file_count": 0, "total_bytes": 0, "relative_size_manifest_sha256": None}
+        return {
+            "exists": False,
+            "file_count": 0,
+            "total_bytes": 0,
+            "relative_size_manifest_sha256": None,
+        }
     for path in sorted(root.rglob("*")):
         if not path.is_file() or "__pycache__" in path.parts or ".git" in path.parts:
             continue
@@ -48,7 +53,9 @@ def tree_identity(root: Path) -> dict[str, Any]:
         "exists": True,
         "file_count": file_count,
         "total_bytes": total_bytes,
-        "relative_size_manifest_sha256": hashlib.sha256("".join(entries).encode()).hexdigest(),
+        "relative_size_manifest_sha256": hashlib.sha256(
+            "".join(entries).encode()
+        ).hexdigest(),
     }
 
 
@@ -112,7 +119,9 @@ def main() -> int:
     if file_hashes["flaggems_plan_cache"] != args.expected_plan_cache_sha256:
         errors.append("FlagGems aten_plan_cache.py hash mismatch")
     if file_hashes["flaggems_fused_moe"] != args.expected_fused_moe_sha256:
-        errors.append("FlagGems fused_moe.py hash mismatch; see the review2 dependency fix")
+        errors.append(
+            "FlagGems fused_moe.py hash mismatch; see the review2 dependency fix"
+        )
 
     bridge_text = ""
     # Optional dependency source may be absent in an installed wheel.
@@ -121,7 +130,7 @@ def main() -> int:
     for marker in (
         "VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE",
         "post-warmup",
-        "stats.get(\"hits\"",
+        'stats.get("hits"',
     ):
         if marker not in bridge_text:
             errors.append(f"plan-cache bridge marker absent: {marker}")
@@ -204,14 +213,18 @@ def main() -> int:
             ),
         }
         if flaggems_root not in flaggems_path.parents:
-            errors.append(f"flag_gems resolved outside mounted FlagGems: {flaggems_path}")
+            errors.append(
+                f"flag_gems resolved outside mounted FlagGems: {flaggems_path}"
+            )
         if not imported["flag_gems"]["enable_aten_plan_cache"]:
             errors.append("modern FlagGems enable_aten_plan_cache API missing")
         if not imported["flag_gems"]["aten_plan_cache_stats"]:
             errors.append("modern FlagGems aten_plan_cache_stats API missing")
         stats_fn = getattr(flag_gems, "aten_plan_cache_stats", None)
         try:
-            imported["flag_gems"]["stats_before_bridge"] = stats_fn() if stats_fn else None
+            imported["flag_gems"]["stats_before_bridge"] = (
+                stats_fn() if stats_fn else None
+            )
         except Exception as exc:  # stats can be unavailable before bridge apply
             imported["flag_gems"]["stats_before_bridge"] = {
                 "unavailable": type(exc).__name__
@@ -262,7 +275,9 @@ def main() -> int:
     }
     for key, value in expected_env.items():
         if os.environ.get(key) != value:
-            errors.append(f"unexpected {key}={os.environ.get(key)!r}; expected {value!r}")
+            errors.append(
+                f"unexpected {key}={os.environ.get(key)!r}; expected {value!r}"
+            )
     path_value = os.environ.get("PYTHONPATH", "")
     if "/opt/vllm-plugin-FL" not in path_value or "/opt/FlagGems/src" not in path_value:
         errors.append("mounted plugin/FlagGems paths absent from PYTHONPATH")

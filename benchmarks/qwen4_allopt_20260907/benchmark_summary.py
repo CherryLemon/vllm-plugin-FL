@@ -25,7 +25,9 @@ METRICS = (
 )
 
 
-def one_round(path: Path, label: str, prompts: int, input_len: int, output_len: int) -> dict[str, Any]:
+def one_round(
+    path: Path, label: str, prompts: int, input_len: int, output_len: int
+) -> dict[str, Any]:
     record: dict[str, Any] = {"label": label, "path": str(path), "errors": []}
     errors: list[str] = record["errors"]
     status_path = path.with_name(f"{path.stem}.status.json")
@@ -34,7 +36,9 @@ def one_round(path: Path, label: str, prompts: int, input_len: int, output_len: 
             status_data = json.loads(status_path.read_text(encoding="utf-8"))
             record["command_status"] = status_data
             if status_data.get("returncode") != 0:
-                errors.append(f"benchmark command returned {status_data.get('returncode')}")
+                errors.append(
+                    f"benchmark command returned {status_data.get('returncode')}"
+                )
         except (OSError, ValueError):
             errors.append("benchmark command status is invalid")
     else:
@@ -74,7 +78,11 @@ def one_round(path: Path, label: str, prompts: int, input_len: int, output_len: 
 
     for key, expected_len in (("input_lens", input_len), ("output_lens", output_len)):
         values = data.get(key)
-        if not isinstance(values, list) or len(values) != prompts or set(values) != {expected_len}:
+        if (
+            not isinstance(values, list)
+            or len(values) != prompts
+            or set(values) != {expected_len}
+        ):
             errors.append(f"{key} is not exactly {prompts} entries of {expected_len}")
 
     record["metrics"] = {key: data.get(key) for key in METRICS}
@@ -101,7 +109,9 @@ def aggregate(rounds: list[dict[str, Any]]) -> dict[str, Any]:
                     "min": low,
                     "max": high,
                     "range": high - low,
-                    "relative_range_pct": ((high - low) / center * 100.0) if center else None,
+                    "relative_range_pct": ((high - low) / center * 100.0)
+                    if center
+                    else None,
                 }
             else:
                 out[group_name]["range_drift"][metric] = None
@@ -120,11 +130,27 @@ def main() -> int:
     args = parser.parse_args()
 
     rounds: list[dict[str, Any]] = []
-    warmup = one_round(args.benchmark_dir / "warmup.json", "warmup", args.warmup_prompts, args.input_len, args.output_len)
+    warmup = one_round(
+        args.benchmark_dir / "warmup.json",
+        "warmup",
+        args.warmup_prompts,
+        args.input_len,
+        args.output_len,
+    )
     for index in range(1, args.formal_rounds + 1):
-        rounds.append(one_round(args.benchmark_dir / f"formal{index}.json", f"formal{index}", args.formal_prompts, args.input_len, args.output_len))
+        rounds.append(
+            one_round(
+                args.benchmark_dir / f"formal{index}.json",
+                f"formal{index}",
+                args.formal_prompts,
+                args.input_len,
+                args.output_len,
+            )
+        )
     result: dict[str, Any] = {
-        "status": "pass" if warmup["status"] == "pass" and all(r["status"] == "pass" for r in rounds) else "fail",
+        "status": "pass"
+        if warmup["status"] == "pass" and all(r["status"] == "pass" for r in rounds)
+        else "fail",
         "workload": {
             "input_len": args.input_len,
             "output_len": args.output_len,

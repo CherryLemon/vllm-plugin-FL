@@ -170,9 +170,7 @@ def test_production_hc_module_fast_path_matches_formula_and_replays_graph(
     combined_ref = module.combine(block_output, residuals_ref)
     assert module.pack_down_inject_weights()
     monkeypatch.setattr(hc, "can_use_hc_triton", can_use_hc_triton)
-    monkeypatch.setattr(
-        hc, "can_use_hc_inject_triton", can_use_hc_inject_triton
-    )
+    monkeypatch.setattr(hc, "can_use_hc_inject_triton", can_use_hc_inject_triton)
 
     mixed, residuals = module.mix(hidden)
     injection_logits = residuals[2]

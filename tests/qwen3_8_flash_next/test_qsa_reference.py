@@ -48,7 +48,11 @@ def test_qsa_store_rows_and_compress_groups_reference():
     torch.testing.assert_close(stored[2, 3, 0], rows[1])
     assert bool((stored[0] == -1).all())
 
-    raw = torch.arange(4 * 4 * 3, dtype=torch.float32).reshape(4, 4, 1, 3).to(torch.bfloat16)
+    raw = (
+        torch.arange(4 * 4 * 3, dtype=torch.float32)
+        .reshape(4, 4, 1, 3)
+        .to(torch.bfloat16)
+    )
     token_to_req = torch.tensor([0, 1], dtype=torch.int32)
     logical_positions = torch.tensor([3, 7], dtype=torch.int64)
     compressed_slots = torch.tensor([0, 1], dtype=torch.int64)
@@ -121,11 +125,11 @@ def _load_qsa_ops():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable; Triton comparison is optional")
     try:
-        return importlib.import_module(
-            "vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa"
-        )
+        return importlib.import_module("vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa")
     except Exception as exc:  # target-GPU jobs must not hide import failures
-        raise AssertionError(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}") from exc
+        raise AssertionError(
+            f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 @pytest.mark.gpu
@@ -141,9 +145,7 @@ def test_qsa_cuda_store_and_compress_match_reference():
     ops.qsa_store_cache_rows(cache, slots, rows)
     torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)
 
-    kv_backing = torch.full(
-        (4, 2, 4, 2, 8), -1.0, dtype=torch.bfloat16, device=device
-    )
+    kv_backing = torch.full((4, 2, 4, 2, 8), -1.0, dtype=torch.bfloat16, device=device)
     k_cache, v_cache = kv_backing.unbind(1)
     key = torch.randn(4, 2, 8, dtype=torch.bfloat16, device=device)
     value = torch.randn_like(key)
@@ -175,7 +177,9 @@ def test_qsa_cuda_store_and_compress_match_reference():
     actual_pool, actual_pos = ops.qsa_compress_groups_with_ratio(
         raw, table, req, logical, compressed_slots, 4
     )
-    torch.testing.assert_close(actual_pool.cpu().float(), expected_pool.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        actual_pool.cpu().float(), expected_pool.float(), rtol=2e-2, atol=2e-2
+    )
     torch.testing.assert_close(actual_pos.cpu(), expected_pos)
 
 
@@ -186,15 +190,11 @@ def test_qsa_fused_compress_norm_mrope_store_matches_reference_and_graph():
     torch.manual_seed(25)
     rows, page_size, head_dim, rotary_dim = 2, 4, 128, 64
     table = _qsa_geometry(device)
-    raw = torch.randn(
-        4, page_size, 1, head_dim, dtype=torch.bfloat16, device=device
-    )
+    raw = torch.randn(4, page_size, 1, head_dim, dtype=torch.bfloat16, device=device)
     req = torch.tensor([0, 1], dtype=torch.int32, device=device)
     logical = torch.tensor([3, 7], dtype=torch.int64, device=device)
     compressed_slots = torch.tensor([0, 5], dtype=torch.int64, device=device)
-    rope_cache = torch.zeros(
-        4, page_size, 1, 3, dtype=torch.int64, device=device
-    )
+    rope_cache = torch.zeros(4, page_size, 1, 3, dtype=torch.int64, device=device)
     table_cpu = table.cpu()
     for request in range(rows):
         for position in range(8):
@@ -207,8 +207,7 @@ def test_qsa_fused_compress_norm_mrope_store_matches_reference_and_graph():
     # Real Qwen4 checkpoint config: mrope_section=[11, 11, 10].
     mrope_section = (11, 11, 10)
     frequencies = 1.0 / (
-        1_000_000
-        ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+        1_000_000 ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
     )
     angles = positions[:, None] * frequencies[None, :]
     cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).to(
@@ -312,9 +311,7 @@ def test_qsa_fused_compress_norm_mrope_store_matches_reference_and_graph():
         ),
         dim=-1,
     )
-    actual_text = torch.stack(
-        (compressed[0, 0, 0], compressed[1, 1, 0])
-    ).cpu()
+    actual_text = torch.stack((compressed[0, 0, 0], compressed[1, 1, 0])).cpu()
     torch.testing.assert_close(
         actual_text.float(), expected_text.float(), rtol=2e-2, atol=2e-2
     )
@@ -337,7 +334,9 @@ def test_qsa_cuda_indexer_and_sparse_match_reference():
     actual_logits, actual_visible = ops.qsa_mqa_paged(
         q, key, table, req, positions, lengths, 4
     )
-    torch.testing.assert_close(actual_logits.cpu(), expected_logits, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        actual_logits.cpu(), expected_logits, rtol=2e-2, atol=2e-2
+    )
     torch.testing.assert_close(actual_visible.cpu(), expected_visible)
 
     block_indices = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32, device=device)
@@ -361,7 +360,9 @@ def test_qsa_cuda_indexer_and_sparse_match_reference():
     actual_out = ops.qsa_sparse_paged_attention(
         q_gqa, k, v, logical_indices, table, req
     )
-    torch.testing.assert_close(actual_out.cpu().float(), expected_out.float(), rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(
+        actual_out.cpu().float(), expected_out.float(), rtol=5e-2, atol=5e-2
+    )
 
     gate = torch.randn_like(q_gqa)
     gated_out = torch.empty_like(q_gqa)
@@ -464,12 +465,10 @@ def test_qsa_cuda_full_select_matches_reference_and_graph(rows):
     # select k=512 compressed blocks, one of the private NVIDIA op's supported
     # K values. The same case stays valid through the generic vendor path.
     page_size, num_pages, compress_ratio, token_topk = 16, 32, 4, 2048
-    table = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).reshape(1, num_pages)
-    key = torch.randn(
-        num_pages, page_size, 1, 8, dtype=torch.bfloat16, device=device
+    table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        1, num_pages
     )
+    key = torch.randn(num_pages, page_size, 1, 8, dtype=torch.bfloat16, device=device)
     q = torch.randn(rows, 2, 8, dtype=torch.bfloat16, device=device)
     req = torch.zeros(rows, dtype=torch.int32, device=device)
     positions = torch.full((rows,), 2047, dtype=torch.int64, device=device)
@@ -518,9 +517,7 @@ def test_qsa_cuda_full_select_matches_reference_and_graph(rows):
             expected_valid = expected[row][expected[row] >= 0].sort().values
             actual_valid = actual_cpu[row][actual_cpu[row] >= 0].sort().values
             torch.testing.assert_close(actual_valid, expected_valid, rtol=0, atol=0)
-            assert int((actual_cpu[row] < 0).sum()) == int(
-                (expected[row] < 0).sum()
-            )
+            assert int((actual_cpu[row] < 0).sum()) == int((expected[row] < 0).sum())
 
     assert_same_selected_tokens(select())
     for _ in range(5):
