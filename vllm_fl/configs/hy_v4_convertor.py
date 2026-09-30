@@ -19,7 +19,8 @@ class HYV4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
     def get_quantization_config(self) -> dict[str, Any] | None:
         from vllm.model_executor.layers import quantization as me_quant
-        from vllm_fl.patches.hy_v4_v024 import _patch_mxfp8_override_order
+
+        from vllm_fl.configs.hy_v4_quantization import _patch_mxfp8_override_order
 
         quant_config = super().get_quantization_config()
         if quant_config is not None:

@@ -12,6 +12,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -20,9 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 
 try:
     from vllm.model_executor.layers.fused_moe import (
@@ -73,9 +72,6 @@ from vllm_fl.ops.hy_v4_hc import (
     writeback as _hyv4_hc_writeback,
 )
 from vllm_fl.patches.hy_v4_runtime import HY4RuntimePlan, prepare_hy4_runtime
-
-logger = init_logger(__name__)
-
 
 _HYV4_SHARED_EXPERTS_RUNNER_ENV = "VLLM_HY4_SHARED_EXPERTS_RUNNER"
 
@@ -340,7 +336,7 @@ class HYV4MoE(nn.Module):
         if config.hidden_act != "silu":
             raise ValueError("HY4 currently supports only the silu activation")
 
-        self.gate = GateLinear(
+        self.gate = fused_moe_layers.GateLinear(
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=torch.float32,
@@ -380,7 +376,7 @@ class HYV4MoE(nn.Module):
         # output to FP32.  The default non-SP fallback keeps the original
         # RowParallelLinear reduction and only uses the helper for the FP32
         # final add.  SP uses replicated weights and no row reduction.
-        self.experts = FusedMoE(
+        self.experts = fused_moe_layers.FusedMoE(
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,

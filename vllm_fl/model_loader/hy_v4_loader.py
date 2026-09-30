@@ -13,12 +13,9 @@ from safetensors.torch import safe_open
 from tqdm.auto import tqdm
 
 from vllm.config import ModelConfig
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
 from vllm.model_executor.model_loader.weight_utils import enable_tqdm
-
-logger = init_logger(__name__)
 
 _PACKED_EXPERT_NAMES = (
     ".mlp.experts.gate_up_proj",
