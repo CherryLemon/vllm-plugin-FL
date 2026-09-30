@@ -40,7 +40,14 @@ def test_encoding_matches_cpu_cast_at_every_rounding_boundary():
     bf16 = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
     bf16 = bf16.float()
     bf16 = bf16[torch.isfinite(bf16) & (bf16.abs() <= 448)]
-    values = torch.cat([boundaries, -boundaries, bf16, torch.tensor([-1e4, 1e4])])
+    values = torch.cat(
+        [
+            boundaries,
+            -boundaries,
+            bf16,
+            torch.tensor([-1e4, 1e4, -torch.inf, torch.inf, torch.nan, -torch.nan]),
+        ]
+    )
     expected = values.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
     inputs = values.to(current_platform.device_type)
     output = torch.empty_like(inputs, dtype=torch.uint8)
