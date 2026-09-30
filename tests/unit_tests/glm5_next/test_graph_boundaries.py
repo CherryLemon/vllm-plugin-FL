@@ -8,9 +8,9 @@ def test_kpool_custom_op_is_a_piecewise_split() -> None:
     from vllm.config.compilation import CompilationConfig
 
     from vllm_fl.activation import patch_inventory
-    from vllm_fl.patches.glm5_next_v024 import apply_glm5_next_v024_patches
+    from vllm_fl.patches.glm5_next_runtime import register_glm5_next_support
 
-    apply_glm5_next_v024_patches()
+    register_glm5_next_support()
     assert "vllm::sparse_attn_indexer_kpool" in CompilationConfig._attention_ops
     assert any(
         p["target"].endswith("CompilationConfig._attention_ops")
@@ -23,7 +23,7 @@ def test_graph_config_disables_glm5_allreduce_fusion(monkeypatch) -> None:
     """Graph mode must not inherit the generic H100 O2 allreduce fusion."""
     from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
 
-    from vllm_fl.patches.glm5_next_v024 import Glm5NextForCausalLMConfig
+    from vllm_fl.patches.glm5_next_runtime import Glm5NextForCausalLMConfig
 
     # Keep this a focused config test; the common hybrid checks are covered by
     # vLLM and are unrelated to the GLM5 graph safety override.

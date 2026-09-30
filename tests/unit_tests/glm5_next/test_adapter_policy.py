@@ -223,7 +223,7 @@ def test_portable_custom_ops_propagate_execution_failure(
     from types import SimpleNamespace
 
     from vllm_fl.kernels.glm5_next import indexer_backend
-    from vllm_fl.patches import glm5_next_v024 as hooks
+    from vllm_fl.patches import glm5_next_runtime as hooks
 
     error = error_type("execution failed")
 
@@ -257,7 +257,7 @@ import torch
 from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
 from vllm_fl.kernels.glm5_next import indexer_backend
 from vllm_fl.models.glm5_next import SiluAndMulWithClamp
-from vllm_fl.patches import glm5_next_v024 as hooks
+from vllm_fl.patches import glm5_next_runtime as hooks
 calls = []
 def unsupported(*args, **kwargs):
     calls.append(1)
@@ -357,7 +357,7 @@ def test_portable_mhc_fallback_preserves_norm_and_strict(monkeypatch, strict):
     from vllm.model_executor.layers.mhc import MHCPreOp
 
     from vllm_fl.kernels.glm5_next import indexer_backend
-    from vllm_fl.patches import glm5_next_v024 as hooks
+    from vllm_fl.patches import glm5_next_runtime as hooks
 
     calls = []
     layer_input = torch.tensor([[3.0, 4.0]])

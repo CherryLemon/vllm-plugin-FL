@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from vllm_fl.configs.glm5_next import Glm5NextTextConfig
-from vllm_fl.patches.glm5_next_v024 import (
+from vllm_fl.patches.glm5_next_runtime import (
     Glm5NextModelArchConfigConvertor,
 )
 from vllm_fl.transformers_utils.processors.glm5_next import (

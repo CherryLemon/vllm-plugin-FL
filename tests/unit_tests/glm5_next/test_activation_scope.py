@@ -13,7 +13,7 @@ from vllm_fl.activation import (
     reset_activation_for_tests,
 )
 from vllm_fl.kernels.glm5_next import provider
-from vllm_fl.patches import glm5_next_v024 as glm_patch
+from vllm_fl.patches import glm5_next_runtime as glm_patch
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,7 @@ def test_registration_does_not_mutate_env_or_shared_classes(monkeypatch):
     except Exception:
         MHCPreOp = None
 
-    assert glm_patch.apply_glm5_next_v024_patches() is True
+    assert glm_patch.register_glm5_next_support() is True
 
     assert {k: os.environ.get(k) for k in dispatch_keys} == env_before
     assert (
@@ -217,9 +217,9 @@ def test_real_glm_activation_applies_before_model_construction(monkeypatch):
 
 def test_registration_leaves_worker_kpool_paths_pristine():
     """Item 1: the runner-side kpool hooks are plan-bound, not import-bound."""
-    assert glm_patch.apply_glm5_next_v024_patches() is True
+    assert glm_patch.register_glm5_next_support() is True
 
-    from vllm_fl.patches import glm5_next_kpool_v024 as kpool
+    from vllm_fl.patches import glm5_next_kpool as kpool
 
     patches = kpool.glm5_next_kpool_runtime_patches("test@1")
     assert {patch.attr for patch in patches} == {
@@ -235,7 +235,7 @@ def test_real_glm_activation_binds_kpool_runtime_patches(monkeypatch):
     _protect_patched_state(monkeypatch)
     provider.get_glm5_provider.cache_clear()
 
-    from vllm_fl.patches import glm5_next_kpool_v024 as kpool
+    from vllm_fl.patches import glm5_next_kpool as kpool
 
     plan = glm_patch._glm5_plan_provider(_glm_config())
     assert plan is not None

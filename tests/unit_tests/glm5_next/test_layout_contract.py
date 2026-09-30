@@ -41,12 +41,12 @@ from vllm.v1 import kv_cache_spec_registry as registry
 from vllm.v1.core import single_type_kv_cache_manager as managers
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm_fl.models.glm5_next_kpool import KpoolTailSpec, KpoolTailManager
-from vllm_fl.patches.glm5_next_kpool_v024 import install_glm5_next_kpool_v024
+from vllm_fl.patches.glm5_next_kpool import install_glm5_next_kpool
 
 registry._REGISTRY_KVCACHESPEC_LIST.clear()
 if {preinitialized!r}:
     managers.register_all_kvcache_specs(None)
-install_glm5_next_kpool_v024()
+install_glm5_next_kpool()
 tail = KpoolTailSpec(block_size=4, num_kv_heads=1, head_size=128,
                     dtype=torch.float32, sliding_window=4)
 ordinary = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=128,
@@ -58,7 +58,7 @@ assert registry.KVCacheSpecRegistry.get_uniform_type_base_spec(tail) is KpoolTai
 assert registry.KVCacheSpecRegistry.get_manager_class(ordinary) is managers.FullAttentionManager
 assert registry.KVCacheSpecRegistry.get_uniform_type_base_spec(ordinary) is FullAttentionSpec
 # Re-registration keeps the same native and custom manager contracts.
-install_glm5_next_kpool_v024()
+install_glm5_next_kpool()
 managers.register_all_kvcache_specs(None)
 assert registry.KVCacheSpecRegistry.get_manager_class(tail) is KpoolTailManager
 """
@@ -146,7 +146,7 @@ def test_metadata_builder_delegates_non_glm_and_uses_same_glm_layout(monkeypatch
     from vllm.platforms import current_platform
     from vllm.v1.worker.utils import AttentionGroup
 
-    from vllm_fl.patches import glm5_next_kpool_v024 as hooks
+    from vllm_fl.patches import glm5_next_kpool as hooks
 
     monkeypatch.setattr(
         current_platform, "get_device_capability", lambda: SimpleNamespace(major=9)
@@ -185,7 +185,7 @@ def test_metadata_builder_delegates_non_glm_and_uses_same_glm_layout(monkeypatch
 def test_translated_block_table_reuses_storage_across_batch_sizes(monkeypatch):
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 
-    from vllm_fl.patches import glm5_next_kpool_v024 as hooks
+    from vllm_fl.patches import glm5_next_kpool as hooks
 
     monkeypatch.setitem(
         hooks._RUNTIME_BASELINES,

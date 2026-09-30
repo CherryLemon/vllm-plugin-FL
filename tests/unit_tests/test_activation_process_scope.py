@@ -42,7 +42,7 @@ def _probe_state():
     from vllm_fl.activation import get_active_plan
     from vllm_fl.dispatch.policy import PolicyManager
     from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
-    from vllm_fl.patches import glm5_next_kpool_v024 as kpool
+    from vllm_fl.patches import glm5_next_kpool as kpool
 
     active = get_active_plan()
     kpool_bound = all(
@@ -131,7 +131,7 @@ def test_spawn_worker_activates_real_plan_and_policy():
     result = _run(mp.get_context("spawn"), _child_spawn_activate)
     assert "error" not in result, result
     assert result["activated"] is True
-    assert result["active"] == "glm5_next_v024"
+    assert result["active"] == "glm5_next"
     assert result["indexer"] is False
     assert result["private_indexer"] is True
     assert result["kpool_bound"] is True
@@ -204,11 +204,11 @@ def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
     vllm_fl.register_model()
     try:
         assert activate_for_model(_glm_config()) is not None
-        assert get_active_plan().name == "glm5_next_v024"
+        assert get_active_plan().name == "glm5_next"
 
         result = _run(mp.get_context("fork"), _child_fork_rebind)
         assert "error" not in result, result
-        assert result["inherited"]["active"] == "glm5_next_v024"
+        assert result["inherited"]["active"] == "glm5_next"
         assert result["inherited"]["order"] == ["flagos", "reference"]
         # Same plan in the child: idempotent, and state stays bound.
         assert result["same_is_none"] is False
@@ -218,7 +218,7 @@ def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
         # A different model in the child is rejected.
         assert result["conflict"] is True
         # Parent process state is untouched by the child.
-        assert get_active_plan().name == "glm5_next_v024"
+        assert get_active_plan().name == "glm5_next"
         assert _probe_state()["order"] == ["flagos", "reference"]
     finally:
         reset_activation_for_tests()

@@ -8,7 +8,7 @@ import pytest
 from vllm_fl.activation import reset_activation_for_tests
 from vllm_fl.dispatch.policy import SelectionPolicy
 from vllm_fl.kernels.glm5_next import provider
-from vllm_fl.patches import glm5_next_v024 as glm_patch
+from vllm_fl.patches import glm5_next_runtime as glm_patch
 from vllm_fl.runtime.model_policy import (
     build_model_runtime_plan,
     reset_model_policy_for_tests,
@@ -54,7 +54,7 @@ def test_glm_registration_binds_runtime_policy_factory(monkeypatch):
     monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
     provider.get_glm5_provider.cache_clear()
 
-    assert glm_patch.apply_glm5_next_v024_patches() is True
+    assert glm_patch.register_glm5_next_support() is True
 
     plan = build_model_runtime_plan(_glm_config(), None, SelectionPolicy())
     assert plan.attention_backend is None
@@ -68,7 +68,7 @@ def test_glm_registration_binds_runtime_policy_factory(monkeypatch):
 def test_glm_runtime_plan_preserves_explicit_user_order(monkeypatch):
     monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
     provider.get_glm5_provider.cache_clear()
-    assert glm_patch.apply_glm5_next_v024_patches() is True
+    assert glm_patch.register_glm5_next_support() is True
 
     user_policy = SelectionPolicy.from_dict(
         prefer="flagos",
@@ -81,7 +81,7 @@ def test_glm_runtime_plan_preserves_explicit_user_order(monkeypatch):
 def test_glm_runtime_plan_ignores_other_models(monkeypatch):
     monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
     provider.get_glm5_provider.cache_clear()
-    assert glm_patch.apply_glm5_next_v024_patches() is True
+    assert glm_patch.register_glm5_next_support() is True
 
     policy = SelectionPolicy.from_dict(prefer="reference")
     plan = build_model_runtime_plan(_other_config(), None, policy)

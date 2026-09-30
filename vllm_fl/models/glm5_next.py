@@ -649,7 +649,7 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
                         attr=attr,
                         replacement=replacement,
                         pristine=getattr(owner, attr),
-                        fingerprint="glm5.mla.v024",
+                        fingerprint="glm5.mla",
                         phase="construction",
                     )
                 )
@@ -1099,7 +1099,7 @@ class Glm5NextForCausalLM(
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        from vllm_fl.patches.glm5_next_v024 import validate_glm5_config
+        from vllm_fl.patches.glm5_next_runtime import validate_glm5_config
 
         validate_glm5_config(vllm_config)
         INDEXER_BACKEND.preflight()

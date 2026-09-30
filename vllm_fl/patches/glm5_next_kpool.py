@@ -322,7 +322,7 @@ def glm5_next_kpool_runtime_patches(fingerprint: str) -> list[PendingPatch]:
     ]
 
 
-def install_glm5_next_kpool_v024() -> None:
+def install_glm5_next_kpool() -> None:
     """Register scoped engine hooks as one owned, rollback-safe transaction."""
     global _EARLY_PATCHES
     if _EARLY_PATCHES is not None:
@@ -341,7 +341,7 @@ def install_glm5_next_kpool_v024() -> None:
                 replacement=replacement,
                 pristine=inspect.getattr_static(owner, attr),
                 get_current=lambda: inspect.getattr_static(owner, attr),
-                fingerprint="glm5.kpool.v024",
+                fingerprint="glm5.kpool",
                 phase="engine/config",
             )
         )
@@ -687,4 +687,4 @@ def install_glm5_next_kpool_v024() -> None:
         )
 
 
-__all__ = ["install_glm5_next_kpool_v024"]
+__all__ = ["install_glm5_next_kpool"]

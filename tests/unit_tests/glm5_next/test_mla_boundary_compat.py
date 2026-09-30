@@ -6,7 +6,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from vllm_fl.patches import glm5_next_v024 as glm5_patch
+from vllm_fl.patches import glm5_next_runtime as glm5_patch
 
 _install_mla_boundary_compat_ops = glm5_patch._install_mla_boundary_compat_ops
 

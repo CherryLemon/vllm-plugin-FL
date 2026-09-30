@@ -13,7 +13,7 @@ from vllm_fl.kernels.glm5_next.indexer_backend import (
     Glm5NextIndexerBackend,
     _dequantize_grouped,
 )
-from vllm_fl.patches import glm5_next_v024 as patch
+from vllm_fl.patches import glm5_next_runtime as patch
 from vllm_fl.runtime.model_policy import ModelPolicyError, validate_model_config
 
 
@@ -43,7 +43,7 @@ def test_unsupported_modes_rejected_at_early_and_final_config(arch, mode):
         text.quantization_config = {"quant_method": "fp8"}
     else:
         config.quant_config = object()
-    patch.apply_glm5_next_v024_patches()
+    patch.register_glm5_next_support()
     # The early hook must fail before accessing any hybrid/cache settings.
     with pytest.raises(ModelPolicyError):
         patch.Glm5NextForCausalLMConfig.verify_and_update_config(config)
@@ -96,7 +96,7 @@ vllm_fl.register_model()
 from vllm_fl.activation import activate_for_model
 from vllm_fl.dispatch import SelectionPolicy, set_global_policy, get_default_manager
 from vllm_fl.kernels.glm5_next import provider
-from vllm_fl.patches import glm5_next_v024 as patch
+from vllm_fl.patches import glm5_next_runtime as patch
 from vllm_fl.platform import PlatformFL
 from vllm_fl.dispatch.backends.flaggems.flaggems import FlagGemsBackend
 

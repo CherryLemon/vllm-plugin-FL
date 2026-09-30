@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Register the plugin-owned GLM5-Next implementation on vLLM 0.24."""
+"""Register and activate the plugin-owned GLM5-Next runtime components."""
 
 import os
 from functools import wraps
@@ -81,20 +81,6 @@ def glm5_portable_moe_defaults() -> MoEDispatchDefaults:
             (op_name, order) for op_name, order in zip(portable_ops, portable_order)
         ),
     )
-
-
-def is_vllm_024() -> bool:
-    """Return whether the installed vLLM belongs to the 0.24 ABI line.
-
-    Keep this probe local to the model adapter: the current plugin main branch
-    has no generic ``patches._version`` module, and importing a historical
-    helper would make an otherwise valid 0.24 install fail at plugin startup.
-    """
-    try:
-        release = version("vllm").split("+", 1)[0].split(".")
-    except PackageNotFoundError:
-        return False
-    return len(release) >= 2 and release[:2] == ["0", "24"]
 
 
 def _is_missing_cache_op(exc: AttributeError, op_name: str) -> bool:
@@ -484,8 +470,6 @@ _BASELINES: dict[str, object] = {}
 
 
 def _capture_baselines() -> None:
-    if not is_vllm_024():
-        return
     from vllm.model_executor.layers.activation import SiluAndMulWithClamp
     from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
 
@@ -525,7 +509,7 @@ def _glm5_fingerprint() -> str:
         release = version("vllm").split("+", 1)[0]
     except PackageNotFoundError:  # pragma: no cover - vLLM must be installed
         release = "unknown"
-    return f"glm5_next_v024@vllm{release}:provider={get_glm5_provider()}"
+    return f"glm5_next_runtime@vllm{release}:provider={get_glm5_provider()}"
 
 
 def _is_glm5_model(vllm_config) -> bool:
@@ -721,7 +705,7 @@ def _apply_glm5_activation() -> None:
     # registration for every model; the config-time and registry hooks stay
     # there because vLLM needs them before the worker exists, but the metadata
     # builder and KV-block zeroer hooks are runner-side and now follow the plan.
-    from vllm_fl.patches.glm5_next_kpool_v024 import (
+    from vllm_fl.patches.glm5_next_kpool import (
         glm5_next_kpool_runtime_patches,
     )
 
@@ -734,10 +718,10 @@ def _apply_glm5_activation() -> None:
 
 
 def _glm5_plan_provider(vllm_config) -> ActivationPlan | None:
-    if not is_vllm_024() or not _is_glm5_model(vllm_config):
+    if not _is_glm5_model(vllm_config):
         return None
     return ActivationPlan(
-        name="glm5_next_v024",
+        name="glm5_next",
         fingerprint=_glm5_fingerprint(),
         apply=_apply_glm5_activation,
         attention_backend=_glm5_attention_override,
@@ -806,11 +790,11 @@ def _register_glm5_next_registrations() -> None:
         Glm5NextTextConfig,
         Glm5NextVisionConfig,
     )
-    from vllm_fl.patches.glm5_next_kpool_v024 import (
-        install_glm5_next_kpool_v024,
+    from vllm_fl.patches.glm5_next_kpool import (
+        install_glm5_next_kpool,
     )
 
-    install_glm5_next_kpool_v024()
+    install_glm5_next_kpool()
 
     config_registry = transformers_config._CONFIG_REGISTRY
     config_registry["glm5_next"] = Glm5NextConfig
@@ -845,21 +829,19 @@ def _register_glm5_next_registrations() -> None:
     )
 
 
-def apply_glm5_next_v024_patches() -> bool:
+def register_glm5_next_support() -> bool:
     """Register GLM5-Next config/model entries and its activation plan.
 
     Registers config/model entries and tracked early engine/config hooks.
     Worker patches and dispatch defaults are installed by activate_for_model
     only after GLM model matching, before its modules are constructed.
     """
-    if not is_vllm_024():
-        return False
 
     _register_glm5_next_registrations()
     register_plan_provider(_glm5_plan_provider)
     register_model_policy_factory(
         ModelPolicyFactory(
-            name="glm5_next_v024",
+            name="glm5_next",
             architectures=(_CAUSAL_ARCH, _CONDITIONAL_ARCH),
             model_types=("glm5_next", "glm5_next_text"),
             build=_glm5_runtime_plan,
@@ -868,7 +850,7 @@ def apply_glm5_next_v024_patches() -> bool:
     )
 
     logger.info(
-        "Registered vLLM 0.24 GLM5-Next text/VLM runtime with bounded KDA "
+        "Registered GLM5-Next text/VLM runtime with bounded KDA "
         "gate, kpool, and ViT data parallelism"
     )
     return True
@@ -877,6 +859,6 @@ def apply_glm5_next_v024_patches() -> bool:
 __all__ = [
     "Glm5NextForCausalLMConfig",
     "Glm5NextModelArchConfigConvertor",
-    "apply_glm5_next_v024_patches",
+    "register_glm5_next_support",
     "glm5_portable_moe_defaults",
 ]

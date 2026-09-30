@@ -1031,7 +1031,7 @@ class Glm5NextForConditionalGeneration(
         return Glm5NextForCausalLM.get_mamba_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        from vllm_fl.patches.glm5_next_v024 import validate_glm5_config
+        from vllm_fl.patches.glm5_next_runtime import validate_glm5_config
 
         validate_glm5_config(vllm_config)
         # Bypass Glm4vForConditionalGeneration.__init__: its language-model
