@@ -70,9 +70,7 @@ def test_capability_only_after_successful_probe(monkeypatch):
     assert support is AttentionCGSupport.UNIFORM_BATCH
     assert reason is None
 
-    monkeypatch.setattr(
-        mla_sparse, "_probe_graph_capture", lambda hs: (False, "boom")
-    )
+    monkeypatch.setattr(mla_sparse, "_probe_graph_capture", lambda hs: (False, "boom"))
     support, reason = mla_sparse.sparse_mla_cudagraph_support(576)
     assert support is AttentionCGSupport.NEVER
     assert "boom" in reason

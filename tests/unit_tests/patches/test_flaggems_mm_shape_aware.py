@@ -57,7 +57,11 @@ def test_default_is_disabled_and_does_not_touch_torch(monkeypatch):
     monkeypatch.setattr(runtime, "_STATE", None)
     monkeypatch.setattr(runtime, "_FAILED", False)
     monkeypatch.delenv(shape_aware.ENABLE_ENV, raising=False)
-    monkeypatch.setattr(shape_aware, "capture_native_mm_kernel", lambda: pytest.fail("captured disabled MM"))
+    monkeypatch.setattr(
+        shape_aware,
+        "capture_native_mm_kernel",
+        lambda: pytest.fail("captured disabled MM"),
+    )
     assert runtime.configure_flaggems(lambda library: None).status == "disabled"
 
 
@@ -142,14 +146,21 @@ def test_apply_captures_flaggems_before_override_and_routes_shapes(monkeypatch):
     native = _FakeSafeKernel(lambda keys, a, b: "native")
     flaggems = _FakeSafeKernel(lambda keys, a, b: "flaggems")
     library = _FakeLibrary()
-    observed = SimpleNamespace(mm=flaggems, mm_callable=lambda a, b: None, mm_registration=None)
+    observed = SimpleNamespace(
+        mm=flaggems, mm_callable=lambda a, b: None, mm_registration=None
+    )
     monkeypatch.setattr(shape_aware.torch.library, "Library", lambda *args: library)
     state = shape_aware.apply_shape_aware_mm(native, observed, 2)
     assert state.native_mm is native and state.flaggems_mm is flaggems
     op, wrapper, key, with_keyset, allow_override = library.impl_calls[0]
     assert (op, key, with_keyset, allow_override) == ("mm", "CUDA", True, True)
     b = _FakeTensor(m=4096, stride=(1, 4096))
-    assert [wrapper("keys", _FakeTensor(m=rows), b) for rows in (1, 2, 3, 1)] == ["native", "native", "flaggems", "native"]
+    assert [wrapper("keys", _FakeTensor(m=rows), b) for rows in (1, 2, 3, 1)] == [
+        "native",
+        "native",
+        "flaggems",
+        "native",
+    ]
 
 
 def test_apply_fails_without_safe_override_api(monkeypatch):
@@ -158,8 +169,12 @@ def test_apply_fails_without_safe_override_api(monkeypatch):
             pytest.fail("unsafe registration attempted")
 
     safe = _FakeSafeKernel(lambda *args: None)
-    observed = SimpleNamespace(mm=safe, mm_callable=lambda a, b: None, mm_registration=None)
-    monkeypatch.setattr(shape_aware.torch.library, "Library", lambda *args: OldLibrary())
+    observed = SimpleNamespace(
+        mm=safe, mm_callable=lambda a, b: None, mm_registration=None
+    )
+    monkeypatch.setattr(
+        shape_aware.torch.library, "Library", lambda *args: OldLibrary()
+    )
     with pytest.raises(RuntimeError, match="with_keyset|allow_override"):
         shape_aware.apply_shape_aware_mm(safe, observed, 2)
 
@@ -168,7 +183,11 @@ def test_apply_requires_capture_before_flaggems(monkeypatch):
     monkeypatch.setattr(runtime, "_STATE", None)
     monkeypatch.setattr(runtime, "_FAILED", False)
     monkeypatch.setenv(shape_aware.ENABLE_ENV, "1")
-    monkeypatch.setattr(shape_aware, "capture_native_mm_kernel", lambda: (_ for _ in ()).throw(RuntimeError("capture before flag_gems.enable")))
+    monkeypatch.setattr(
+        shape_aware,
+        "capture_native_mm_kernel",
+        lambda: (_ for _ in ()).throw(RuntimeError("capture before flag_gems.enable")),
+    )
     enabled = []
     with pytest.raises(RuntimeError, match="before flag_gems.enable"):
         runtime.configure_flaggems(enabled.append)

@@ -388,6 +388,7 @@ class TritonExpertsFL(TritonExperts):
         if (
             self._lora_context is None
             and runtime_platform.is_cuda()
+            and activation == MoEActivation.SILU
             and (
                 self.quant_config.gemm1_clamp_limit is None
                 or has_native_triton_moe()
@@ -550,6 +551,8 @@ class TritonExpertsFL(TritonExperts):
             intermediate_cache2,
             intermediate_cache1.view(-1, N),
             clamp_limit=self.quant_config.gemm1_clamp_limit,
+            alpha=self.gemm1_alpha,
+            beta=self.gemm1_beta,
         )
 
         a2q_scale: torch.Tensor | None = None

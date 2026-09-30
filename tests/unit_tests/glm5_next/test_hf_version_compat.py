@@ -42,18 +42,24 @@ def test_video_rgb_conversion_without_new_torchvision_api(channels):
 @pytest.mark.parametrize("fps", [None, 0.1])
 def test_flat_video_metadata_survives_serving_budget_normalization(fps):
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "<|video|>": 2}, unk_token="[UNK]")),
+        tokenizer_object=Tokenizer(
+            WordLevel({"[UNK]": 0, "<|video|>": 2}, unk_token="[UNK]")
+        ),
         unk_token="[UNK]",
     )
     processor = Glm5NextProcessor(
-        Glm5NextImageProcessor(), tokenizer, Glm5NextVideoProcessor(max_image_tokens=128)
+        Glm5NextImageProcessor(),
+        tokenizer,
+        Glm5NextVideoProcessor(max_image_tokens=128),
     )
     processor.configure_serving({"max_frames": 8, "max_image_tokens": 128})
     options = {} if fps is None else {"fps": fps}
     result = processor(
         videos=[np.zeros((60, 112, 112, 3), dtype=np.uint8)],
         video_metadata=[dict(total_num_frames=60, fps=2.0, duration=30.0)],
-        text="<|video|>", return_tensors="pt", **options,
+        text="<|video|>",
+        return_tensors="pt",
+        **options,
     )
     grid = result["video_grid_thw"][0]
     assert 0 < int(grid[0]) <= 4

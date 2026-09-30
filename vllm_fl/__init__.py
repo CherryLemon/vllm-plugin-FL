@@ -323,8 +323,6 @@ def register_model():
         install_arm_cpu_packed_w4a8()
         return
 
-    patch_vllm_moe_sum()
-
     _register_flagcx_connector()
 
     # Register OOT quant kernels so kernel selection can find them
