@@ -66,6 +66,7 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, ven
     monkeypatch.setitem(sys.modules, name, backend)
     experts = SimpleNamespace(
         _lora_context=None,
+        gemm1_clamp_limit=None,
         quant_config=SimpleNamespace(
             use_fp8_w8a8=False,
             use_int8_w8a8=False,
@@ -222,3 +223,4 @@ def test_fused_moe_factory_obeys_oot_policy(
     else:
         patch_factory.assert_not_called()
         patch_oracle.assert_called_once_with(prefer_flaggems_experts=False)
+    return None

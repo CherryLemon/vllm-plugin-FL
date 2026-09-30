@@ -46,6 +46,7 @@ def qsa_sparse_triton_launch_config(
         if torch.cuda.get_device_capability(device) == (9, 0):
             return 64, 8, 3
     except (AssertionError, RuntimeError):
+        # No usable capability query: retain the conservative launch config.
         pass
     return 16, 4, 2
 

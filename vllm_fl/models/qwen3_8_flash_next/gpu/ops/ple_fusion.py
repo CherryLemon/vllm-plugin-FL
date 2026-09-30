@@ -50,6 +50,8 @@ def _default_prefill_conv_config(device: torch.device) -> tuple[int, int]:
             if torch.cuda.get_device_capability(device)[0] >= 9:
                 return 8, 256
         except (AssertionError, RuntimeError):
+            # Capability probing may be unavailable during import/preflight;
+            # the conservative launch below still applies.
             pass
     return 16, 128
 
@@ -187,9 +189,6 @@ def _ple_prefill_dilated_conv_kernel(
             tl.load(has_initial_ptr + request * stride_has_initial).to(tl.int1)
             & valid_state
         )
-    else:
-        safe_state_index = 0
-        has_initial = False
 
     valid_tokens = token_offsets < query_len
     valid_channels = channel_offsets < channels
@@ -467,18 +466,7 @@ def qwen3_8_flash_next_ple_gate_norm_fake(
     hc_count: int,
     eps: float,
 ) -> None:
-    del (
-        key,
-        query,
-        value,
-        key_weight,
-        query_weight,
-        conv_weight,
-        gated,
-        normalized,
-        hc_count,
-        eps,
-    )
+    return None
 
 
 def ple_gate_norm(

@@ -237,6 +237,7 @@ def test_rocm_quantization_source_precedes_cuda_alike(monkeypatch):
         ),
     )
     assert quant_linear._resolve_source_platform() is PlatformEnum.ROCM
+    return None
 
 
 def test_rocm_moe_priority_includes_aiter_and_triton(monkeypatch):
@@ -261,6 +262,7 @@ def test_rocm_moe_priority_includes_aiter_and_triton(monkeypatch):
         fused_moe_utils.UnquantizedMoeBackend.AITER,
         fused_moe_utils.UnquantizedMoeBackend.TRITON,
     ]
+    return None
 
 
 def test_unknown_oot_moe_priority_falls_back_to_triton(monkeypatch):
@@ -284,3 +286,4 @@ def test_unknown_oot_moe_priority_falls_back_to_triton(monkeypatch):
         fused_moe_utils.UnquantizedMoeBackend.TRITON,
         fused_moe_utils.UnquantizedMoeBackend.BATCHED_TRITON,
     ]
+    return None
