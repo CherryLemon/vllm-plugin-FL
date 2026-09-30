@@ -30,7 +30,6 @@ from vllm.distributed import (
     parallel_state,
     utils as dist_utils,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
@@ -69,8 +68,6 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm_fl.kernels.glm5_next.provider import use_nvidia_reference
 from vllm_fl.kernels.glm5_next.vision_attention import Glm5VisionAttention
 from vllm_fl.models.glm5_next import SiluAndMulWithClamp
-
-logger = init_logger(__name__)
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -928,6 +925,7 @@ class Glm5NextMultiModalProcessor(Glm4vMultiModalProcessor):
 
     def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
         from dataclasses import replace
+
         from vllm.multimodal.processing import PromptUpdateDetails
 
         updates = super()._get_prompt_updates(

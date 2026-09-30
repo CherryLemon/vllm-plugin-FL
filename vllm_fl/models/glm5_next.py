@@ -13,6 +13,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ParallelConfig, VllmConfig
@@ -28,7 +29,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import (
     SiluAndMulWithClamp as VllmSiluAndMulWithClamp,
 )
-from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -93,20 +93,16 @@ else:
     mhc_pre_broadcast_tilelang = None
 
 if current_platform.is_cuda():
+    import vllm.model_executor.layers.mamba.ops.causal_conv1d as conv_ops
     from vllm.model_executor.layers.fla.ops.kda import fused_recurrent_kda
-    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-        causal_conv1d_fn,
-        causal_conv1d_update,
-    )
 
     from vllm_fl.kernels.glm5_next.safe_kda import (
         chunk_kda_with_safe_gate,
         fused_safe_kda_gate,
     )
 else:
+    from vllm_fl.kernels.glm5_next import portable as conv_ops
     from vllm_fl.kernels.glm5_next.portable import (
-        causal_conv1d_fn,
-        causal_conv1d_update,
         chunk_kda_with_safe_gate,
         fused_recurrent_kda,
         safe_kda_gate as fused_safe_kda_gate,
@@ -235,7 +231,7 @@ class Glm5NextMoE(nn.Module):
 
         router_dtype_name = getattr(config, "moe_router_dtype", "float32")
         router_dtype = getattr(torch, str(router_dtype_name))
-        self.gate = GateLinear(
+        self.gate = fused_moe_layers.GateLinear(
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=router_dtype,
@@ -278,7 +274,7 @@ class Glm5NextMoE(nn.Module):
                 swiglu_limit=swiglu_limit,
             )
 
-        self.experts = FusedMoE(
+        self.experts = fused_moe_layers.FusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -441,7 +437,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             q_proj_states = q_proj_states.transpose(0, 1)
             k_proj_states = k_proj_states.transpose(0, 1)
             v_proj_states = v_proj_states.transpose(0, 1)
-            q = causal_conv1d_fn(
+            q = conv_ops.causal_conv1d_fn(
                 q_proj_states,
                 q_conv_weights,
                 self.q_conv1d.bias,
@@ -452,7 +448,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
-            k = causal_conv1d_fn(
+            k = conv_ops.causal_conv1d_fn(
                 k_proj_states,
                 k_conv_weights,
                 self.k_conv1d.bias,
@@ -463,7 +459,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata_narrowed,
             ).transpose(0, 1)
-            v = causal_conv1d_fn(
+            v = conv_ops.causal_conv1d_fn(
                 v_proj_states,
                 v_conv_weights,
                 self.v_conv1d.bias,
@@ -479,7 +475,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             decode_conv_indices = non_spec_state_indices_tensor[
                 : attn_metadata_narrowed.num_actual_tokens
             ]
-            q = causal_conv1d_update(
+            q = conv_ops.causal_conv1d_update(
                 q_proj_states,
                 conv_state_q,
                 q_conv_weights,
@@ -488,7 +484,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 conv_state_indices=decode_conv_indices,
                 validate_data=True,
             )
-            k = causal_conv1d_update(
+            k = conv_ops.causal_conv1d_update(
                 k_proj_states,
                 conv_state_k,
                 k_conv_weights,
@@ -497,7 +493,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 conv_state_indices=decode_conv_indices,
                 validate_data=True,
             )
-            v = causal_conv1d_update(
+            v = conv_ops.causal_conv1d_update(
                 v_proj_states,
                 conv_state_v,
                 v_conv_weights,
@@ -633,6 +629,7 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
         if current_platform.is_cuda() and not use_nvidia_reference():
             from vllm.model_executor.layers import sparse_attn_indexer
             from vllm.model_executor.layers.attention import mla_attention
+
             from vllm_fl.dispatch.backends.flaggems.impl.mla_prefill import (
                 FlagGemsMLAPrefillBackend,
             )

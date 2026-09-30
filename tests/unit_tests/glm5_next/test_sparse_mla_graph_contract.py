@@ -5,8 +5,8 @@ once instead of retrying after a kernel may have written the KV cache."""
 
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 from vllm.v1.attention.backend import AttentionCGSupport
 

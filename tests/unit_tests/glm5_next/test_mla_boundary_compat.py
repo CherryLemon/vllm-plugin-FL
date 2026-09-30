@@ -85,7 +85,6 @@ def test_mla_cache_missing_vendor_op_uses_bf16_slot_fallback(
     calls = {"cache": 0}
 
     def missing_vendor_cache(*args, **kwargs):
-        del args, kwargs
         calls["cache"] += 1
         raise AttributeError(
             "'_OpNamespace' '_C_cache_ops' object has no attribute "
@@ -123,7 +122,6 @@ def test_flaggems_writer_failure_after_write_is_not_retried(monkeypatch) -> None
     calls = {"cache": 0}
 
     def missing_vendor_cache(*args, **kwargs):
-        del args, kwargs
         raise AttributeError(
             "'_OpNamespace' '_C_cache_ops' object has no attribute "
             "'concat_and_cache_mla'"
@@ -161,7 +159,6 @@ def test_mla_cache_does_not_hide_unrelated_vendor_errors(monkeypatch) -> None:
     monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
 
     def broken_vendor_cache(*args, **kwargs):
-        del args, kwargs
         raise AttributeError("vendor metadata is missing")
 
     ops = _fake_ops(cache_impl=broken_vendor_cache)
@@ -184,7 +181,7 @@ def test_mla_cache_wrapper_is_not_installed_when_vendor_abi_exists(
     monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
 
     def vendor_cache(*args, **kwargs):
-        del args, kwargs
+        return None
 
     ops = _fake_ops(cache_impl=vendor_cache)
     _install_mla_boundary_compat_ops(ops)
@@ -198,7 +195,7 @@ def test_explicit_flaggems_rejects_accidental_vendor_attention(
     monkeypatch.setattr(glm5_patch, "get_glm5_provider", lambda: "flaggems")
 
     def vendor_cache(*args, **kwargs):
-        del args, kwargs
+        return None
 
     ops = _fake_ops(cache_impl=vendor_cache)
     _install_mla_boundary_compat_ops(ops)

@@ -49,7 +49,7 @@ from transformers.processing_utils import (
     VideosKwargs,
 )
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers.utils import TensorType, logging
+from transformers.utils import TensorType
 from transformers.video_processing_utils import BaseVideoProcessor
 from transformers.video_utils import (
     VideoInput,
@@ -64,8 +64,6 @@ from .glm5_next_budget import (
     resolve_serving_kwargs,
     resolve_vision_budget,
 )
-
-logger = logging.get_logger(__name__)
 
 # The earlier size-budget config can advertise a huge ``longest_edge``. Keep
 # the original serving guard for that schema so swapping config files does not
@@ -797,6 +795,18 @@ class Glm5NextVideoProcessor(BaseVideoProcessor):
     sampling_policy = "fps_interval"
     model_input_names = ["pixel_values_videos", "video_grid_thw"]
 
+    def convert_to_rgb(self, video):
+        """Support older torchvision while keeping HF's white alpha background."""
+        channels = video.shape[-3]
+        if channels == 1:
+            return video.expand(*video.shape[:-3], 3, *video.shape[-2:])
+        if channels == 3:
+            return video
+        if channels != 4:
+            raise ValueError(f"GLM5-Next video requires 1, 3 or 4 channels, got {channels}")
+        alpha = video[..., 3:4, :, :].float() / 255.0
+        return (1 - alpha) * 255 + alpha * video[..., :3, :, :]
+
     def sample_frames(
         self,
         metadata: VideoMetadata,
@@ -1147,6 +1157,9 @@ class Glm5NextProcessor(ProcessorMixin):
         if hasattr(self, "_serving_mm_kwargs"):
             for key in NORMALIZED_SERVING_KEYS:
                 kwargs.pop(key, None)
+        # Metadata is a modality input, not a deployment budget. Older HF
+        # merge helpers can drop it while normalizing flat serving options.
+        video_metadata = kwargs.pop("video_metadata", None)
         output_kwargs = self._merge_kwargs(
             Glm5NextProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -1160,6 +1173,8 @@ class Glm5NextProcessor(ProcessorMixin):
             image_inputs = {}
 
         if videos is not None:
+            if video_metadata is not None:
+                output_kwargs["videos_kwargs"]["video_metadata"] = video_metadata
             videos_inputs = self.video_processor(
                 videos=videos, **output_kwargs["videos_kwargs"]
             )

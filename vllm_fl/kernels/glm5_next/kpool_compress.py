@@ -863,9 +863,6 @@ def append_tail_to_topk(
 
     rows, n_cols = topk_result.shape
     out_cols = n_cols + tail_pool
-    out = torch.empty(
-        (rows, out_cols), dtype=topk_result.dtype, device=topk_result.device
-    )
 
     # tail tokens: [pool_len*pool_size, seq_len) for each row.
     pool_len = pool_lens.to(torch.int32)

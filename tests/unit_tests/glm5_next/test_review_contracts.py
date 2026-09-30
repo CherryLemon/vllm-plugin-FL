@@ -89,6 +89,7 @@ def test_grouped_scales_and_invalid_shape():
 def test_fresh_process_attention_dispatch_and_vision_import_isolation(provider):
     code = r"""
 from types import SimpleNamespace
+import pytest
 import vllm_fl
 vllm_fl.register_model()
 from vllm_fl.activation import activate_for_model
@@ -103,16 +104,27 @@ provider._has_nvidia_reference_kernels = lambda: False
 set_global_policy(SelectionPolicy.from_dict(per_op_order={
     "attention_backend": ["flagos", "vendor:cuda"],
 }))
+from vllm.platforms import current_platform
 from vllm_fl.dispatch.backends.vendor.cuda.cuda import CudaBackend
 vendor = CudaBackend()
 for sparse in (False, True):
     get_default_manager().clear_failed_impls("attention_backend")
     selector = SimpleNamespace(use_mla=True, use_sparse=sparse)
-    expected = vendor.attention_backend(use_mla=True, use_sparse=sparse)
-    assert PlatformFL.get_attn_backend_cls(None, selector) == expected
+    if current_platform.is_cuda():
+        expected = vendor.attention_backend(use_mla=True, use_sparse=sparse)
+        assert PlatformFL.get_attn_backend_cls(None, selector) == expected
+    else:
+        # The forced CUDA fallback is unavailable here. Generic MLA must fail
+        # before activation rather than borrow another model's portable plan.
+        with pytest.raises(RuntimeError, match="requires a model runtime plan"):
+            PlatformFL.get_attn_backend_cls(None, selector)
 get_default_manager().clear_failed_impls("attention_backend")
 selector = SimpleNamespace(use_mla=False, use_sparse=False)
-assert PlatformFL.get_attn_backend_cls(None, selector) == FlagGemsBackend().attention_backend()
+if current_platform.is_cuda():
+    assert PlatformFL.get_attn_backend_cls(None, selector) == FlagGemsBackend().attention_backend()
+else:
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        PlatformFL.get_attn_backend_cls(None, selector)
 
 import vllm.model_executor.layers.attention.mm_encoder_attention as mm
 import vllm.v1.attention.backends.fa_utils as fa
@@ -146,6 +158,7 @@ print("review contracts passed")
 
 def test_private_vision_adapter_preserves_public_fa(monkeypatch):
     import flag_gems
+
     from vllm_fl.kernels.glm5_next.vision_attention import _vision_attention
 
     calls = []

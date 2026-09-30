@@ -157,7 +157,8 @@ def _protect_real_activation_state(monkeypatch):
         monkeypatch.setattr(
             SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
         )
-    except Exception:
+    except (ImportError, AttributeError):
+        # Reduced vLLM builds may omit this optional activation class.
         pass
     monkeypatch.setattr(
         indexer_backend.DeepseekV32IndexerBackend,

@@ -190,7 +190,7 @@ def test_kpool_fp8_cache_layout_matches_returned_compression() -> None:
             return_compressed=True,
         )
     except RuntimeError as exc:
-        pytest.skip(f"CPU float8 conversion is unavailable: {exc}")
+        return pytest.skip(f"CPU float8 conversion is unavailable: {exc}")
 
     cache_values, cache_scales = portable._cache_views(cache, 128)
     torch.testing.assert_close(

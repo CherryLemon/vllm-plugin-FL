@@ -33,14 +33,12 @@ Responsibilities:
 
 from __future__ import annotations
 
-import logging
 import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from vllm_fl.dispatch.policy import SelectionPolicy
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "ModelPolicyError",

@@ -12,6 +12,7 @@ the residual only while writing the fused mHC output.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import math
 from typing import Any
 
@@ -30,7 +31,7 @@ if not has_tilelang():
 # Keep the reference import order.  flashinfer must bind the real libcudart
 # before TileLang can load libcudart_stub on sm100 systems.
 with contextlib.suppress(Exception):
-    import flashinfer.comm  # noqa: F401
+    importlib.import_module("flashinfer.comm")
 
 import tilelang
 import tilelang.language as T

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bind model adapters through the common resolver without hiding GPU failures."""
 
-from .policy import get_policy, get_policy_epoch
+from .policy import PREFER_DEFAULT, get_policy, get_policy_epoch
 
 
 class OperatorBinding:
@@ -12,10 +12,15 @@ class OperatorBinding:
     implementation is disabled for this manager instead of retried per token.
     """
 
-    def __init__(self, manager, op_name, *, graph_capabilities=None):
+    def __init__(
+        self, manager, op_name, *, graph_capabilities=None, supports=None,
+        default_order=(),
+    ):
         self.manager = manager
         self.op_name = op_name
         self.graph_capabilities = graph_capabilities or {}
+        self.supports = supports or {}
+        self.default_order = default_order
         self._cache = None
         self.selected_impl = None
 
@@ -54,11 +59,25 @@ class OperatorBinding:
 
     def __call__(self, *args, **kwargs):
         candidates = self.preflight()
-        strict = get_policy().strict
+        policy = get_policy()
+        # Workload guards inspect metadata only. Unsupported shapes do not
+        # disable an implementation for later calls with a supported shape.
+        candidates = [
+            impl for impl in candidates
+            if impl.impl_id not in self.supports
+            or self.supports[impl.impl_id](*args, **kwargs)
+        ]
+        explicit = dict(policy.per_op_order).get(self.op_name)
+        if self.default_order and explicit is None and policy.prefer == PREFER_DEFAULT:
+            order = {name: i for i, name in enumerate(self.default_order)}
+            candidates.sort(key=lambda impl: order.get(impl.impl_id, len(order)))
+        if not candidates:
+            raise NotImplementedError(f"No permitted implementation supports {self.op_name}")
+        strict = policy.strict
         for impl in candidates:
             self.manager._record_first_use(self.op_name, impl)
             try:
-                result = impl.fn(*args, **kwargs)
+                result = self.manager._call_with_hooks(self.op_name, impl.fn, args, kwargs)
             except NotImplementedError:
                 if strict:
                     raise
@@ -69,3 +88,5 @@ class OperatorBinding:
             else:
                 self.selected_impl = impl.impl_id
                 return result
+
+        raise RuntimeError(f"No implementation completed {self.op_name}")

@@ -104,9 +104,8 @@ def test_complete_packed_and_expert_weights(ep):
 def test_missing_shard_fails_even_when_destination_name_is_loaded(missing):
     model = _Fixture()
     originals = [p.weight_loader for p in model.parameters()]
-    with pytest.raises(RuntimeError, match="missing packed weight shards"):
-        with audit_packed_weights(model):
-            model.load_weights((n, w) for n, w in _weights() if n != missing)
+    with pytest.raises(RuntimeError, match="missing packed weight shards"), audit_packed_weights(model):
+        model.load_weights((n, w) for n, w in _weights() if n != missing)
     assert all(p.weight_loader is old for p, old in zip(model.parameters(), originals))
 
 

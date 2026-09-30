@@ -179,6 +179,25 @@ class Glm5NextTextConfig(PretrainedConfig):
             **kwargs,
         )
 
+    def validate_layer_type(self):
+        """Validate the checkpoint's sparse alias without rewriting its schema."""
+        from copy import copy
+
+        validate = getattr(super(), "validate_layer_type", None)
+        if validate is None:
+            return None
+        from transformers.configuration_utils import ALLOWED_ATTN_LAYER_TYPES
+
+        # HF 5.x changed its accepted sparse names. Validate a temporary view
+        # only when the checkpoint alias is missing, preserving serialized names.
+        alias = "deepseek_sparse_attention"
+        canonical = alias if alias in ALLOWED_ATTN_LAYER_TYPES else "sparse"
+        view = copy(self)
+        view.layer_types = [
+            canonical if kind == alias else kind for kind in self.layer_types
+        ]
+        return super(Glm5NextTextConfig, view).validate_layer_type()
+
     @property
     def is_moe(self) -> bool:
         return self.n_routed_experts is not None

@@ -89,7 +89,7 @@ class KpoolTailManager(FullAttentionManager):
         num_tokens: int,
         retention_interval: int | None = None,
     ) -> None:
-        del request, num_tokens, retention_interval
+        return None
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         del running_request_id
@@ -102,7 +102,7 @@ class KpoolTailManager(FullAttentionManager):
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
-        del request_id, total_computed_tokens
+        return None
 
     def get_num_blocks_to_allocate(
         self,
@@ -282,6 +282,7 @@ class Glm5NextIndexerAttentionBackend(DeepseekV32IndexerBackend):
     @staticmethod
     def get_physical_cache_layout(spec):
         from vllm.platforms import current_platform
+
         from vllm_fl.runtime.kv_layout import PhysicalCacheLayout
 
         storage = spec.storage_block_size

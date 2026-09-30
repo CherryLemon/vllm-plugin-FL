@@ -13,9 +13,9 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_fl.activation import PendingPatch, bind_patches
 from vllm_fl.models.glm5_next_kpool import (
-    glm5_indexer_page_alignment,
     KpoolTailManager,
     KpoolTailSpec,
+    glm5_indexer_page_alignment,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,8 +57,8 @@ def _group_glm5_kpool(vllm_config, kv_cache_spec):
     """
     from vllm.v1.kv_cache_interface import (
         KVCacheGroupSpec,
-        MLAAttentionSpec,
         MambaSpec,
+        MLAAttentionSpec,
         UniformTypeKVCacheSpecs,
     )
 
@@ -139,8 +139,9 @@ def _runtime_patch(
 
 def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
     """Keep the compressed indexer at pool-page granularity in metadata."""
-    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
     from vllm.v1.worker import utils as worker_utils
+
+    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
 
     owner = worker_utils.AttentionGroup
     pristine = _runtime_pristine(owner, "create_metadata_builders")
@@ -177,6 +178,7 @@ def _create_metadata_builders_patch(fingerprint: str) -> PendingPatch:
             builder._glm5_physical_layout = layout
             if kernel_block_size is not None:
                 builder.kernel_block_size = kernel_block_size
+        return None
 
     return _runtime_patch(
         owner,
@@ -252,8 +254,9 @@ def _indexer_build_patch(fingerprint: str) -> PendingPatch:
 
 def _zeroer_init_patch(fingerprint: str) -> PendingPatch:
     """Exclude compressed index pages from the page-uniform zeroing pass."""
-    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
     from vllm.v1.worker import utils as worker_utils
+
+    from vllm_fl.runtime.kv_layout import get_physical_cache_layout
 
     owner = worker_utils.KVBlockZeroer
     pristine = _runtime_pristine(owner, "__init__")

@@ -626,8 +626,8 @@ def sparse_attn_indexer_kpool(
                 shape2 = (num_requests, next_n)
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
-                dec_slot = slot_mapping[:num_decode_tokens].view(shape2)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(shape2)
+                dec_slot = slot_mapping[:num_decode_tokens].view(num_requests, num_decode_tokens // num_requests)
+                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(num_requests, num_decode_tokens // num_requests)
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -650,7 +650,7 @@ def sparse_attn_indexer_kpool(
                     scatter_idx,
                 )
             else:
-                dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(shape2)
+                dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(num_requests, num_decode_tokens // num_requests)
             # The compress kernel writes the raw fp8 cache (not the quant view);
             # pass the underlying kv_cache, not kv_cache_quant_view.
             if dec_tail_slot is not None:

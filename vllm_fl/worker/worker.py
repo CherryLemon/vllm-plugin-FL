@@ -6,10 +6,11 @@
 
 import gc
 import os
-from contextlib import nullcontext, contextmanager
-from types import NoneType
-from typing import TYPE_CHECKING, Any, Optional, cast, Generator
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from types import NoneType
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -31,6 +32,7 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
+
 try:
     from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 except ImportError:
@@ -49,14 +51,13 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.utils.torch_utils import set_random_seed
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
-
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import GiB_bytes  # , MemorySnapshot, memory_profiling
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -65,9 +66,8 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-import vllm_fl.envs as fl_envs
 
-from vllm_fl.ops.custom_ops import register_oot_ops
+import vllm_fl.envs as fl_envs
 from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.utils import get_flag_gems_whitelist_blacklist
 
@@ -162,10 +162,8 @@ def memory_profiling_fl(
     torch_device_fn.empty_cache()
 
     # Reset peak memory stats - platform agnostic
-    try:
+    with suppress(AttributeError, RuntimeError):
         torch_device_fn.reset_peak_memory_stats()
-    except (AttributeError, RuntimeError):
-        pass  # Some platforms may not support this
 
     result = MemoryProfilingResult()
     result.before_create = baseline_snapshot
@@ -274,132 +272,39 @@ class WorkerFL(WorkerBase):
         # semantics.  Only then is the plan applied (class patches, etc.) and
         # the process bound to the model.  A plain plugin import activates
         # nothing; only a matching model does.
-        from vllm_fl.activation import (
-            activate_for_model,
-            preflight_activation_config,
-            validate_plan_capability,
-        )
 
-        initial_whitelist = None
-        if fl_envs.USE_FLAGGEMS:
-            initial_whitelist, _ = get_flag_gems_whitelist_blacklist()
-        requested_plan = preflight_activation_config(
-            self.vllm_config, initial_whitelist
-        )
-        self._requested_plan = requested_plan
+        from vllm_fl.flaggems_runtime import configure_flaggems
 
-        register_oot_ops()
+        whitelist, blacklist = get_flag_gems_whitelist_blacklist()
+        from vllm_fl.activation import validate_flaggems_whitelist
 
-        from vllm_fl.dispatch import get_default_manager
-        from vllm_fl.dispatch.policy import PolicyManager
-        from vllm_fl.runtime.model_policy import (
-            activate_runtime_plan,
-            build_model_runtime_plan,
-            preflight_runtime_plan,
-        )
+        whitelist = validate_flaggems_whitelist(whitelist)
 
-        policy_manager = PolicyManager.get_instance()
-        plan_defaults = (
-            requested_plan.moe_defaults if requested_plan is not None else None
-        )
-        # Resolve candidates under the policy the plan will actually run with
-        # (explicit user order > requested plan > platform fallback).  The
-        # pre-activation policy cannot distinguish an explicit order from a
-        # platform default, so checking against it could reject a valid plan.
-        final_policy = policy_manager.policy_for_plan(plan_defaults)
-
-        # Build the model's runtime plan once, after implementation
-        # registration and before model construction.  Pure: no environment
-        # write and no global mutation.
-        runtime_plan = build_model_runtime_plan(
-            self.vllm_config,
-            device_caps=_probe_device_capability(),
-            user_policy=final_policy,
-        )
-        self._runtime_plan = runtime_plan
-        preflight_runtime_plan(runtime_plan)
-
-        if requested_plan is not None:
-            with policy_manager.create_policy_context(runtime_plan.selection_policy):
-                validate_plan_capability(
-                    requested_plan,
-                    get_default_manager().resolve_candidates,
-                    policy_order_for=runtime_plan.selection_policy.get_per_op_order,
-                )
-
-        self._model_plan = activate_for_model(self.vllm_config)
-
-        # Publish the runtime selection.  ``set_global_policy`` activates the
-        # resolved SelectionPolicy and invalidates the dispatch epoch cache;
-        # the attention selector reads the active runtime plan.
-        activate_runtime_plan(runtime_plan)
-        policy_manager.set_global_policy(runtime_plan.selection_policy)
-
-        if fl_envs.USE_FLAGGEMS:
-            # Capture native CUDA aten::mm before FlagGems changes the CUDA
-            # registration. The common policy is opt-in; model integrations
-            # may supply a validated default in their own commit.
-            from vllm_fl.patches.flaggems_mm_shape_aware import (
-                capture_native_mm_kernel,
-                is_mm_dispatch_enabled,
-                is_shape_aware_mm_enabled,
-            )
-
-            shape_aware_mm_enabled = is_shape_aware_mm_enabled()
-
-            # Resolve policy before capturing native mm. An override is valid
-            # only when FlagGems retains ownership of aten::mm.
-            whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-            # Validate the explicit whitelist against the active plan's required
-            # ops using the same helper the dispatch registry filter uses, so
-            # the runtime enable step and the registered implementations cannot
-            # disagree.  An unset whitelist enables every op and is left as-is.
-            from vllm_fl.activation import validate_flaggems_whitelist
-
-            whitelist = validate_flaggems_whitelist(whitelist)
-            mm_dispatch_enabled = is_mm_dispatch_enabled(whitelist, blacklist)
-            native_mm_kernel = None
-            if shape_aware_mm_enabled and mm_dispatch_enabled:
-                native_mm_kernel = capture_native_mm_kernel()
-
+        def enable_flaggems(library):
             import flag_gems
 
-            # Only rank 0 records the oplist to avoid file truncation and
-            # interleaved writes when tensor-parallel-size > 1.
-            should_record = (rank == 0)
-
-            # Use whitelist if specified (takes precedence over blacklist)
-            if whitelist:
-                logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
-                flag_gems.only_enable(
-                    include=whitelist,
-                    record=should_record,
-                    once=True,
-                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                )
+            kwargs = dict(
+                record=rank == 0, once=True,
+                path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+            )
+            if library is not None:
+                kwargs["lib"] = library
+            if whitelist is not None:
+                flag_gems.only_enable(include=whitelist, **kwargs)
             elif blacklist:
-                logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
-                flag_gems.enable(
-                    unused=blacklist,
-                    record=should_record,
-                    once=True,
-                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-                )
+                flag_gems.enable(unused=blacklist, **kwargs)
             else:
-                logger.info("[FlagGems] Enable all ops")
-                flag_gems.enable(
-                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH
-                )
+                flag_gems.enable(**kwargs)
 
-            from vllm_fl.patches.flaggems_mm_shape_aware import apply_shape_aware_mm
-
-            if shape_aware_mm_enabled and not mm_dispatch_enabled:
-                logger.warning(
-                    "[FlagGems] Skip shape-aware aten.mm because mm is "
-                    "excluded by the active whitelist/blacklist"
-                )
-            elif shape_aware_mm_enabled:
-                apply_shape_aware_mm(native_mm_kernel=native_mm_kernel)
+        mm_status = configure_flaggems(
+            enable_flaggems,
+            use_flaggems=fl_envs.USE_FLAGGEMS,
+            whitelist=whitelist,
+            blacklist=blacklist,
+        )
+        logger.info(
+            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
+        )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator
@@ -1090,7 +995,7 @@ class WorkerFL(WorkerBase):
 
         return None
 
-    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
@@ -1183,7 +1088,7 @@ class WorkerFL(WorkerBase):
         self,
         old_ep_size: int,
         new_ep_size: int,
-        global_expert_loads: Optional[torch.Tensor],
+        global_expert_loads: torch.Tensor | None,
     ) -> None:
         from vllm.distributed.parallel_state import get_ep_group
 
@@ -1228,7 +1133,7 @@ class WorkerFL(WorkerBase):
 
     def _reconfigure_moe(
         self, old_ep_size: int, new_ep_size: int
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """
         Reconfigure MoE modules with provided reconfig_request
 
@@ -1378,8 +1283,8 @@ class WorkerFL(WorkerBase):
     def save_sharded_state(
         self,
         path: str,
-        pattern: Optional[str] = None,
-        max_size: Optional[int] = None,
+        pattern: str | None = None,
+        max_size: int | None = None,
     ) -> None:
         from vllm.model_executor.model_loader import ShardedStateLoader
 
@@ -1410,7 +1315,7 @@ class WorkerFL(WorkerBase):
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     local_rank: int = -1,
     backend: str = "nccl",
 ) -> None:

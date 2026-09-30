@@ -170,7 +170,8 @@ def _protect_patched_state(monkeypatch):
         monkeypatch.setattr(
             SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
         )
-    except Exception:
+    except (ImportError, AttributeError):
+        # Reduced vLLM builds may omit this optional activation class.
         pass
     from vllm import _custom_ops
 
