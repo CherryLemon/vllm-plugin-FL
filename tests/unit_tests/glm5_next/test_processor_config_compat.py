@@ -30,7 +30,11 @@ class _ImageProcessorStub:
         return {"pixel_values": "pixels", "image_grid_thw": "grid"}
 
 
-class _ProcessorCallHarness(Glm5NextProcessor):
+class _ProcessorCallHarness:
+    """A method harness; real HF initialization is covered separately."""
+
+    _call_with_resolved_kwargs = Glm5NextProcessor._call_with_resolved_kwargs
+
     def __init__(self) -> None:
         self.tokenizer = _TokenizerStub()
         self.image_processor = _ImageProcessorStub()
