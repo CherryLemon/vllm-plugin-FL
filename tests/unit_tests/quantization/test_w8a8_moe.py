@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import sys
+from importlib import import_module
 from types import SimpleNamespace
 
 from vllm_fl.quantization.w8a8 import moe as moe_adapter
@@ -110,7 +111,7 @@ def test_w8a8_moe_selector_uses_fl_experts_on_non_nvidia_oot(monkeypatch):
         lambda self: True,
     )
 
-    import vllm_fl.utils as fl_utils
+    fl_utils = import_module("vllm_fl.utils")
 
     monkeypatch.setattr(fl_utils, "is_oot_enabled", lambda: True)
     monkeypatch.setattr(fl_utils, "use_flaggems_op", lambda op_name: True)
@@ -158,7 +159,7 @@ def test_w8a8_moe_selector_uses_flaggems_on_nvidia(monkeypatch):
         lambda self: False,
     )
 
-    import vllm_fl.utils as fl_utils
+    fl_utils = import_module("vllm_fl.utils")
 
     monkeypatch.setattr(fl_utils, "is_oot_enabled", lambda: True)
     monkeypatch.setattr(
@@ -205,7 +206,7 @@ def test_w8a8_moe_selector_nvidia_policy_disable_uses_native_fallback(monkeypatc
         lambda **kwargs: kwargs,
     )
 
-    import vllm_fl.utils as fl_utils
+    fl_utils = import_module("vllm_fl.utils")
 
     monkeypatch.setattr(
         type(_active_platform()),
@@ -252,7 +253,7 @@ def test_w8a8_moe_selector_nvidia_noncanonical_falls_back_without_flaggems(
         lambda **kwargs: kwargs,
     )
 
-    import vllm_fl.utils as fl_utils
+    fl_utils = import_module("vllm_fl.utils")
 
     monkeypatch.setattr(
         type(_active_platform()),

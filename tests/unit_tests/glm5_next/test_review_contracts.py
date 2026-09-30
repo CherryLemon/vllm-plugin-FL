@@ -89,6 +89,7 @@ def test_grouped_scales_and_invalid_shape():
 def test_fresh_process_attention_dispatch_and_vision_import_isolation(provider):
     code = r"""
 from types import SimpleNamespace
+import re
 import pytest
 import vllm_fl
 vllm_fl.register_model()
@@ -120,11 +121,15 @@ for sparse in (False, True):
             PlatformFL.get_attn_backend_cls(None, selector)
 get_default_manager().clear_failed_impls("attention_backend")
 selector = SimpleNamespace(use_mla=False, use_sparse=False)
-if current_platform.is_cuda():
-    assert PlatformFL.get_attn_backend_cls(None, selector) == FlagGemsBackend().attention_backend()
-else:
-    with pytest.raises(RuntimeError, match="requires CUDA"):
+# Compare the public candidate's capability contract on the actual platform.
+# Some non-NVIDIA vendors provide this generic backend; others reject CUDA.
+try:
+    expected = FlagGemsBackend().attention_backend()
+except RuntimeError as error:
+    with pytest.raises(RuntimeError, match=re.escape(str(error))):
         PlatformFL.get_attn_backend_cls(None, selector)
+else:
+    assert PlatformFL.get_attn_backend_cls(None, selector) == expected
 
 import vllm.model_executor.layers.attention.mm_encoder_attention as mm
 import vllm.v1.attention.backends.fa_utils as fa
