@@ -1,5 +1,9 @@
 # Common worker follow-up, September 20, 2026
 
+> Historical H100 acceptance for the recorded wheel hashes below. The September 30
+> dispatch/lifetime changes require new commit-specific CI; these results do not
+> establish that the current PR passes all CI.
+
 This revision follows the review of PR544 `2d68733`. The shared metadata owner
 is also used by PR455, including its packed block-table arena. After PR442
 merged into main `71f6148`, this branch retains its fused multi-group kernel
@@ -15,9 +19,9 @@ relative to the previously tested `4e3540a`.
 initialization. The optional MM module owns captured handles and shape routing.
 Disabled/excluded MM does not parse the MM threshold. Observing successful
 FlagGems `lib=` registration establishes the callable and boxed handle; kernel
-repr and source-package paths no longer gate installation. The diagnostic
-registration-stack adapter is restricted to the tested Torch 2.11 family.
-Other builds have no verified repeated-initialization ownership check.
+repr and source-package paths no longer gate installation. The recorded wheel used a Torch 2.11 registration-stack adapter. Current code
+checks the available full dispatcher stack, including inactive registrations,
+through the shared dispatch binding; CPU lifetime regressions cover owner replacement.
 
 Metadata padding clears each group's logical width, not its row stride. These
 can differ when groups share packed storage. A graph/replay test protects

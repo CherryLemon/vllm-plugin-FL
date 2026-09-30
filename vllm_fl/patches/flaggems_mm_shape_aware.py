@@ -28,6 +28,10 @@ from typing import Any
 
 import torch
 
+from vllm_fl.dispatch.binding import OperatorBinding
+from vllm_fl.dispatch.manager import OpManager
+from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+
 logger = logging.getLogger(__name__)
 
 ENABLE_ENV = "VLLM_FL_FLAGOS_MM_SHAPE_AWARE"
@@ -229,12 +233,9 @@ def _register_override(library: Any, wrapper: Callable[..., Any]) -> None:
 
 
 def _registration_fingerprint() -> tuple[str, ...] | None:
-    # PyTorch 2.11 has no public kernel identity API. Restrict its diagnostic
-    # registration-stack adapter to the tested ABI; repr/source filenames are
-    # never implementation identity. Other builds can install through the
-    # public API, but repeated initialization cannot verify external ownership.
-    if torch.__version__.split("+", 1)[0].split(".")[:2] != ["2", "11"]:
-        return None
+    # Compare the complete active/inactive registration stack, never just
+    # source locations or repr(kernel). Vendor builds expose this API on more
+    # than one torch version; a version string must not disable ownership checks.
     return tuple(
         line
         for line in torch._C._dispatch_dump("aten::mm").splitlines()
@@ -285,9 +286,23 @@ def apply_shape_aware_mm(
     ):
         raise RuntimeError("CUDA mm changed after the observed FlagGems registration")
 
-    def shape_aware_mm(dispatch_keys, a, b):
-        target = native if _is_native_candidate(a, b, threshold) else gems
-        return target.call_boxed(dispatch_keys, a, b)
+    manager = OpManager(register_builtins=False)
+    manager.registry.register_many([
+        OpImpl("aten_mm", "vendor.cuda.retained_mm", BackendImplKind.VENDOR,
+               native.call_boxed, vendor="cuda", priority=100),
+        OpImpl("aten_mm", "default.flaggems.retained_mm", BackendImplKind.DEFAULT,
+               gems.call_boxed, priority=150),
+    ])
+    shape_aware_mm = OperatorBinding(
+        manager, "aten_mm",
+        supports={
+            "vendor.cuda.retained_mm": lambda keys, a, b: _is_native_candidate(a, b, threshold),
+        },
+        default_order=("vendor.cuda.retained_mm", "default.flaggems.retained_mm"),
+    )
+    # Resolve once before registration/capture; the common binding refreshes
+    # this cache if a public dispatch policy changes.
+    shape_aware_mm.preflight()
 
     library = torch.library.Library("aten", "IMPL")
     _register_override(library, shape_aware_mm)

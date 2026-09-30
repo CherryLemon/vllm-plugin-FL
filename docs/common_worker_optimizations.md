@@ -64,9 +64,9 @@ The active policy is immutable for the process lifetime. Repeated worker initial
 with identical settings checks the dispatcher registration and returns
 `already_active`, without running FlagGems registration again. Changing enable,
 threshold, USE_FLAGGEMS or backend selection requires a fresh process. External
-registration changes raise `conflicting_owner` on the tested PyTorch 2.11
-adapter. Other Torch builds can use the public installation APIs but have no
-verified repeated-initialization ownership check. Worker shutdown intentionally
+registration changes raise `conflicting_owner` when the complete dispatcher
+registration stack changes, including inactive registrations. The public boxed
+kernel and safe Library override APIs are still required at startup. Worker shutdown intentionally
 does not uninstall a process-wide kernel; the retained handles remain alive.
 A failed registration cannot be retried in the same process.
 
@@ -77,7 +77,7 @@ only after successful CUDA MM registration, after vendor and condition filtering
 Successful registration through this library establishes which callable and
 boxed handle were installed. Kernel repr strings and source-package paths are
 diagnostic only and never gate initialization. The registration-stack check
-is restricted to the PyTorch 2.11 adapter. Startup status records the selected
+uses the available dispatcher registration stack, including inactive owners. Startup status records the selected
 backends and routing threshold. Ownership checks happen at
 worker initialization, not on every MM invocation; external dispatcher mutation
 while a worker is running is unsupported.
@@ -87,7 +87,7 @@ capture/replay, and worker capture entry points. Numerical checks and performanc
 measurements for a particular model are separate requirements; these contracts
 do not imply that every model/platform/scheduling combination is validated.
 
-See [the recorded validation and reproduction commands](common_worker_validation.md)
+See [the recorded validation and reproduction commands](common_worker_review2.md)
 for the tested snapshot, installed-wheel checks, and scheduling limitations.
 
 ## Integration owner
