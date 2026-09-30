@@ -10,12 +10,16 @@ from vllm_fl.dispatch.types import BackendImplKind, OpImpl
 
 def make_binding(native, flaggems):
     manager = OpManager(register_builtins=False)
-    manager.registry.register_many([
-        OpImpl("test_mm", "native", BackendImplKind.VENDOR, native, vendor="cuda"),
-        OpImpl("test_mm", "flaggems", BackendImplKind.DEFAULT, flaggems),
-    ])
+    manager.registry.register_many(
+        [
+            OpImpl("test_mm", "native", BackendImplKind.VENDOR, native, vendor="cuda"),
+            OpImpl("test_mm", "flaggems", BackendImplKind.DEFAULT, flaggems),
+        ]
+    )
     return OperatorBinding(
-        manager, "test_mm", supports={"native": lambda rows: rows <= 2},
+        manager,
+        "test_mm",
+        supports={"native": lambda rows: rows <= 2},
         default_order=("native", "flaggems"),
     )
 
@@ -28,7 +32,9 @@ def test_shape_guard_does_not_disable_later_supported_shapes():
 
 def test_public_selection_and_vendor_exclusion_override_shape_default():
     binding = make_binding(lambda rows: "native", lambda rows: "flaggems")
-    with policy_context(SelectionPolicy.from_dict(per_op_order={"test_mm": ["flagos"]})):
+    with policy_context(
+        SelectionPolicy.from_dict(per_op_order={"test_mm": ["flagos"]})
+    ):
         assert binding(1) == "flaggems"
     with policy_context(SelectionPolicy.from_dict(deny_vendors={"cuda"})):
         assert binding(1) == "flaggems"
