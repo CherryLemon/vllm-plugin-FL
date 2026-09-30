@@ -60,7 +60,7 @@ def test_qsa_backend_owns_vendor_neutral_legacy_layout():
     )
 
 
-def test_unpack_legacy_vllm_024_cache_layout():
+def test_unpack_legacy_cache_layout():
     cache = torch.zeros(3, 2, 16, 2, 8)
     key, value = _unpack_qsa_kv_cache(cache, 8)
     assert key.shape == value.shape == (3, 16, 2, 8)
