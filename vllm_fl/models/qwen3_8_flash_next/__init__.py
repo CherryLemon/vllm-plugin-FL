@@ -4,22 +4,29 @@
 
 from typing import TYPE_CHECKING, Any
 
-from .common.hyperconnection import (
-    GatedResidualSimple,
-    GroupedGemmaRMSNorm,
-    HyperConnectionBase,
-    HyperConnectionConfig,
-)
-
 if TYPE_CHECKING:
+    from .common.hyperconnection import (
+        GatedResidualSimple,
+        GroupedGemmaRMSNorm,
+        HyperConnectionBase,
+        HyperConnectionConfig,
+    )
     from .gpu.model import (
         Qwen3_8FlashNextForCausalLM,
         Qwen3_8FlashNextForConditionalGeneration,
     )
     from .gpu.mtp import Qwen3_8FlashNextMTP
 
+    Qwen4ExpForCausalLM = Qwen3_8FlashNextForCausalLM
+    Qwen4ExpForConditionalGeneration = Qwen3_8FlashNextForConditionalGeneration
+    Qwen4ExpMTP = Qwen3_8FlashNextMTP
+
 
 def __getattr__(name: str) -> Any:
+    if name in {"GatedResidualSimple", "GroupedGemmaRMSNorm", "HyperConnectionBase", "HyperConnectionConfig"}:
+        from .common import hyperconnection
+
+        return getattr(hyperconnection, name)
     if name in {
         "Qwen3_8FlashNextForCausalLM",
         "Qwen3_8FlashNextForConditionalGeneration",

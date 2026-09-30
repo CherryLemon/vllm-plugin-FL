@@ -133,13 +133,11 @@ def test_native_candidate_boundary_dtype_and_stride():
     "scenario",
     ["reuse", "disable", "threshold", "backend", "external", "filtered"],
 )
-@pytest.mark.gpu
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.version.hip is not None
+    torch.version.hip is not None
     or not callable(getattr(torch.library, "get_kernel", None))
     or not torch._C._dispatch_has_kernel_for_dispatch_key("aten::mm", "CUDA"),
-    reason="Real CUDA dispatcher probe requires NVIDIA and SafeKernelFunction",
+    reason="CUDA registration probe requires a CUDA torch wheel and SafeKernelFunction",
 )
 def test_real_dispatcher_process_lifetime(monkeypatch, scenario):
     # Real Library and SafeKernelFunction, isolated so aten registrations never

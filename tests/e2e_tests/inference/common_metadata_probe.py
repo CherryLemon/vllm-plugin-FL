@@ -58,7 +58,7 @@ RUNTIME_MODULES = (
 
 
 def runtime_identity():
-    import vllm_fl
+    package = importlib.import_module("vllm_fl")
 
     files = {}
     for name in RUNTIME_MODULES:
@@ -74,7 +74,7 @@ def runtime_identity():
         except PackageNotFoundError:
             versions[package] = None
     return {
-        "package_path": str(Path(vllm_fl.__file__).resolve()),
+        "package_path": str(Path(package.__file__).resolve()),
         "files": files,
         "versions": versions,
     }

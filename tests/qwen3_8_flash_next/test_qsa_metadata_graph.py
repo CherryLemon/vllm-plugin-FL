@@ -17,7 +17,7 @@ def _load_qsa_ops():
     try:
         return importlib.import_module("vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa")
     except Exception as exc:
-        pytest.fail(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}")
+        raise AssertionError(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _reference(

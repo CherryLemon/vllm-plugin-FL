@@ -12,10 +12,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
-
 
 STATS_RE = re.compile(
     r"FlagGems ATen plan cache stats \(post-warmup\): "
@@ -106,7 +105,7 @@ def main() -> int:
     if result["status"] != "pass":
         print("plan-cache gate: FAIL")
         return 1
-    print("plan-cache gate: PASS " f"ranks={args.expected_ranks}")
+    print(f"plan-cache gate: PASS ranks={args.expected_ranks}")
     return 0
 
 

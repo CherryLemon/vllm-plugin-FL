@@ -5,11 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-# The reference package intentionally has model -> qsa -> model ownership.  Keep
-# the model import here so the test mirrors package registration instead of
-# importing qsa as a standalone leaf module.
 from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import QSAStateBackend
-from vllm_fl.models.qwen3_8_flash_next.gpu import model as _model  # noqa: F401
 from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import (
     Qwen3_8FlashNextQSAAttentionBackend,
     _unpack_qsa_kv_cache,

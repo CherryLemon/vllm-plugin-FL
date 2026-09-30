@@ -42,9 +42,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from ..common.qsa_cache import QSAForwardMetadata, QSAMetadataBuilder
-from . import model
 from .indexer_qsa import QSAIndexer
 from .nvidia_fast_paths import has_native_cache_update, native_cache_update
+from .quantization import without_modelopt_fp4
 
 
 def _prepared_qsa_token_to_req(
@@ -245,7 +245,7 @@ class Qwen3_8FlashNextQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
             bias=False,
-            quant_config=model.without_modelopt_fp4(quant_config),
+            quant_config=without_modelopt_fp4(quant_config),
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(

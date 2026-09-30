@@ -9,7 +9,6 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-
 METRICS = (
     "request_throughput",
     "output_throughput",

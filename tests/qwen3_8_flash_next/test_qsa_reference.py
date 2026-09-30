@@ -125,7 +125,7 @@ def _load_qsa_ops():
             "vllm_fl.models.qwen3_8_flash_next.gpu.ops.qsa"
         )
     except Exception as exc:  # target-GPU jobs must not hide import failures
-        pytest.fail(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}")
+        raise AssertionError(f"vLLM QSA plugin import failed: {type(exc).__name__}: {exc}") from exc
 
 
 @pytest.mark.gpu

@@ -187,12 +187,6 @@ def test_combine_norm_cuda_graph_replay_is_deterministic() -> None:
             rtol=3.0e-2,
             msg=f"norm iter {iteration}",
         )
-        if iteration == 0:
-            first_graph_out = graph_out.clone()
-        else:
-            # The input changes, so deterministic means repeat the same input
-            # once more and compare exact output, not compare different inputs.
-            pass
 
     residual.copy_(torch.full_like(residual, 0.125))
     block.copy_(torch.full_like(block, -0.25))
@@ -203,7 +197,6 @@ def test_combine_norm_cuda_graph_replay_is_deterministic() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(graph_out, repeat)
-    del first_graph_out
 
 
 def test_delayed_module_matches_eager_and_final_mixer() -> None:

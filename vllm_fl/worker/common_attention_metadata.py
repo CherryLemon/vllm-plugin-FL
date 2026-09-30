@@ -72,7 +72,7 @@ class _CommonAttentionMetadataLayout:
 
 
 @triton.jit
-def _load_ptr(ptr_to_ptr, elem_dtype):
+def _load_ptr(ptr_to_ptr, elem_dtype: tl.constexpr):
     ptr = tl.load(ptr_to_ptr)
     ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
     return tl.multiple_of(ptr, 16)

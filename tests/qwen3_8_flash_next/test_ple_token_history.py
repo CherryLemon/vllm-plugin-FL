@@ -270,7 +270,7 @@ def test_fixed_address_consumer_smoke_reads_updated_context_and_padding():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            output = h.context * 7
+            h.context.mul(7)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

@@ -39,7 +39,6 @@ try:
     )
 except ImportError:  # vLLM 0.24 type-only compatibility
     MambaStateCopyFuncsByType = dict
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -379,16 +378,6 @@ class _VLLM024StackedAutoWeightsLoader(AutoWeightsLoader):
                 )
             weight_loader(param, weight_data, shard_id)
             yield weight_qualname
-
-
-def without_modelopt_fp4(
-    quant_config: QuantizationConfig | None,
-) -> QuantizationConfig | None:
-    """Return ``None`` for weights excluded from Qwen3.8-Flash-Next ModelOpt-FP4."""
-
-    if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-        return None
-    return quant_config
 
 
 def _remap_qsa_cache_scale_name(

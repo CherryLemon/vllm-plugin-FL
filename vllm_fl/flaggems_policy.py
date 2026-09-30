@@ -12,12 +12,8 @@ unrelated model is a no-op.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
-
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,8 +27,8 @@ class FlagGemsModelPolicy:
     model-specific wording lives with the integration, not the worker.
     """
 
-    whitelist: Optional[list[str]] = None
-    blacklist: Optional[list[str]] = None
+    whitelist: list[str] | None = None
+    blacklist: list[str] | None = None
     skip_generic_aten: bool = False
     log_messages: tuple[str, ...] = field(default_factory=tuple)
 
@@ -40,7 +36,7 @@ class FlagGemsModelPolicy:
 # A provider receives the current (whitelist, blacklist) and returns either
 # ``None`` (not applicable) or a policy to merge into the chain.
 FlagGemsPolicyProvider = Callable[
-    ..., Optional[FlagGemsModelPolicy]
+    ..., FlagGemsModelPolicy | None
 ]
 
 _PROVIDERS: list[FlagGemsPolicyProvider] = []
@@ -68,11 +64,11 @@ def iter_flag_gems_policy_providers() -> tuple[FlagGemsPolicyProvider, ...]:
 
 def resolve_flag_gems_policy(
     vllm_config,
-    whitelist: Optional[list[str]],
-    blacklist: Optional[list[str]],
+    whitelist: list[str] | None,
+    blacklist: list[str] | None,
     *,
-    vendor_name: Optional[str] = None,
-    providers: Optional[tuple[FlagGemsPolicyProvider, ...]] = None,
+    vendor_name: str | None = None,
+    providers: tuple[FlagGemsPolicyProvider, ...] | None = None,
 ) -> FlagGemsModelPolicy:
     """Run the provider chain and return the merged model-scoped policy.
 

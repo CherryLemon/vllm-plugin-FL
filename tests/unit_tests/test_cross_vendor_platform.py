@@ -225,7 +225,7 @@ def test_rocm_quantization_source_precedes_cuda_alike(monkeypatch):
 
         from vllm_fl.quantization import quant_linear
     except (ImportError, ModuleNotFoundError) as exc:
-        pytest.skip(f"vLLM quantization dependencies unavailable: {exc}")
+        return pytest.skip(f"vLLM quantization dependencies unavailable: {exc}")
 
     monkeypatch.setattr(
         quant_linear,
@@ -244,7 +244,7 @@ def test_rocm_moe_priority_includes_aiter_and_triton(monkeypatch):
     try:
         from vllm_fl.ops.fused_moe import fused_moe_utils
     except (ImportError, ModuleNotFoundError) as exc:
-        pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
+        return pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
 
     monkeypatch.setattr(
         "vllm.platforms.current_platform",
@@ -268,7 +268,7 @@ def test_unknown_oot_moe_priority_falls_back_to_triton(monkeypatch):
     try:
         from vllm_fl.ops.fused_moe import fused_moe_utils
     except (ImportError, ModuleNotFoundError) as exc:
-        pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
+        return pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
 
     monkeypatch.setattr(
         "vllm.platforms.current_platform",

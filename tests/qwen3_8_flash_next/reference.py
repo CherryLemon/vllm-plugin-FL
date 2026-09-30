@@ -12,7 +12,6 @@ import math
 import torch
 import torch.nn.functional as F
 
-
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
@@ -188,10 +187,7 @@ def dilated_short_conv_reference(
         outputs.append(F.silu(y))
         if state_len:
             current_state = history[:, -state_len:]
-    if outputs:
-        output = torch.stack(outputs, dim=0)
-    else:
-        output = x.new_empty((0, hidden))
+    output = torch.stack(outputs, dim=0) if outputs else x.new_empty((0, hidden))
     return output, current_state
 
 

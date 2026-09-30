@@ -347,7 +347,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_state_indices_tensor = None
             spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
             non_spec_query_start_loc = None
-            non_spec_query_start_loc_cpu = None
         else:
             # Mixed batch: build a per-token group key consistent with the
             # request grouping above (spec=0 | decode=1 | prefill=2) and a

@@ -13,8 +13,9 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import sys
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 
@@ -114,10 +115,9 @@ def main() -> int:
         errors.append("FlagGems fused_moe.py hash mismatch; see the review2 dependency fix")
 
     bridge_text = ""
-    try:
+    # Optional dependency source may be absent in an installed wheel.
+    with suppress(OSError):
         bridge_text = bridge_file.read_text(encoding="utf-8")
-    except OSError:
-        pass
     for marker in (
         "VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE",
         "post-warmup",

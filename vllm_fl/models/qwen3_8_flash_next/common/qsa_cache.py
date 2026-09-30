@@ -458,7 +458,8 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
-    def forward(self) -> None: ...
+    def forward(self) -> None:
+        return None
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         """Bind storage on both legacy direct-assign and newer hook runtimes."""

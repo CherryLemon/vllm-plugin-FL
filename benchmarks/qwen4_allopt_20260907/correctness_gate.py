@@ -7,9 +7,9 @@ import argparse
 import hashlib
 import json
 import os
-from typing import Any
 import urllib.error
 import urllib.request
+from typing import Any
 
 
 def request_json(url: str, payload: dict[str, Any] | None = None) -> tuple[int, bytes]:

@@ -12,7 +12,7 @@ def _import_fused_moe_utils():
     try:
         from vllm_fl.ops.fused_moe import fused_moe_utils
     except (ImportError, ModuleNotFoundError) as exc:
-        pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
+        return pytest.skip(f"vLLM MoE dependencies unavailable: {exc}")
     return fused_moe_utils
 
 
@@ -209,7 +209,7 @@ def test_fused_moe_factory_obeys_oot_policy(
         from vllm_fl import utils
         from vllm_fl.ops import custom_ops
     except (ImportError, ModuleNotFoundError) as exc:
-        pytest.skip(f"vLLM OOT dependencies unavailable: {exc}")
+        return pytest.skip(f"vLLM OOT dependencies unavailable: {exc}")
 
     patch_factory = Mock()
     patch_oracle = Mock()
