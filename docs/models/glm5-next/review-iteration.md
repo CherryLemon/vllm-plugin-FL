@@ -209,3 +209,13 @@ refactor; the earlier accelerator results remain tied to their recorded commits.
 FULL-graph compatibility checks for reference/fallback bindings remain follow-up
 work. The restricted deployment above still does not qualify the broader default
 FlagGems configuration or portable whole-model execution.
+
+The September 30 CI exposed unsupported native E4M3FN conversion/MMA on
+A100 and vendor targets. Cache writers now encode the same E4M3FN bytes
+without native FP8 instructions. The existing paged-MQA binding retains native
+FP8 MMA on NVIDIA SM89+; other targets decode exactly to BF16 before MMA.
+Bytewise cache references, decode/prefill parity and changing-input graph
+assertions remain intact. New codec checks cover every rounding boundary,
+finite BF16 inputs and all 256 storage bytes. Interpreter and offline compiler
+checks do not establish GPU numerical, performance or whole-model acceptance;
+those require results for the final commit on the corresponding hardware.

@@ -9,8 +9,8 @@ backend-neutral PyTorch implementations in this module.
 from __future__ import annotations
 
 import importlib
-from functools import cached_property
-from typing import Callable
+from collections.abc import Callable
+from functools import cache, cached_property
 
 import torch
 
@@ -23,6 +23,16 @@ from .provider import use_nvidia_reference
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+
+@cache
+def _has_native_e4m3_mma(device_index):
+    # Resolve static compiler capability during warmup, never from tensor data.
+    # CUDA-compatible vendor APIs do not imply NVIDIA FP8 MMA support.
+    if not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability(device_index)
+    return capability is not None and (capability.major, capability.minor) >= (8, 9)
 
 
 def _graph_safe_flaggems_paged_mqa_logits(
@@ -130,6 +140,7 @@ def _graph_safe_flaggems_paged_mqa_logits(
         BLOCK_KV=block_kv,
         BLOCK_D=128,
         NUM_BLOCKS=num_blocks,
+        NATIVE_FP8=_has_native_e4m3_mma(q_values.device.index or 0),
     )
     return logits
 

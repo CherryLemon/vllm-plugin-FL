@@ -15,10 +15,13 @@
 """FlagGems paged MQA adapted to read interleaved pages without repacking.
 
 Derived from FlagGems fp8_fp4_paged_mqa_logits.py; see PROVENANCE.md.
-Only the page/scale addressing differs from the FP8 tensor-core computation.
+Native FP8 MMA keeps that computation. Other targets exactly decode E4M3FN
+bytes to BF16 before MMA, preserving the page format and scale addressing.
 """
 
-from vllm.triton_utils import triton, tl
+from vllm.triton_utils import tl, triton
+
+from .fp8_storage import decode_e4m3fn
 
 
 @triton.jit
@@ -45,6 +48,7 @@ def _paged_mqa_logits_kernel(
     BLOCK_KV: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    NATIVE_FP8: tl.constexpr,
 ):
     """Per-tile kernel: each program processes one BLOCK_KV tile for one row."""
     kv_block = tl.program_id(0)
@@ -69,7 +73,11 @@ def _paged_mqa_logits_kernel(
     # Pre-load Q as FP8: [num_heads, head_dim]
     q_offsets = h_ids[:, None] * head_dim + d_ids[None, :]
     q_u8 = tl.load(q_row_base + q_offsets)
-    q_fp8 = q_u8.to(tl.float8e4nv, bitcast=True)
+    if NATIVE_FP8:
+        q_values = q_u8.to(tl.float8e4nv, bitcast=True)
+    else:
+        # Every finite E4M3FN value is exactly representable in BF16.
+        q_values = decode_e4m3fn(q_u8).to(tl.bfloat16)
 
     # Pre-load weights: [num_heads] float32
     w_all = tl.load(w_row_base + tl.arange(0, num_heads))
@@ -92,10 +100,13 @@ def _paged_mqa_logits_kernel(
             # Coalesced KV load: [block_size, head_dim] as FP8
             kv_offsets = p_ids[:, None] * head_dim + d_ids[None, :]
             kv_u8 = tl.load(page_base + kv_offsets)
-            kv_fp8 = kv_u8.to(tl.float8e4nv, bitcast=True)
+            if NATIVE_FP8:
+                kv_values = kv_u8.to(tl.float8e4nv, bitcast=True)
+            else:
+                kv_values = decode_e4m3fn(kv_u8).to(tl.bfloat16)
 
             # Tensor-core MMA: Q[H, D] @ KV[block_size, D]^T -> [H, block_size]
-            dots = tl.dot(q_fp8, tl.trans(kv_fp8))
+            dots = tl.dot(q_values, tl.trans(kv_values))
 
             # Coalesced scale load: [block_size] float32
             scale_tile = tl.load(
