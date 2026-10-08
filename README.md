@@ -197,7 +197,7 @@ pip install --no-build-isolation '.[hy4]'
 
 The extra pins the public MLA query concatenation API and TLE capability checks
 from [FlagGems-vllm #897](https://github.com/flagos-ai/FlagGems-vllm/pull/897) to
-commit `9abced038ce03bed2967480935212956d7600b96`. Sparse indexer, cache and attention
+commit `e24933fc80dcd6ba2d687f6b4fceeb87a94483fa`. Sparse indexer, cache and attention
 replacements also use `flaggems_vllm`; query quantization uses general FlagGems.
 Runtime selection checks callable APIs, device kernels and the shared dispatch
 policy before allocating model weights. A selected operator's execution error
