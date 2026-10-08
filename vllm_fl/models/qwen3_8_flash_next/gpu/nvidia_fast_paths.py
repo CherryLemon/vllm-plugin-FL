@@ -30,27 +30,6 @@ def is_nvidia_platform() -> bool:
         return False
 
 
-def qsa_sparse_triton_launch_config(
-    device: torch.device,
-) -> tuple[int, int, int]:
-    """Return the measured sparse-QSA config, guarded by GPU architecture.
-
-    ``(64, 8, 3)`` is validated on SM90 H100/H200 shapes.  Every other
-    NVIDIA architecture and every non-NVIDIA accelerator keeps the original
-    conservative Triton configuration until it has its own benchmark.
-    """
-
-    if not is_nvidia_platform() or device.type != "cuda":
-        return 16, 4, 2
-    try:
-        if torch.cuda.get_device_capability(device) == (9, 0):
-            return 64, 8, 3
-    except (AssertionError, RuntimeError):
-        # No usable capability query: retain the conservative launch config.
-        pass
-    return 16, 4, 2
-
-
 def _has_cuda_kernel(qualified_op: str) -> bool:
     if not is_nvidia_platform():
         return False
@@ -219,5 +198,4 @@ __all__ = [
     "is_nvidia_platform",
     "native_cache_update",
     "native_topk",
-    "qsa_sparse_triton_launch_config",
 ]

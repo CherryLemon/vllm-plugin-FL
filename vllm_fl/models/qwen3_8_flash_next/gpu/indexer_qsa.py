@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, cast
 
 import torch
@@ -23,8 +22,6 @@ from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
 )
 from .nvidia_fast_paths import fast_gemma_rmsnorm, fast_qsa_rope
-
-_QSA_FUSED_COMPRESS_ENABLED = os.environ.get("QWEN4_QSA_FUSED_COMPRESS", "1") != "0"
 
 
 def apply_qsa_rope(
@@ -228,8 +225,7 @@ class QSAIndexer(nn.Module):
         section = getattr(self.rotary_emb, "mrope_section", None)
         section = (rotary_dim // 2, 0, 0) if section is None else tuple(section)
         if (
-            _QSA_FUSED_COMPRESS_ENABLED
-            and self.index_head_dim == 128
+            self.index_head_dim == 128
             and rotary_dim == 64
             and bool(getattr(self.rotary_emb, "is_neox_style", False))
             and len(section) == 3

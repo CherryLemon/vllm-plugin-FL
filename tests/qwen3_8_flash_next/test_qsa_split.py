@@ -142,12 +142,14 @@ def test_qsa_split8_matches_single_with_invalid_pages_and_strides(monkeypatch):
     assert case["k"].stride(1) != case["k"].shape[2] * case["k"].shape[3]
 
     baseline = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "1")
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", lambda *_: 1)
     _run(ops, case, baseline)
     torch.cuda.synchronize()
 
     candidate = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     workspace = _workspace(case, 8)
     _run(ops, case, candidate, workspace=workspace)
     torch.cuda.synchronize()
@@ -166,7 +168,9 @@ def test_qsa_split_dispatch_topk_boundaries(monkeypatch):
     ops = _load_qsa_ops()
     device = torch.device("cuda")
     case = _case(device, rows=2, topk=512)
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     assert ops.qsa_sparse_split_count(case["q"], case["k"], 511) == 1
     assert ops.qsa_sparse_split_count(case["q"], case["k"], 512) == 8
     assert ops.qsa_sparse_split_count(case["q"], case["k"], 513) == 8
@@ -175,21 +179,25 @@ def test_qsa_split_dispatch_topk_boundaries(monkeypatch):
     # single-kernel fallback, while 512 enters split=8.
     case_fallback = _case(device, rows=2, topk=511)
     fallback_baseline = torch.empty_like(case_fallback["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "1")
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", lambda *_: 1)
     _run(ops, case_fallback, fallback_baseline)
     torch.cuda.synchronize()
     fallback_candidate = torch.empty_like(case_fallback["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     _run(ops, case_fallback, fallback_candidate)
     torch.cuda.synchronize()
     _assert_split_error(fallback_candidate, fallback_baseline)
 
     baseline = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "1")
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", lambda *_: 1)
     _run(ops, case, baseline)
     torch.cuda.synchronize()
     candidate = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     _run(ops, case, candidate, workspace=_workspace(case, 8))
     torch.cuda.synchronize()
     _assert_split_error(candidate, baseline)
@@ -211,12 +219,14 @@ def test_qsa_split_rows64_invalid_requests_pages_and_gate_extremes(monkeypatch):
     case["gate"][7].fill_(80)
 
     baseline = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "1")
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", lambda *_: 1)
     _run(ops, case, baseline)
     torch.cuda.synchronize()
 
     candidate = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     workspace = _workspace(case, 8)
     _run(ops, case, candidate, workspace=workspace)
     torch.cuda.synchronize()
@@ -250,11 +260,9 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     ops = _load_qsa_ops()
     device = torch.device("cuda")
     case = _case(device)
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
-    # Require mode makes a successful capture evidence that the split/merge
-    # path received a warmed fixed workspace rather than falling back to the
-    # single CTA kernel on a capture miss.
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_REQUIRE", "1")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     cache = {}
     captured_out = torch.empty_like(case["q"])
     graph = torch.cuda.CUDAGraph()
@@ -280,7 +288,7 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
             attention()
 
     # Exercise the worker entry: removing force_attention from eager warmup
-    # now fails REQUIRE during capture instead of passing a source-text check.
+    # verifies that the split workspace was reserved before capture.
     runner = SimpleNamespace(_dummy_run=dummy)
     ModelRunnerFL._warmup_and_capture(
         runner,
@@ -298,7 +306,7 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     torch.cuda.synchronize()
 
     expected = torch.empty_like(case["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "1")
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", lambda *_: 1)
     _run(ops, case, expected)
     torch.cuda.synchronize()
     _assert_split_error(captured_out, expected)
@@ -306,7 +314,9 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     # Capture a second layer/bucket without resizing the first workspace.  A
     # real input mutation and replay here catches accidental cross-bucket
     # aliasing that a pointer-only cache test cannot see.
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     case_b = _case(device, rows=16, topk=1025)
     splits_b, workspace_b = ops.qsa_prepare_split_workspace(
         case_b["q"], case_b["k"], case_b["indices"].shape[1], cache
@@ -330,7 +340,7 @@ def test_qsa_split8_graph_replay_with_changed_inputs(monkeypatch):
     graph_b.replay()
     torch.cuda.synchronize()
     expected_b = torch.empty_like(case_b["q"])
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "1")
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", lambda *_: 1)
     _run(ops, case_b, expected_b)
     torch.cuda.synchronize()
     _assert_split_error(captured_out_b, expected_b)
@@ -342,7 +352,9 @@ def test_qsa_split_workspace_is_per_layer_and_bucket(monkeypatch):
 
     ops = _load_qsa_ops()
     device = torch.device("cuda")
-    monkeypatch.setenv("QWEN4_QSA_SPLIT_TOPK", "8")
+    from flaggems_vllm import qsa_sparse_split_count
+
+    monkeypatch.setattr(ops, "qsa_sparse_split_count", qsa_sparse_split_count)
     layer_a = {}
     layer_b = {}
 

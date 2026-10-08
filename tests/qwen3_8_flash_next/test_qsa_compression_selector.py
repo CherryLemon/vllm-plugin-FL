@@ -10,18 +10,14 @@ from vllm_fl.models.qwen3_8_flash_next.gpu.ops import qsa
 
 
 @pytest.mark.parametrize(
-    "enabled,dim,neox,fused",
+    "dim,neox,fused",
     [
-        (True, 128, True, True),
-        (False, 128, True, False),
-        (True, 64, True, False),
-        (True, 128, False, False),
+        (128, True, True),
+        (64, True, False),
+        (128, False, False),
     ],
 )
-def test_compression_selector_matches_supported_layout(
-    monkeypatch, enabled, dim, neox, fused
-):
-    monkeypatch.setattr(indexer_qsa, "_QSA_FUSED_COMPRESS_ENABLED", enabled)
+def test_compression_selector_matches_supported_layout(dim, neox, fused):
     instance = indexer_qsa.QSAIndexer.__new__(indexer_qsa.QSAIndexer)
     instance.index_head_dim = dim
     instance.select_all_tokens = False

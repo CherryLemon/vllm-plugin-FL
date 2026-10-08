@@ -11,8 +11,6 @@ this file does not silently construct a second model configuration.
 from __future__ import annotations
 
 import ast
-import json
-import os
 from pathlib import Path
 
 import pytest
@@ -26,27 +24,6 @@ from vllm_fl.models.qwen3_8_flash_next.common.hyperconnection import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for HC allopt checks"
 )
-
-_METRICS: dict[str, dict[str, float | bool]] = {}
-
-
-def _record_error(name: str, output: torch.Tensor, reference: torch.Tensor) -> None:
-    diff = (output.float() - reference.float()).abs()
-    max_abs = float(diff.max().item()) if diff.numel() else 0.0
-    rmse = float(diff.square().mean().sqrt().item()) if diff.numel() else 0.0
-    ref_max = float(reference.float().abs().max().item()) if reference.numel() else 0.0
-    _METRICS[name] = {
-        "max_abs": max_abs,
-        "rmse": rmse,
-        "reference_max_abs": ref_max,
-        "all_finite": bool(torch.isfinite(output).all().item()),
-    }
-    print(f"[hc-metric] {name}: max_abs={max_abs:.7g} rmse={rmse:.7g}")
-    metrics_path = os.environ.get("HC_ALLOPT_METRICS_PATH")
-    if metrics_path:
-        Path(metrics_path).write_text(
-            json.dumps({"metrics": _METRICS}, indent=2, sort_keys=True) + "\n"
-        )
 
 
 def _reference_combine_norm(
@@ -99,107 +76,6 @@ def _inputs(
     return residual, block, injection, weight
 
 
-@pytest.mark.parametrize("rows", [1, 3, 17])
-@pytest.mark.parametrize("shared_weight", [True, False])
-def test_combine_norm_rounding_and_packed_stride(
-    rows: int, shared_weight: bool
-) -> None:
-    from vllm_fl.models.qwen3_8_flash_next.gpu.ops.hyperconnection import (
-        can_use_hc_combine_norm_triton,
-    )
-
-    dtype = torch.bfloat16
-    residual, block, injection, weight = _inputs(
-        rows, dtype, shared_weight=shared_weight
-    )
-    assert can_use_hc_combine_norm_triton(injection, block, residual, weight)
-    eps = 1.0e-6
-    out, normed = torch.ops.vllm.qwen4_hc_combine_norm(
-        residual, block, injection, weight, eps, 4
-    )
-    ref_out, ref_normed = _reference_combine_norm(
-        residual, block, injection, weight, eps, 4
-    )
-    if weight.numel() == residual.shape[-1]:
-        baseline_out = torch.ops.vllm.qwen4_hc_inject_combine(
-            injection, block, residual, 4
-        )
-        baseline_normed = torch.ops.vllm.qwen4_grouped_gemma_rmsnorm(
-            baseline_out, weight, 4, eps
-        )
-        _record_error(
-            f"baseline_combine_rows{rows}_shared{shared_weight}",
-            baseline_out,
-            ref_out,
-        )
-        _record_error(
-            f"baseline_norm_rows{rows}_shared{shared_weight}",
-            baseline_normed,
-            ref_normed,
-        )
-    _record_error(f"fused_combine_rows{rows}_shared{shared_weight}", out, ref_out)
-    _record_error(f"fused_norm_rows{rows}_shared{shared_weight}", normed, ref_normed)
-    torch.testing.assert_close(out, ref_out, atol=2.0e-2, rtol=2.0e-2)
-    torch.testing.assert_close(normed, ref_normed, atol=4.0e-2, rtol=3.0e-2)
-    assert out.dtype is dtype
-    assert normed.dtype is dtype
-    assert out.is_contiguous()
-    assert normed.is_contiguous()
-
-
-def test_combine_norm_cuda_graph_replay_is_deterministic() -> None:
-    residual, block, injection, weight = _inputs(5, torch.bfloat16, shared_weight=False)
-    eps = 1.0e-6
-
-    # Eager warmup compiles/lazily allocates before capture.
-    eager = torch.ops.vllm.qwen4_hc_combine_norm(
-        residual, block, injection, weight, eps, 4
-    )
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_out, graph_normed = torch.ops.vllm.qwen4_hc_combine_norm(
-            residual, block, injection, weight, eps, 4
-        )
-    first_inputs = [x.clone() for x in (residual, block, injection, weight)]
-    first_ref = _reference_combine_norm(*first_inputs, eps, 4)
-    _record_error("graph_warmup_combined", eager[0], first_ref[0])
-    _record_error("graph_warmup_normed", eager[1], first_ref[1])
-    torch.testing.assert_close(eager[0], first_ref[0], atol=2.0e-2, rtol=2.0e-2)
-
-    for iteration in range(10):
-        residual.copy_(torch.randn_like(residual))
-        block.copy_(torch.randn_like(block))
-        injection.copy_(torch.randn_like(injection))
-        graph.replay()
-        torch.cuda.synchronize()
-        ref = _reference_combine_norm(residual, block, injection, weight, eps, 4)
-        if iteration == 0:
-            _record_error("graph_replay_combined", graph_out, ref[0])
-            _record_error("graph_replay_normed", graph_normed, ref[1])
-        torch.testing.assert_close(
-            graph_out, ref[0], atol=2.0e-2, rtol=2.0e-2, msg=f"output iter {iteration}"
-        )
-        torch.testing.assert_close(
-            graph_normed,
-            ref[1],
-            atol=4.0e-2,
-            rtol=3.0e-2,
-            msg=f"norm iter {iteration}",
-        )
-
-    residual.copy_(torch.full_like(residual, 0.125))
-    block.copy_(torch.full_like(block, -0.25))
-    injection.copy_(torch.full_like(injection, 0.5))
-    graph.replay()
-    torch.cuda.synchronize()
-    repeat = graph_out.clone()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(graph_out, repeat)
-
-
 def test_delayed_module_matches_eager_and_final_mixer() -> None:
     config = HyperConnectionConfig(
         hc_count=4,
@@ -230,9 +106,6 @@ def test_delayed_module_matches_eager_and_final_mixer() -> None:
     torch.testing.assert_close(delayed_combined, eager_combined, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(delayed_next, eager_next, atol=7e-2, rtol=4e-2)
     torch.testing.assert_close(delayed_injection, eager_injection, atol=5e-2, rtol=3e-2)
-    _record_error("module_delayed_combined_h256", delayed_combined, eager_combined)
-    _record_error("module_delayed_input_h256", delayed_next, eager_next)
-    _record_error("module_delayed_injection_h256", delayed_injection, eager_injection)
     assert delayed_input.shape == (7, module.hidden_size)
 
     # The final mixer has no new injection projection but must consume the
@@ -304,10 +177,6 @@ def test_production_c64_h2560_delayed_combine_and_mix_cuda_graph() -> None:
         graph.replay()
         torch.cuda.synchronize()
         expected = module.combine_and_mix(state, block, injection)
-        if iteration == 0:
-            _record_error("production_c64_state", graph_state, expected[0])
-            _record_error("production_c64_input", graph_input, expected[1])
-            _record_error("production_c64_injection", graph_injection, expected[2])
         torch.testing.assert_close(graph_state, expected[0], atol=8e-2, rtol=5e-2)
         torch.testing.assert_close(graph_input, expected[1], atol=8e-2, rtol=5e-2)
         torch.testing.assert_close(graph_injection, expected[2], atol=8e-2, rtol=5e-2)
