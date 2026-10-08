@@ -570,7 +570,7 @@ class QSACompressedKeyCache(_QSAStateCache):
 
 # Register QSA side caches as KV-cache owners so the common model runner can
 # invoke their bind hook without matching on this module's name.
-from vllm_fl.compat.vllm024.kv_cache import register_kv_cache_owner
+from vllm_fl.compat.kv_cache import register_kv_cache_owner
 
 register_kv_cache_owner(_QSAStateCache)
 

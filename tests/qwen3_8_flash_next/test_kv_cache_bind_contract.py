@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""C6: vLLM 0.24 KV binding must call the cache-owner hook exactly once, after
-the upstream bind, and identify owners by registration rather than module name."""
+"""Bind cache-owner views once, according to the upstream helper's behavior."""
 
 import pytest
 import torch
 
 import vllm_fl.worker.model_runner as mr
-from vllm_fl.compat.vllm024 import kv_cache as kv_bind
+from vllm_fl.compat import kv_cache as kv_bind
 from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import QSAKeyStateCache
 
 
@@ -59,7 +58,7 @@ def _noop_upstream(monkeypatch, *, mutates=True):
     import vllm.v1.worker.utils as vllm_utils
 
     monkeypatch.setattr(vllm_utils, "bind_kv_cache", fake)
-    monkeypatch.setattr(kv_bind, "resolve_kv_bind_abi", lambda: False)
+    monkeypatch.setattr(kv_bind, "upstream_binds_kv_cache_owners", lambda: False)
     return calls
 
 
@@ -77,18 +76,45 @@ def test_owner_hook_called_once_after_upstream(monkeypatch):
 
 def test_unregistered_layer_is_not_called(monkeypatch):
     _noop_upstream(monkeypatch)
+    monkeypatch.setattr(
+        kv_bind,
+        "upstream_binds_kv_cache_owners",
+        lambda: pytest.fail("ordinary attention should not probe owner hooks"),
+    )
     unregistered = _UnregisteredOwner()
     kv_caches = {"qsa": torch.zeros(1)}
     kv_bind.bind_kv_cache(kv_caches, {"qsa": unregistered}, [], 1)
     assert unregistered.bound == []
 
 
-def test_native_upstream_hook_is_not_duplicated(monkeypatch):
-    _noop_upstream(monkeypatch)
-    monkeypatch.setattr(kv_bind, "resolve_kv_bind_abi", lambda: True)
-    owner = _Owner()
-    kv_bind.bind_kv_cache({"qsa": torch.zeros(1)}, {"qsa": owner}, [], 1)
-    assert owner.bound == []
+@pytest.mark.parametrize("calls_hook", [False, True])
+def test_behavior_probe_and_binding_call_owner_once(monkeypatch, calls_hook):
+    import vllm.v1.worker.utils as vllm_utils
+
+    calls = []
+
+    def upstream(caches, context, runner, num_attn_module=1):
+        calls.append(list(caches))
+        for name, cache in caches.items():
+            layer = context[name]
+            if calls_hook:
+                layer.bind_kv_cache(cache)
+            else:
+                layer.kv_cache = cache
+            runner.append(cache)
+
+    monkeypatch.setattr(vllm_utils, "bind_kv_cache", upstream)
+    kv_bind.upstream_binds_kv_cache_owners.cache_clear()
+    try:
+        owner = _Owner()
+        cache = torch.zeros(1)
+        kv_bind.bind_kv_cache({"qsa": cache}, {"qsa": owner}, [])
+        kv_bind.bind_kv_cache({"qsa": cache}, {"qsa": owner}, [])
+        assert owner.bound == [cache, cache]
+        # One behavior probe for the process, then one upstream bind per call.
+        assert len(calls) == 3
+    finally:
+        kv_bind.upstream_binds_kv_cache_owners.cache_clear()
 
 
 def test_validation_failure_leaves_no_mutation(monkeypatch):
@@ -202,15 +228,15 @@ def test_rebind_replaces_typed_views():
     assert obj.rope_position_cache.storage_offset() == obj.rope_position_offset // 4
 
 
-def test_unknown_abi_fails_before_upstream_bind(monkeypatch):
+def test_probe_failure_propagates_before_upstream_bind(monkeypatch):
     calls = _noop_upstream(monkeypatch)
 
-    def fail_abi():
-        raise RuntimeError("Unverified ABI")
+    def fail_probe():
+        raise RuntimeError("upstream probe failed")
 
-    monkeypatch.setattr(kv_bind, "resolve_kv_bind_abi", fail_abi)
+    monkeypatch.setattr(kv_bind, "upstream_binds_kv_cache_owners", fail_probe)
     owner = _Owner()
-    with pytest.raises(RuntimeError, match="Unverified ABI"):
+    with pytest.raises(RuntimeError, match="upstream probe failed"):
         kv_bind.bind_kv_cache({"qsa": torch.zeros(1)}, {"qsa": owner}, [])
     assert calls == []
     assert owner.bound == []

@@ -1,2 +1,2 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Version-adapted compatibility helpers for specific vLLM ABIs."""
+"""Patches selected by the installed framework's behavior and APIs."""

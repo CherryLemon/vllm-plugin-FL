@@ -255,8 +255,6 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        from vllm_fl.flaggems_runtime import configure_flaggems
-
         from vllm_fl.flaggems_policy import resolve_flag_gems_policy
         from vllm_fl.patches.flaggems_aten_plan_cache import apply_flaggems_aten_plan_cache
 
@@ -271,31 +269,19 @@ class WorkerFL(WorkerBase):
         for message in model_policy.log_messages:
             logger.info(message)
 
-        def enable_flaggems(library):
+        if fl_envs.USE_FLAGGEMS and not model_policy.skip_generic_aten:
             import flag_gems
 
             kwargs = dict(
                 record=rank == 0, once=True,
                 path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
             )
-            if library is not None:
-                kwargs["lib"] = library
             if whitelist is not None:
                 flag_gems.only_enable(include=whitelist, **kwargs)
             elif blacklist:
                 flag_gems.enable(unused=blacklist, **kwargs)
             else:
                 flag_gems.enable(**kwargs)
-
-        mm_status = configure_flaggems(
-            enable_flaggems,
-            use_flaggems=fl_envs.USE_FLAGGEMS and not model_policy.skip_generic_aten,
-            whitelist=whitelist,
-            blacklist=blacklist,
-        )
-        logger.info(
-            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
-        )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator
@@ -902,19 +888,6 @@ class WorkerFL(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
-        # Emit one aggregate observation after model warmup/capture. This is
-        # deliberately outside the request path and proves that an explicitly
-        # enabled FlagGems plan cache is installed and receiving real hits.
-        if fl_envs.USE_FLAGGEMS and (
-            self.rank == 0
-            or os.getenv("VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE", "0") == "1"
-        ):
-            from vllm_fl.patches.flaggems_aten_plan_cache import (
-                log_flaggems_aten_plan_cache_stats,
-            )
-
-            log_flaggems_aten_plan_cache_stats("post-warmup")
-
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
@@ -1338,20 +1311,6 @@ class WorkerFL(WorkerBase):
         )
 
     def shutdown(self) -> None:
-        if (
-            fl_envs.USE_FLAGGEMS
-            and os.getenv("VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE_REQUIRE", "0") == "1"
-        ):
-            # This boundary has no request-path overhead. Keep shutdown safe
-            # even when it follows an unrelated initialization failure.
-            try:
-                from vllm_fl.patches.flaggems_aten_plan_cache import (
-                    log_flaggems_aten_plan_cache_stats,
-                )
-
-                log_flaggems_aten_plan_cache_stats("pre-shutdown")
-            except Exception as error:
-                logger.warning("Could not report final plan-cache stats: %s", error)
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if self.profiler is not None:

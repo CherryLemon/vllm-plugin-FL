@@ -11,7 +11,6 @@ Decode and speculative-decode keep using the existing implementation.
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 
@@ -19,25 +18,7 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in ("0", "false", "no", "off")
-
-
-def _env_nonnegative_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return max(0, int(value))
-    except ValueError:
-        return default
-
-
-PLE_FUSION_ENABLED = _env_flag("VLLM_FL_PLE_FUSION", True)
-PLE_FUSION_MIN_TOKENS = _env_nonnegative_int("VLLM_FL_PLE_FUSION_MIN_TOKENS", 1024)
+PLE_FUSION_MIN_TOKENS = 1024
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
@@ -377,7 +358,7 @@ def can_use_ple_gate_norm_triton(
     """Return whether the contiguous inference gate/norm path is supported."""
 
     tensors = (key, query, value, key_weight, query_weight, conv_weight)
-    if not PLE_FUSION_ENABLED or not HAS_TRITON or hc_count <= 0:
+    if not HAS_TRITON or hc_count <= 0:
         return False
     if key.ndim != 3 or query.shape != key.shape:
         return False
@@ -516,7 +497,7 @@ def can_use_ple_prefill_conv_triton(
 ) -> bool:
     """Return whether PLE prefill can bypass pack/layout/native conv ops."""
 
-    if not PLE_FUSION_ENABLED or not HAS_TRITON:
+    if not HAS_TRITON:
         return False
     if (
         x.ndim != 2
@@ -690,7 +671,6 @@ direct_register_custom_op(
 
 
 __all__ = [
-    "PLE_FUSION_ENABLED",
     "PLE_FUSION_MIN_TOKENS",
     "can_use_ple_gate_norm_triton",
     "can_use_ple_prefill_conv_triton",

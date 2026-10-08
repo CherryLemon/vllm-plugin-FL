@@ -302,10 +302,8 @@ def should_skip_generic_flaggems_aten(
         vendor_name == "nvidia"
         and whitelist is None
         and needs_native_index_select(vllm_config)
-        and os.getenv(
-            "VLLM_FL_FLAGGEMS_ATEN_PLAN_CACHE",
-            os.getenv("FLAGGEMS_ATEN_PLAN_CACHE", "0"),
-        ).strip().lower() in {"0", "false", "off", "no"}
+        and os.getenv("FLAGGEMS_ATEN_PLAN_CACHE", "0").strip().lower()
+        in {"0", "false", "off", "no"}
     )
 
 

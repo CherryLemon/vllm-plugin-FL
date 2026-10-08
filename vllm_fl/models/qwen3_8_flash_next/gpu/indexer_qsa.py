@@ -238,14 +238,6 @@ class QSAIndexer(nn.Module):
             return ops.qsa_compress_norm_mrope_store_groups
         return ops.qsa_compress_groups_with_ratio
 
-    def runtime_status(self) -> dict[str, Any]:
-        from ..vendor.vllm024.dispatch import qsa_runtime_status
-
-        return qsa_runtime_status(
-            compression_impl=self._compression_impl(),
-            select_all_tokens=self.select_all_tokens,
-        )
-
     def _update_and_compress(
         self,
         token_k: torch.Tensor,

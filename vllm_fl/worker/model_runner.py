@@ -7,7 +7,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -275,7 +274,7 @@ from vllm.v1.worker.utils import (
 
 # FL-specific imports
 from vllm_fl.worker.ple_token_history import PLETokenHistory
-from vllm_fl.compat.vllm024.kv_cache import bind_kv_cache
+from vllm_fl.compat.kv_cache import bind_kv_cache
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.dispatch.io_dumper import (
@@ -289,9 +288,6 @@ from vllm_fl.worker.common_attention_metadata import (
     compute_common_attention_metadata,
     resolve_metadata_policy,
 )
-
-
-from vllm_fl.worker.packed_block_table import PackedBlockTableArena
 
 GraphWrapper = GraphWrapper
 
@@ -837,8 +833,6 @@ class ModelRunnerFL(
             if self.common_metadata_policy.mode != "stock"
             else None
         )
-        self.packed_block_table_arena: PackedBlockTableArena | None = None
-        self._install_packed_block_table_arena()
         self.seq_lens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -2026,74 +2020,6 @@ class ModelRunnerFL(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
-    def _install_packed_block_table_arena(self) -> None:
-        """Install the fixed-address packed block-table/slot arena.
-
-        This is intentionally a best-effort metadata optimization.  A vendor
-        ``CpuGpuBuffer`` may have stronger assumptions than the vLLM buffer
-        (for example, contiguous group storage), so construction failure must
-        retain the stock per-group commit path rather than change correctness.
-        The all-on harness explicitly enables this switch. Other day0 users
-        retain the existing common-attention metadata path by default.
-        """
-        old_arena = getattr(self, "packed_block_table_arena", None)
-        if old_arena is not None:
-            old_arena.close()
-        self.packed_block_table_arena = None
-
-        disabled = os.getenv("VLLM_FL_PACKED_BLOCK_TABLE_ARENA", "0").lower()
-        require = os.getenv("VLLM_FL_PACKED_BLOCK_TABLE_REQUIRE", "0").lower()
-        require = require not in {"0", "false", "off", "no"}
-        if disabled in {"0", "false", "off", "no"}:
-            if require:
-                raise RuntimeError(
-                    "VLLM_FL_PACKED_BLOCK_TABLE_REQUIRE=1 but the packed "
-                    "block-table arena is disabled"
-                )
-            return
-
-        try:
-            self.packed_block_table_arena = PackedBlockTableArena(
-                self.input_batch.block_table,
-                device=self.device,
-                pin_memory=self.pin_memory,
-            )
-        except Exception as exc:
-            if require:
-                raise RuntimeError(
-                    "Packed block-table arena is required but could not be "
-                    "installed"
-                ) from exc
-            # Do not make model startup depend on an optional aliasing
-            # optimization.  The warning includes the exception for remote
-            # diagnosis while the normal per-group path remains unchanged.
-            logger.warning_once(
-                "Packed block-table arena disabled; falling back to per-group "
-                "metadata copies: %s",
-                exc,
-            )
-        else:
-            logger.info(
-                "Packed block-table arena enabled: groups=%d packed_width=%d "
-                "h2d_copies=1 metadata_owner=common",
-                self.packed_block_table_arena.group_count,
-                self.packed_block_table_arena.total_block_width,
-            )
-
-    def _close_packed_block_table_arena(self) -> None:
-        arena = getattr(self, "packed_block_table_arena", None)
-        if arena is not None:
-            arena.close()
-            self.packed_block_table_arena = None
-
-    def _commit_block_table(self, num_reqs: int) -> None:
-        """Copy block-table rows once, with a safe stock fallback."""
-        arena = self.packed_block_table_arena
-        if arena is not None and arena.block_table is self.input_batch.block_table:
-            arena.commit(num_reqs)
-        else:
-            self.input_batch.block_table.commit_block_table(num_reqs)
-
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2114,7 +2040,7 @@ class ModelRunnerFL(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self._commit_block_table(num_reqs)
+        self.input_batch.block_table.commit_block_table(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -6241,7 +6167,7 @@ class ModelRunnerFL(
                 # remove_request() are visible to the attention metadata
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
-                self._commit_block_table(num_reqs_padded)
+                self.input_batch.block_table.commit_block_table(num_reqs_padded)
                 prepared_metadata = self._run_common_attention_metadata(
                     num_reqs_padded,
                     cudagraph_runtime_mode,
@@ -6768,9 +6694,6 @@ class ModelRunnerFL(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
-        # The cleanup above synchronizes and destroys slot-mapping graphs
-        # first; only then is it safe to release the arena's graph addresses.
-        self._close_packed_block_table_arena()
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
@@ -7493,15 +7416,12 @@ class ModelRunnerFL(
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
         ):
-            # Graphs and packed views retain pointers into the old input batch.
-            # Tear both down before replacing it; the new batch is installed
-            # below with fresh, capture-stable addresses.
+            # Retire metadata graphs before replacing their input buffers.
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             _accelerator_synchronize()
             if self.common_attention_metadata_graph is not None:
                 self.common_attention_metadata_graph.clear()
-            self._close_packed_block_table_arena()
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -7517,7 +7437,6 @@ class ModelRunnerFL(
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
             )
-            self._install_packed_block_table_arena()
 
         assert self._init_block_sizes == block_sizes, (
             f"InputBatch block_sizes {self._init_block_sizes} != "
@@ -7769,12 +7688,7 @@ class ModelRunnerFL(
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        # Version-correct binding order: upstream ``bind_kv_cache`` runs once
-        # (it fills the runner list and assigns ``layer.kv_cache`` directly on
-        # the vLLM 0.24 ABI), then the registered cache owners run their bind
-        # hook once to build typed views over the shared storage.  Owners are
-        # identified by explicit registration, not by module name, and a newer
-        # ABI that already calls the hook is used natively without a second call.
+        # Bind owner views only when the upstream helper omits that hook.
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )

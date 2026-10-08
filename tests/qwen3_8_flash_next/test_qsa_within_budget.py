@@ -54,13 +54,6 @@ def make_indexer(monkeypatch):
 def test_selection_gate_uses_worker_context_limit(make_indexer, limit):
     indexer = make_indexer(limit)
     assert indexer.select_all_tokens is (limit <= 2048)
-    status = indexer.runtime_status()
-    assert status["stages"]["selection"]["callable"].endswith(
-        ".qsa_select_all_paged_tokens" if limit <= 2048 else ".qsa_select_paged_tokens"
-    )
-    if limit <= 2048:
-        assert set(status["stages"]) == {"metadata", "selection", "attention"}
-        assert status["compression_candidates"] == []
 
 
 def test_kv_export_keeps_side_cache_state(make_indexer):

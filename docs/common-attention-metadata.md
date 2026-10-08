@@ -21,8 +21,9 @@ behavior. The default is `stock` on every platform. `eager` opts into the
 pointer-table Triton producer without metadata graph capture; `graph` or `1`
 also enables metadata graphs. Graph support is checked separately through the
 platform graph API. An unavailable graph uses the producer eagerly only when
-that producer is enabled. See [the common worker contracts](common_worker_optimizations.md)
-for unsupported scheduling combinations, receipt validation and buffer lifetime.
+that producer is enabled. Ubatching and async speculative decode use the stock
+path. Graphs are retired before replacing InputBatch buffers; each metadata
+receipt is valid only for its producer generation and prepared step.
 
 The new kernel uses uint64 device pointer tables. Exposing a graph API alone
 does not establish support for that kernel on a different compiler or device.

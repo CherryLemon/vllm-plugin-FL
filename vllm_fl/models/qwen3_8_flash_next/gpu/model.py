@@ -126,7 +126,7 @@ def _get_qwen35_hf_to_vllm_mapper() -> WeightsMapper:
 _QWEN35_HF_TO_VLLM_MAPPER = _get_qwen35_hf_to_vllm_mapper()
 
 
-_VLLM024_STACKED_WEIGHT_MAPPINGS = (
+_STACKED_WEIGHT_MAPPINGS = (
     (".q_proj", ".qkv_proj", "q"),
     (".k_proj", ".qkv_proj", "k"),
     (".v_proj", ".qkv_proj", "v"),
@@ -141,13 +141,13 @@ _VLLM024_STACKED_WEIGHT_MAPPINGS = (
 )
 
 
-def _map_vllm024_stacked_weights(
+def _map_stacked_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """Attach packed-linear shard metadata missing from vLLM 0.24's mapper."""
+    """Attach shard metadata when the native mapper cannot stack weights."""
 
     for name, weight in weights:
-        for old, new, shard_id in _VLLM024_STACKED_WEIGHT_MAPPINGS:
+        for old, new, shard_id in _STACKED_WEIGHT_MAPPINGS:
             if old in name:
                 name = name.replace(old, new, 1)
                 weight.shard_id = shard_id
@@ -155,7 +155,7 @@ def _map_vllm024_stacked_weights(
         yield name, weight
 
 
-def _get_vllm024_expert_mappings(
+def _get_expert_mappings(
     model: nn.Module,
     num_experts: int,
     num_redundant_experts: int,
@@ -163,7 +163,7 @@ def _get_vllm024_expert_mappings(
     list[tuple[str, str, int, str]],
     list[tuple[str, str, int, str]],
 ] | None:
-    """Probe for the vLLM 0.24 fused-MoE mapping ABI.
+    """Probe for the fused-MoE mapping API.
 
     vLLM 0.24 exposes ``fused_moe_make_expert_params_mapping`` but does not
     teach ``AutoWeightsLoader`` how to turn a Hugging Face fused 3-D
@@ -226,7 +226,7 @@ def _get_vllm024_expert_mappings(
     return regular_mapping, fused_mapping
 
 
-def _call_vllm024_expert_weight_loader(
+def _call_expert_weight_loader(
     param: nn.Parameter,
     loaded_weight: torch.Tensor,
     param_name: str,
@@ -263,14 +263,14 @@ def _call_vllm024_expert_weight_loader(
     return True if loaded is None else bool(loaded)
 
 
-def _load_vllm024_fused_expert_weight(
+def _load_fused_expert_weight(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: dict[str, nn.Parameter],
     fused_mapping: list[tuple[str, str, int, str]],
     num_experts: int,
 ) -> tuple[bool, set[str]]:
-    """Load one fused HF expert tensor using the vLLM 0.24 parameter ABI."""
+    """Load a fused HF expert tensor through the available expert loader."""
 
     if "mlp.experts.gate_up_proj" not in name and "mlp.experts.down_proj" not in name:
         return False, set()
@@ -302,7 +302,7 @@ def _load_vllm024_fused_expert_weight(
         loaded_local_expert = False
         for actual_shard_id, shard_weight in shard_weights:
             for expert_id in range(num_experts):
-                if _call_vllm024_expert_weight_loader(
+                if _call_expert_weight_loader(
                     param,
                     shard_weight[expert_id],
                     name_mapped,
@@ -316,7 +316,7 @@ def _load_vllm024_fused_expert_weight(
     return True, loaded_params
 
 
-def _load_vllm024_single_expert_weight(
+def _load_single_expert_weight(
     name: str,
     loaded_weight: torch.Tensor,
     params_dict: dict[str, nn.Parameter],
@@ -332,7 +332,7 @@ def _load_vllm024_single_expert_weight(
         param = params_dict.get(name_mapped)
         if param is None:
             return True, loaded_params
-        if _call_vllm024_expert_weight_loader(
+        if _call_expert_weight_loader(
             param,
             loaded_weight,
             name_mapped,
@@ -344,7 +344,7 @@ def _load_vllm024_single_expert_weight(
     return False, loaded_params
 
 
-class _VLLM024StackedAutoWeightsLoader(AutoWeightsLoader):
+class _StackedAutoWeightsLoader(AutoWeightsLoader):
     """Teach the vLLM 0.24 auto-loader to forward packed shard identifiers."""
 
     def _load_param(
@@ -851,7 +851,7 @@ class Qwen3_8FlashNextModel(nn.Module):
         loader_cls = AutoWeightsLoader
         legacy_loaded: set[str] = set()
         if not _HAS_NATIVE_STACKED_WEIGHTS_MAPPER:
-            expert_mappings = _get_vllm024_expert_mappings(
+            expert_mappings = _get_expert_mappings(
                 self,
                 num_experts=getattr(self.config, "num_experts", 0) or 0,
                 num_redundant_experts=self.num_redundant_experts,
@@ -863,7 +863,7 @@ class Qwen3_8FlashNextModel(nn.Module):
 
                 def _legacy_weights() -> Iterable[tuple[str, torch.Tensor]]:
                     for name, loaded_weight in legacy_input:
-                        handled, loaded = _load_vllm024_fused_expert_weight(
+                        handled, loaded = _load_fused_expert_weight(
                             name,
                             loaded_weight,
                             params_dict,
@@ -873,7 +873,7 @@ class Qwen3_8FlashNextModel(nn.Module):
                         if handled:
                             legacy_loaded.update(loaded)
                             continue
-                        handled, loaded = _load_vllm024_single_expert_weight(
+                        handled, loaded = _load_single_expert_weight(
                             name,
                             loaded_weight,
                             params_dict,
@@ -882,15 +882,15 @@ class Qwen3_8FlashNextModel(nn.Module):
                         if handled:
                             legacy_loaded.update(loaded)
                             continue
-                        yield from _map_vllm024_stacked_weights(
+                        yield from _map_stacked_weights(
                             ((name, loaded_weight),)
                         )
 
                 weights = _legacy_weights()
             else:
-                weights = _map_vllm024_stacked_weights(weights)
+                weights = _map_stacked_weights(weights)
             mapper = None
-            loader_cls = _VLLM024StackedAutoWeightsLoader
+            loader_cls = _StackedAutoWeightsLoader
         loader = loader_cls(
             self,
             skip_substrs=skip_substrs,

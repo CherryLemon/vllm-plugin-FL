@@ -1,4 +1,4 @@
-"""Focused tests for the vLLM 0.24 fused-expert loader compatibility."""
+"""Focused tests for capability-selected stacked and fused-expert loading."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def test_legacy_stacked_mapping_covers_attention_gdn_and_shared_expert():
         ("layers.0.ple.key_proj.weight", torch.ones(1)),
     ]
 
-    mapped = list(qwen_model._map_vllm024_stacked_weights(weights))
+    mapped = list(qwen_model._map_stacked_weights(weights))
     names = [name for name, _ in mapped]
     assert names[:3] == [
         "layers.0.self_attn.qkv_proj.weight",
@@ -91,7 +91,7 @@ def test_legacy_fused_experts_split_gate_up_and_load_every_expert():
         ("experts.routed_experts.w2_weight", "experts.down_proj", 0, "w2"),
     ]
     gate_up = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
-    handled, names = qwen_model._load_vllm024_fused_expert_weight(
+    handled, names = qwen_model._load_fused_expert_weight(
         "layers.0.mlp.experts.gate_up_proj",
         gate_up,
         params,
@@ -111,7 +111,7 @@ def test_legacy_fused_experts_split_gate_up_and_load_every_expert():
     torch.testing.assert_close(loaded[3][2], gate_up[1, 2:])
 
     down = torch.arange(2 * 3 * 2, dtype=torch.float32).reshape(2, 3, 2)
-    handled, names = qwen_model._load_vllm024_fused_expert_weight(
+    handled, names = qwen_model._load_fused_expert_weight(
         "layers.0.mlp.experts.down_proj",
         down,
         params,
