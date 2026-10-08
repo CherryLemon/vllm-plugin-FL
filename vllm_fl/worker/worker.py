@@ -6,11 +6,10 @@
 
 import gc
 import os
-from collections.abc import Generator
-from contextlib import contextmanager, nullcontext, suppress
-from dataclasses import dataclass
+from contextlib import nullcontext, contextmanager
 from types import NoneType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Optional, cast, Generator
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -32,7 +31,6 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-
 try:
     from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 except ImportError:
@@ -51,13 +49,14 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.utils.torch_utils import set_random_seed
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
+
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import GiB_bytes  # , MemorySnapshot, memory_profiling
-from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -66,10 +65,10 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-
 import vllm_fl.envs as fl_envs
-from vllm_fl.dispatch.io_common import managed_inference_mode
+
 from vllm_fl.ops.custom_ops import register_oot_ops
+from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.utils import get_flag_gems_whitelist_blacklist
 
 logger = init_logger(__name__)
@@ -163,8 +162,10 @@ def memory_profiling_fl(
     torch_device_fn.empty_cache()
 
     # Reset peak memory stats - platform agnostic
-    with suppress(AttributeError, RuntimeError):
+    try:
         torch_device_fn.reset_peak_memory_stats()
+    except (AttributeError, RuntimeError):
+        pass  # Some platforms may not support this
 
     result = MemoryProfilingResult()
     result.before_create = baseline_snapshot
@@ -254,35 +255,38 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        from vllm_fl.flaggems_runtime import configure_flaggems
-
-        whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-
-        def enable_flaggems(library):
+        if fl_envs.USE_FLAGGEMS:
             import flag_gems
 
-            kwargs = dict(
-                record=rank == 0, once=True,
-                path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-            )
-            if library is not None:
-                kwargs["lib"] = library
-            if whitelist is not None:
-                flag_gems.only_enable(include=whitelist, **kwargs)
-            elif blacklist:
-                flag_gems.enable(unused=blacklist, **kwargs)
-            else:
-                flag_gems.enable(**kwargs)
+            # Get whitelist and blacklist from environment variables
+            whitelist, blacklist = get_flag_gems_whitelist_blacklist()
 
-        mm_status = configure_flaggems(
-            enable_flaggems,
-            use_flaggems=fl_envs.USE_FLAGGEMS,
-            whitelist=whitelist,
-            blacklist=blacklist,
-        )
-        logger.info(
-            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
-        )
+            # Only rank 0 records the oplist to avoid file truncation and
+            # interleaved writes when tensor-parallel-size > 1.
+            should_record = (rank == 0)
+
+            # Use whitelist if specified (takes precedence over blacklist)
+            if whitelist:
+                logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
+                flag_gems.only_enable(
+                    include=whitelist,
+                    record=should_record,
+                    once=True,
+                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                )
+            elif blacklist:
+                logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
+                flag_gems.enable(
+                    unused=blacklist,
+                    record=should_record,
+                    once=True,
+                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                )
+            else:
+                logger.info("[FlagGems] Enable all ops")
+                flag_gems.enable(
+                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH
+                )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator
@@ -1000,7 +1004,7 @@ class WorkerFL(WorkerBase):
 
         return None
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+    def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
@@ -1093,7 +1097,7 @@ class WorkerFL(WorkerBase):
         self,
         old_ep_size: int,
         new_ep_size: int,
-        global_expert_loads: torch.Tensor | None,
+        global_expert_loads: Optional[torch.Tensor],
     ) -> None:
         from vllm.distributed.parallel_state import get_ep_group
 
@@ -1138,7 +1142,7 @@ class WorkerFL(WorkerBase):
 
     def _reconfigure_moe(
         self, old_ep_size: int, new_ep_size: int
-    ) -> torch.Tensor | None:
+    ) -> Optional[torch.Tensor]:
         """
         Reconfigure MoE modules with provided reconfig_request
 
@@ -1288,8 +1292,8 @@ class WorkerFL(WorkerBase):
     def save_sharded_state(
         self,
         path: str,
-        pattern: str | None = None,
-        max_size: int | None = None,
+        pattern: Optional[str] = None,
+        max_size: Optional[int] = None,
     ) -> None:
         from vllm.model_executor.model_loader import ShardedStateLoader
 
@@ -1320,7 +1324,7 @@ class WorkerFL(WorkerBase):
 def init_worker_distributed_environment(
     vllm_config: VllmConfig,
     rank: int,
-    distributed_init_method: str | None = None,
+    distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
     backend: str = "nccl",
 ) -> None:

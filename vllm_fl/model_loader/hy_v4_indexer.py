@@ -17,6 +17,9 @@ from collections.abc import Iterable, Mapping
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    dequant_mxfp8_to_bf16,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
@@ -94,9 +97,7 @@ def dequantize_mxfp8_wk(
             f"{_MXFP8_GROUP_SIZE}: "
             f"{tuple(weight.shape)} vs {tuple(scale.shape)}"
         )
-    scales = torch.exp2(scale.to(torch.int16).float() - 127.0)
-    scales = scales.repeat_interleave(_MXFP8_GROUP_SIZE, dim=-1)
-    return (weight.float() * scales).to(torch.bfloat16)
+    return dequant_mxfp8_to_bf16(weight, scale)
 
 
 def dequantize_fp8_wk(

@@ -4,13 +4,13 @@
 
 from __future__ import annotations
 
-import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from vllm.compilation.decorators import support_torch_compile
@@ -57,7 +57,6 @@ from vllm_fl.configs.hy_v4 import HYV4Config
 from vllm_fl.model_loader.hy_v4_coverage import HY4LoadCoverage
 from vllm_fl.model_loader.hy_v4_indexer import (
     IndexerWKLoader,
-    dequantize_mxfp8_wk,
     quant_metadata_from_quant_config,
 )
 from vllm_fl.models.hy_v4_attention import (
@@ -66,71 +65,12 @@ from vllm_fl.models.hy_v4_attention import (
     is_skip_topk_indexer_weight,
     validate_hy4_parallel_config,
 )
-from vllm_fl.ops.hy4_hc_projection import hc_n8_projection
-from vllm_fl.ops.hy_v4_hc import (
-    read_post_linear as _hyv4_hc_read_post_linear,
-    writeback as _hyv4_hc_writeback,
-)
 from vllm_fl.patches.hy_v4_runtime import HY4RuntimePlan, prepare_hy4_runtime
-
-_HYV4_SHARED_EXPERTS_RUNNER_ENV = "VLLM_HY4_SHARED_EXPERTS_RUNNER"
-
-
-def _hyv4_env_flag(name: str, default: bool = False) -> bool:
-    """Read a boolean HY4 opt-in without treating malformed values as enabled."""
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _hyv4_fp32_combine(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
     """The MoE runner owns reduction; combine its outputs in FP32."""
     return routed.float() + shared.float()
-
-
-class _HYV4FP32RoutedOutput(nn.Module):
-    """Cast only the routed output before vLLM's shared+routed add.
-
-    vLLM 0.24 applies ``routed_output_transform`` outside the opaque MoE custom
-    op.  Therefore the fake op may keep its BF16 output contract while the
-    runner's final ``shared_output + fused_output`` is promoted to FP32.
-    """
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return hidden_states.float()
-
-
-def _try_load_mxfp8_indexer_wk(
-    name: str,
-    tensor: torch.Tensor,
-    pending: dict[str, dict[str, torch.Tensor]],
-    params_dict: dict[str, nn.Parameter],
-    loaded_params: set[str],
-) -> bool:
-    """Fuse this checkpoint's ModelOpt MXFP8 indexer wk with weights_proj."""
-    if ".indexer.wk." not in name:
-        return False
-    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = name.endswith(".weight_scale") and tensor.dtype == torch.uint8
-    if not is_weight and not is_scale:
-        return False
-
-    layer_prefix = name.rsplit(".wk.", 1)[0]
-    entry = pending.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
-    if "weight" not in entry or "scale" not in entry:
-        return True
-
-    weight, scale = entry["weight"], entry["scale"]
-    del pending[layer_prefix]
-    weight_bf16 = dequantize_mxfp8_wk(weight, scale)
-
-    fused_name = f"{layer_prefix}.wk_weights_proj.weight"
-    param = params_dict[fused_name]
-    param.weight_loader(param, weight_bf16, 0)
-    loaded_params.add(fused_name)
-    return True
 
 
 def _make_hyv4_expert_params_mapping(
@@ -211,16 +151,19 @@ class HYV4HyperConnection(nn.Module):
     def read(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Collapse streams and return the write gates for the branch output."""
         flat = streams.flatten(1).float()
-        gates = hc_n8_projection(flat, self.hc_fn, self.normalize_eps)
-        return _hyv4_hc_read_post_linear(
-            streams,
-            gates,
-            self.hc_scale,
-            self.hc_base,
-            self.magnitude,
-            self.hc_eps,
-            self.num_streams,
+        norm = torch.rsqrt(
+            flat.square().mean(dim=-1, keepdim=True) + self.normalize_eps
         )
+        gates = F.linear(flat, self.hc_fn) * norm
+        read, write = gates.split(self.num_streams, dim=-1)
+        read = torch.sigmoid(read * self.hc_scale[0] + self.hc_base[: self.num_streams])
+        write = self.magnitude * torch.sigmoid(
+            write * self.hc_scale[1] + self.hc_base[self.num_streams :]
+        )
+        read = read + self.hc_eps
+        write = write + self.hc_eps
+        collapsed = (read.unsqueeze(-1) * streams.float()).sum(dim=1)
+        return collapsed.to(streams.dtype), write
 
     @staticmethod
     def write(
@@ -229,7 +172,9 @@ class HYV4HyperConnection(nn.Module):
         write: torch.Tensor,
     ) -> torch.Tensor:
         """Write one branch result into all identity residual streams."""
-        return _hyv4_hc_writeback(streams, delta, write, streams.shape[1])
+        return (
+            streams.float() + write.float().unsqueeze(-1) * delta.float().unsqueeze(1)
+        ).to(delta.dtype)
 
 
 class HYV4HyperLayer(nn.Module):
@@ -259,10 +204,12 @@ class HYV4HyperHead(nn.Module):
 
     def forward(self, streams: torch.Tensor) -> torch.Tensor:
         flat = streams.flatten(1).float()
+        norm = torch.rsqrt(
+            flat.square().mean(dim=-1, keepdim=True) + self.normalize_eps
+        )
         read = (
             torch.sigmoid(
-                hc_n8_projection(flat, self.hc_head_fn, self.normalize_eps)
-                * self.hc_head_scale
+                F.linear(flat, self.hc_head_fn) * norm * self.hc_head_scale
                 + self.hc_head_base
             )
             + self.hc_eps
@@ -328,11 +275,6 @@ class HYV4MoE(nn.Module):
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
         self.is_sequence_parallel = bool(parallel_config.use_sequence_parallel_moe)
-        # The upstream runner owns aux-stream ordering and late all-reduce.
-        # Keep it opt-in so the existing HY4 fallback remains easy to A/B.
-        self._use_shared_experts_runner = _hyv4_env_flag(
-            _HYV4_SHARED_EXPERTS_RUNNER_ENV
-        )
         if config.hidden_act != "silu":
             raise ValueError("HY4 currently supports only the silu activation")
 
@@ -355,13 +297,9 @@ class HYV4MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
-            # Runner/SP outputs stay local until their FP32 combine.  The
-            # default non-SP fallback intentionally retains HY4's original
-            # BF16 shared reduction.  In SP, both projections are replicated,
-            # matching DeepSeek's ``disable_tp=is_sequence_parallel`` contract.
-            reduce_results=not (
-                self._use_shared_experts_runner or self.is_sequence_parallel
-            ),
+            # Non-SP shared projection retains its BF16 row reduction;
+            # SP projects replicated weights and combines local token chunks.
+            reduce_results=not self.is_sequence_parallel,
             disable_tp=self.is_sequence_parallel,
             prefix=f"{prefix}.shared_experts",
         )
@@ -372,10 +310,6 @@ class HYV4MoE(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts
 
-        # The runner path combines a local shared result after casting routed
-        # output to FP32.  The default non-SP fallback keeps the original
-        # RowParallelLinear reduction and only uses the helper for the FP32
-        # final add.  SP uses replicated weights and no row reduction.
         self.experts = fused_moe_layers.FusedMoE(
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -393,12 +327,6 @@ class HYV4MoE(nn.Module):
             swiglu_limit=config.swiglu_limit,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             apply_routed_scale_to_output=False,
-            shared_experts=(
-                self.shared_experts if self._use_shared_experts_runner else None
-            ),
-            routed_output_transform=(
-                _HYV4FP32RoutedOutput() if self._use_shared_experts_runner else None
-            ),
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             router_logits_dtype=torch.float32,
@@ -415,20 +343,6 @@ class HYV4MoE(nn.Module):
             # Keep token ownership aligned between routed and shared branches;
             # the gather below restores the original token order.
             hidden_states = sequence_parallel_chunk(hidden_states)
-
-        if self._use_shared_experts_runner:
-            # vLLM 0.24's SharedExperts owns aux-stream synchronization.  Its
-            # runner applies the routed output transform outside the opaque
-            # custom op, so the shared+routed add is FP32 while the fake op
-            # retains its BF16 shape/dtype contract.
-            combined = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-            )
-            if self.is_sequence_parallel:
-                combined = tensor_model_parallel_all_gather(combined.float(), 0)
-                combined = combined[:num_tokens]
-            return combined.to(output_dtype).view(shape)
 
         if self.experts.is_internal_router:
             routed = self.experts(

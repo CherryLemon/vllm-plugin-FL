@@ -15,10 +15,7 @@ from vllm_fl.model_loader.hy_v4_loader import (
 from vllm_fl.models import hy_v4
 from vllm_fl.models.hy_v4 import (
     HYV4ForCausalLM,
-    _hyv4_env_flag,
     _hyv4_fp32_combine,
-    _HYV4FP32RoutedOutput,
-    _try_load_mxfp8_indexer_wk,
 )
 from vllm_fl.patches import hy_v4_registration as registration
 
@@ -208,38 +205,6 @@ def test_hy4_packed_experts_do_not_match_shared_expert():
     )
 
 
-def test_hy4_mxfp8_indexer_wk_is_dequantized_into_fused_projection():
-    param = torch.nn.Parameter(torch.zeros(4, 64, dtype=torch.bfloat16))
-
-    def load_shard(target, weight, shard_id):
-        assert shard_id == 0
-        with torch.no_grad():
-            target[: weight.shape[0]].copy_(weight)
-
-    param.weight_loader = load_shard
-    params = {"model.layers.0.self_attn.indexer.wk_weights_proj.weight": param}
-    pending = {}
-    loaded = set()
-    prefix = "model.layers.0.self_attn.indexer.wk"
-    scale = torch.tensor([[127, 128], [126, 127]], dtype=torch.uint8)
-    weight = torch.ones(2, 64, dtype=torch.float8_e4m3fn)
-
-    assert _try_load_mxfp8_indexer_wk(
-        f"{prefix}.weight_scale", scale, pending, params, loaded
-    )
-    assert _try_load_mxfp8_indexer_wk(
-        f"{prefix}.weight", weight, pending, params, loaded
-    )
-
-    expected = torch.tensor(
-        [[1.0] * 32 + [2.0] * 32, [0.5] * 32 + [1.0] * 32],
-        dtype=torch.bfloat16,
-    )
-    torch.testing.assert_close(param[:2], expected)
-    assert not pending
-    assert loaded == set(params)
-
-
 def test_hy4_combine_preserves_fp32_sum():
     routed = torch.tensor([[1.0, 256.0]], dtype=torch.bfloat16)
     shared = torch.tensor([[2**-8, 1.0]], dtype=torch.bfloat16)
@@ -249,21 +214,6 @@ def test_hy4_combine_preserves_fp32_sum():
         result, torch.tensor([[1.00390625, 257.0]]), rtol=0, atol=0
     )
     assert not torch.equal(result, (routed + shared).float())
-
-
-def test_hy4_shared_expert_runner_flag_and_fp32_transform(monkeypatch):
-    flag = "VLLM_HY4_SHARED_EXPERTS_RUNNER"
-    monkeypatch.delenv(flag, raising=False)
-    assert _hyv4_env_flag(flag) is False
-    monkeypatch.setenv(flag, "1")
-    assert _hyv4_env_flag(flag) is True
-    monkeypatch.setenv(flag, "not-a-flag")
-    assert _hyv4_env_flag(flag) is False
-
-    value = torch.ones(2, 3, dtype=torch.bfloat16)
-    transformed = _HYV4FP32RoutedOutput()(value)
-    assert transformed.dtype == torch.float32
-    torch.testing.assert_close(transformed, value.float())
 
 
 def test_hy4_sequence_parallel_chunk_add_gather_and_truncate(monkeypatch):
@@ -305,7 +255,6 @@ def test_hy4_sequence_parallel_chunk_add_gather_and_truncate(monkeypatch):
 
     fake_moe = SimpleNamespace(
         is_sequence_parallel=True,
-        _use_shared_experts_runner=False,
         gate=FakeGate(),
         experts=FakeExperts(),
         shared_experts=FakeShared(),
@@ -362,9 +311,8 @@ def test_hy4_moe_constructor_wires_fallback_runner_and_sp(monkeypatch):
         swiglu_limit=None,
     )
 
-    def construct(*, runner: bool, sequence_parallel: bool):
+    def construct(*, sequence_parallel: bool):
         observed.clear()
-        monkeypatch.setenv("VLLM_HY4_SHARED_EXPERTS_RUNNER", "1" if runner else "0")
         parallel = SimpleNamespace(
             use_sequence_parallel_moe=sequence_parallel,
             eplb_config=SimpleNamespace(num_redundant_experts=0),
@@ -379,26 +327,18 @@ def test_hy4_moe_constructor_wires_fallback_runner_and_sp(monkeypatch):
         fused = next(kwargs for kind, kwargs in observed if kind == "fused")
         return module, dense, fused
 
-    fallback, dense, fused = construct(runner=False, sequence_parallel=False)
+    fallback, dense, fused = construct(sequence_parallel=False)
     assert dense["reduce_results"] is True
     assert dense["disable_tp"] is False
-    assert fused["shared_experts"] is None
-    assert fused["routed_output_transform"] is None
-    assert fused["is_sequence_parallel"] is False
-    assert fallback._use_shared_experts_runner is False
-
-    runner, dense, fused = construct(runner=True, sequence_parallel=False)
-    assert dense["reduce_results"] is False
-    assert dense["disable_tp"] is False
-    assert fused["shared_experts"] is runner.shared_experts
-    assert isinstance(fused["routed_output_transform"], _HYV4FP32RoutedOutput)
+    assert "shared_experts" not in fused
+    assert "routed_output_transform" not in fused
     assert fused["is_sequence_parallel"] is False
 
-    sp, dense, fused = construct(runner=False, sequence_parallel=True)
+    sp, dense, fused = construct(sequence_parallel=True)
     assert dense["reduce_results"] is False
     assert dense["disable_tp"] is True
-    assert fused["shared_experts"] is None
-    assert fused["routed_output_transform"] is None
+    assert "shared_experts" not in fused
+    assert "routed_output_transform" not in fused
     assert fused["is_sequence_parallel"] is True
     assert sp.is_sequence_parallel is True
 

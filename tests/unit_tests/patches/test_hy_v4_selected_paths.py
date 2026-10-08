@@ -2,7 +2,6 @@
 """Selected dependencies and implementation failures at the HY4 boundary."""
 
 import importlib
-import runpy
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +9,79 @@ import pytest
 from .test_hy_v4_review_contracts import _prefill_config
 from vllm_fl.models import hy_v4
 from vllm_fl.patches import hy_v4_runtime as runtime
+
+
+@pytest.mark.parametrize(
+    "options,selected",
+    [
+        ({}, "flagos"),
+        ({"prefer": "vendor"}, "vendor"),
+        ({"per_op_order": {"hy4_test": ["vendor", "flagos"]}}, "vendor"),
+        ({"prefer": "vendor", "deny_vendors": {"cuda"}}, "flagos"),
+        ({"prefer": "vendor", "allow_vendors": {"ascend"}}, "flagos"),
+    ],
+)
+def test_runtime_resolution_obeys_common_policy(options, selected):
+    from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+
+    calls = []
+
+    def flagos():
+        calls.append("flagos")
+
+    def vendor():
+        calls.append("vendor")
+
+    with policy_context(SelectionPolicy.from_dict(**options)):
+        implementation = runtime._resolve_runtime_operator(
+            "hy4_test", [("flagos", flagos), ("vendor", vendor)]
+        )
+        assert not calls
+        implementation()
+    assert calls == [selected]
+
+
+@pytest.mark.parametrize("error_type", [NotImplementedError, RuntimeError])
+def test_selected_runtime_failure_is_not_retried(error_type):
+    import torch
+
+    from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+
+    out = torch.zeros(1)
+    calls = []
+    error = error_type("failure after output mutation")
+
+    def flagos():
+        calls.append("flagos")
+        out.fill_(1)
+        raise error
+
+    def vendor():
+        calls.append("vendor")
+        out.fill_(2)
+
+    with policy_context(SelectionPolicy()):
+        implementation = runtime._resolve_runtime_operator(
+            "hy4_test", [("flagos", flagos), ("vendor", vendor)]
+        )
+        with pytest.raises(error_type) as exc:
+            implementation()
+    assert exc.value is error
+    assert calls == ["flagos"]
+    assert out.item() == 1
+
+
+def test_native_paths_obey_vendor_filter_and_per_op_order():
+    from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+
+    with policy_context(SelectionPolicy()):
+        assert runtime._native_operator_allowed("concat_mla_q")
+    with policy_context(SelectionPolicy.from_dict(deny_vendors={"cuda"})):
+        assert not runtime._native_operator_allowed("concat_mla_q")
+    with policy_context(
+        SelectionPolicy.from_dict(per_op_order={"concat_mla_q": ["flagos"]})
+    ):
+        assert not runtime._native_operator_allowed("concat_mla_q")
 
 
 @pytest.fixture
@@ -42,9 +114,7 @@ def test_unused_flaggems_dependency_does_not_reject_plan(
     import vllm._custom_ops as ops
     import vllm.model_executor.layers.attention.mla_attention as mla
 
-    module = importlib.import_module(
-        "flag_gems" if name == "flash_attn_varlen_func" else "flag_gems.fused"
-    )
+    module = importlib.import_module("flaggems_vllm")
     if absence == "blacklisted":
         monkeypatch.setattr(runtime, "use_flaggems_op", lambda op: op != name)
     else:
@@ -68,7 +138,7 @@ def test_unused_flaggems_dependency_does_not_reject_plan(
 def test_selected_cache_replacement_must_be_available(
     monkeypatch, native_prefill, absence
 ):
-    import flag_gems.fused as fused
+    import flaggems_vllm as fused
 
     monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: False)
     if absence == "blacklisted":
@@ -185,32 +255,3 @@ def test_missing_expert_helper_keeps_no_eplb_mapping(monkeypatch):
     model.n_redundant_experts = 1
     with pytest.raises(RuntimeError, match="EPLB loading requires"):
         hy_v4._make_hyv4_expert_params_mapping(model)
-
-
-@pytest.mark.parametrize(
-    "module_name,fail_at", [("hy4_hc_projection", 1), ("hy_v4_hc", 1), ("hy_v4_hc", 2)]
-)
-@pytest.mark.parametrize(
-    "error_type", [ImportError, RuntimeError, AttributeError, TypeError]
-)
-def test_hc_registration_errors_propagate(
-    monkeypatch, module_name, fail_at, error_type
-):
-    from vllm.utils import torch_utils
-
-    module = importlib.import_module("vllm_fl.ops." + module_name)
-    calls = []
-    error = error_type("registration implementation failed")
-
-    def register(**kwargs):
-        calls.append(kwargs["op_name"])
-        if len(calls) == fail_at:
-            raise error
-
-    # Execute the actual module registration with a fake registrar; no Torch
-    # operator is registered by this test, including before second-op failure.
-    monkeypatch.setattr(torch_utils, "direct_register_custom_op", register)
-    with pytest.raises(error_type) as exc:
-        runpy.run_path(module.__file__)
-    assert exc.value is error
-    assert len(calls) == fail_at

@@ -226,7 +226,7 @@ def test_fallback_failure_rolls_back_real_module_attributes(monkeypatch):
     plan = runtime.validate_hy4_runtime(_prefill_config())
     modules = [indexer, native, ops, sparse, mla]
     modules += [
-        importlib.import_module("flag_gems.fused." + n)
+        importlib.import_module("flaggems_vllm.ops." + n)
         for n in ("top_k_per_row_prefill", "top_k_per_row_decode", "flashmla_sparse")
     ]
     snapshots = [dict(vars(m)) for m in modules]
@@ -319,7 +319,6 @@ def test_explicit_prefill_errors_are_not_swallowed(error):
     ],
 )
 def test_automatic_prefill_absence_uses_fallback(error):
-
     def selector(cfg):
         raise error
 
@@ -343,6 +342,7 @@ def test_automatic_prefill_does_not_hide_configuration_errors(error):
 )
 def test_preflight_requires_callable_implementations(monkeypatch, name):
     import flag_gems
+    import flaggems_vllm
 
     import vllm.model_executor.layers.attention.mla_attention as mla
     from vllm import platforms
@@ -358,7 +358,8 @@ def test_preflight_requires_callable_implementations(monkeypatch, name):
         "get_mla_prefill_backend",
         lambda cfg: SimpleNamespace(is_available=lambda *_: False),
     )
-    monkeypatch.setattr(flag_gems, name, None)
+    module = flag_gems if name == "per_token_group_quant_fp8" else flaggems_vllm
+    monkeypatch.setattr(module, name, None)
     with pytest.raises(RuntimeError, match=name):
         runtime.validate_hy4_runtime(_prefill_config())
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """HY4 runtime capability checks and transactional compatibility installation.
 
-The empty-build adapter changes process-global vLLM/FlagGems symbols. It is
+The empty-build adapter changes process-global vLLM symbols. It is
 installed only by HY4 construction, under a lock, and rolled back on failure.
 It is not an instance-local provider and must not be used to hot-swap models
 in an already initialized worker.
@@ -53,6 +53,41 @@ _FLAGGEMS_INDEXER_OPS = (
 )
 
 
+def _resolve_runtime_operator(name, candidates):
+    """Resolve before execution; a launched operation is never retried."""
+    from vllm_fl.dispatch.manager import OpManager
+    from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+
+    manager = OpManager()
+    manager.registry.register_many(
+        [
+            OpImpl(
+                name,
+                "hy4." + kind,
+                BackendImplKind(kind),
+                implementation,
+                vendor="cuda" if kind == "vendor" else None,
+            )
+            for kind, implementation in candidates
+        ]
+    )
+    return manager.resolve(name)
+
+
+def _native_operator_allowed(name):
+    from vllm_fl.dispatch.policy import get_policy
+    from vllm_fl.dispatch.types import BackendImplKind, OpImpl, match_token
+
+    policy = get_policy()
+    if not policy.is_vendor_allowed("cuda"):
+        return False
+    implementation = OpImpl(
+        name, "hy4.vendor", BackendImplKind.VENDOR, lambda: None, vendor="cuda"
+    )
+    order = policy.get_per_op_order(name) or policy.get_default_order()
+    return any(match_token(implementation, token) for token in order)
+
+
 def _load_flaggems_implementations(names: tuple[str, ...]) -> dict[str, Callable]:
     """Validate only the FlagGems implementations selected by the resolver."""
     denied = [name for name in names if not use_flaggems_op(name)]
@@ -64,12 +99,19 @@ def _load_flaggems_implementations(names: tuple[str, ...]) -> dict[str, Callable
 
     if not names:
         return {}
-    import flag_gems
-    import flag_gems.fused as fused
+    try:
+        import flaggems_vllm
+    except ModuleNotFoundError as exc:
+        if exc.name != "flaggems_vllm":
+            raise
+        raise RuntimeError(
+            "HY4 portable operators require the pinned FlagGems-vllm dependency; "
+            "install vllm-plugin-fl[hy4] as described in README.md"
+        ) from exc
 
     implementations = {
         name: getattr(
-            flag_gems if name == "flash_attn_varlen_func" else fused,
+            flaggems_vllm,
             name,
             None,
         )
@@ -84,7 +126,10 @@ def _load_flaggems_implementations(names: tuple[str, ...]) -> dict[str, Callable
         raise RuntimeError(
             "HY4 required FlagGems implementations unavailable: " + ", ".join(missing)
         )
-    return implementations
+    return {
+        name: _resolve_runtime_operator(name, [("flagos", implementation)])
+        for name, implementation in implementations.items()
+    }
 
 
 @dataclass(frozen=True)
@@ -140,19 +185,22 @@ def _flaggems_query_quantizer(implementation):
 
 
 def _resolve_query_quantizer():
+    candidates = []
     if use_flaggems_op("per_token_group_quant_fp8"):
         import flag_gems
 
         implementation = getattr(flag_gems, "per_token_group_quant_fp8", None)
         if callable(implementation):
-            return _flaggems_query_quantizer(implementation)
+            candidates.append(("flagos", _flaggems_query_quantizer(implementation)))
     if has_device_kernel("_C::per_token_group_fp8_quant", "cuda"):
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             per_token_group_quant_fp8,
         )
 
         if callable(per_token_group_quant_fp8):
-            return per_token_group_quant_fp8
+            candidates.append(("vendor", per_token_group_quant_fp8))
+    if candidates:
+        return _resolve_runtime_operator("per_token_group_quant_fp8", candidates)
     raise RuntimeError(
         "HY4 per_token_group_quant_fp8 has no permitted implementation: "
         "FlagGems is disabled/unavailable and vLLM has no device/composite kernel"
@@ -184,12 +232,24 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     import vllm.model_executor.layers.attention.mla_attention as mla_attention
 
     config = vllm_config.model_config.hf_text_config
-    native_indexer = native_hy4_available(config.index_topk)
-    native_cache = has_device_kernel("_C_cache_ops::concat_and_cache_mla", "cuda")
-    native_concat = has_device_kernel("_C_cache_ops::concat_mla_q", "cuda")
+    native_indexer = native_hy4_available(config.index_topk) and all(
+        _native_operator_allowed(name) for name in _FLAGGEMS_INDEXER_OPS
+    )
+    native_cache = has_device_kernel(
+        "_C_cache_ops::concat_and_cache_mla", "cuda"
+    ) and _native_operator_allowed("concat_and_cache_mla")
+    native_concat = has_device_kernel(
+        "_C_cache_ops::concat_mla_q", "cuda"
+    ) and _native_operator_allowed("concat_mla_q")
     prefill_backend = select_hy4_prefill_backend(
         vllm_config, mla_attention.get_mla_prefill_backend
     )
+    if prefill_backend is not None and not _native_operator_allowed(
+        "flash_attn_varlen_func"
+    ):
+        raise RuntimeError(
+            "Selected HY4 MLA prefill backend is disabled by dispatch policy"
+        )
     portable = not (
         native_indexer and native_cache and native_concat and prefill_backend
     )
@@ -204,6 +264,8 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     required = () if native_indexer else _FLAGGEMS_INDEXER_OPS
     if not native_cache:
         required += ("concat_and_cache_mla",)
+    if not native_concat:
+        required += ("concat_mla_q",)
     if prefill_backend is None:
         qk_width = config.qk_nope_head_dim + config.qk_rope_head_dim
         if not (0 < config.v_head_dim <= qk_width <= 256):
@@ -219,8 +281,6 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
         prefill_backend = _make_hy4_flaggems_mla_prefill_backend(
             implementations["flash_attn_varlen_func"]
         )
-    if not native_concat:
-        implementations["concat_mla_q"] = _concat_hy4_mla_q
     return HY4RuntimePlan(
         "native" if native_indexer else "flaggems",
         query_quantizer,
@@ -267,17 +327,6 @@ def native_hy4_available(index_topk: int) -> bool:
     return all(has_device_kernel(name, "cuda") for name in kernels) and all(
         callable(implementation) for implementation in implementations
     )
-
-
-def _concat_hy4_mla_q(ql_nope, q_pe, q_out) -> None:
-    nope_width, rope_width = ql_nope.shape[-1], q_pe.shape[-1]
-    if q_out.shape[-1] != nope_width + rope_width:
-        raise ValueError(
-            "HY4 concat_mla_q output width mismatch: "
-            f"expected {nope_width + rope_width}, got {q_out.shape[-1]}"
-        )
-    q_out[..., :nope_width].copy_(ql_nope)
-    q_out[..., nope_width:].copy_(q_pe)
 
 
 class PatchTransaction:
@@ -438,45 +487,6 @@ def _install_fallback(tx, plan: HY4RuntimePlan) -> bool:
         return bool(plan.operations)
     implementations = plan.operations
     if plan.provider == "flaggems":
-        # FlagGems 5.3.3 advertises Triton TLE support for this runtime, but
-        # the bundled Triton TLE language module is missing ``cumsum``.  Its
-        # TLE top-k kernels therefore fail while Triton is hashing/compiling
-        # the kernel, before any device code can run.  Select the portable
-        # non-TLE kernels (the module keeps both implementations) for HY4's
-        # local fallback.  This changes the process-global FlagGems module; rollback covers it
-        # if installation fails. Use a dedicated HY4 worker.
-        import importlib
-
-        top_k_prefill_module = importlib.import_module(
-            "flag_gems.fused.top_k_per_row_prefill"
-        )
-        top_k_decode_module = importlib.import_module(
-            "flag_gems.fused.top_k_per_row_decode"
-        )
-        tx.set(top_k_prefill_module, "HAS_TLE", False)
-        tx.set(top_k_decode_module, "HAS_TLE", False)
-        # Triton's dependency walker still visits the constexpr-disabled TLE
-        # branch while compiling the non-TLE kernels.  Give that walker a
-        # cache-key-compatible cumsum symbol; the branch is never emitted
-        # because HAS_TLE is false, while the non-TLE path uses tl.cumsum.
-        import triton.language as tl
-
-        for top_k_module in (top_k_prefill_module, top_k_decode_module):
-            tle = getattr(top_k_module, "tle", None)
-            if tle is not None and not hasattr(tle, "cumsum"):
-                tx.set(tle, "cumsum", tl.cumsum)
-
-        # ``flash_mla_sparse_fwd`` has a separate TLE gate from the top-k
-        # helpers above.  FlagGems selects its TLE implementation on this
-        # Triton build, but the bundled ``triton.experimental.tle.language``
-        # module is missing ``pipe``; the first HY4 request then fails while
-        # Triton hashes the kernel.  Force the portable non-TLE implementation
-        # for this worker-wide fallback as well.
-        flashmla_sparse_module = importlib.import_module(
-            "flag_gems.fused.flashmla_sparse"
-        )
-        tx.set(flashmla_sparse_module, "HAS_TLE_FLASHMLA_SPARSE", False)
-
         cp_gather_indexer_k_quant_cache = implementations[
             "cp_gather_indexer_k_quant_cache"
         ]

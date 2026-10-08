@@ -9,20 +9,20 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Set, Tuple
 
-from .io_common import make_module_tag, make_op_tag, next_exec_order
+from .registry import OpRegistry
+from .policy import SelectionPolicy, get_policy
+from .types import OpImpl, BackendImplKind, match_token
 from .io_dumper import (
-    dump_after,
     dump_before,
+    dump_after,
     dump_cleanup,
     is_dump_enabled,
 )
-from .policy import SelectionPolicy, get_policy
-from .registry import OpRegistry
-from .types import BackendImplKind, OpImpl, match_token
+from .io_common import make_module_tag, make_op_tag, next_exec_order
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ _DISPATCH_DEBUG = os.getenv("VLLM_FL_DISPATCH_DEBUG", "0") == "1"
 # Record which dispatch-level ops are used into the FlagGems oplist file,
 # so users can inspect runtime op usage in one place.
 _FLAGOS_OPLIST_LOCK = threading.Lock()
-_RECORDED_FLAGOS_OPS: set[tuple[str, str]] = set()  # (op_name, impl_id)
+_RECORDED_FLAGOS_OPS: Set[Tuple[str, str]] = set()  # (op_name, impl_id)
 
 
 def _record_default_flagos_op(op_name: str, impl: OpImpl) -> None:
@@ -91,26 +91,25 @@ class OpManager:
     - Dispatch caching with invalidation
     """
 
-    def __init__(
-        self, registry: OpRegistry | None = None, *, register_builtins: bool = True
-    ) -> None:
+    def __init__(self, registry: Optional[OpRegistry] = None) -> None:
         self._lock = threading.RLock()
         self._registry = registry or OpRegistry()
-        self._register_builtins = register_builtins
         self._state = _OpManagerState()
         # Cache for resolve(): (op_name, policy, epoch) -> chosen impl.
-        self._dispatch_cache: dict[tuple[str, SelectionPolicy, int], OpImpl] = {}
+        self._dispatch_cache: Dict[Tuple[str, "SelectionPolicy", int], OpImpl] = {}
         # Cache for resolve_candidates(): (op_name, policy, epoch) -> ordered impls.
-        self._candidates_cache: dict[
-            tuple[str, SelectionPolicy, int], list[OpImpl]
+        self._candidates_cache: Dict[
+            Tuple[str, "SelectionPolicy", int], list[OpImpl]
         ] = {}
-        self._called_ops: dict[str, str] = {}  # Map op_name -> last_used_impl_id
-        self._failed_impls: dict[str, set[str]] = {}  # Map op_name -> set of failed impl_ids
+        self._called_ops: Dict[str, str] = {}  # Map op_name -> last_used_impl_id
+        self._failed_impls: Dict[str, Set[str]] = {}  # Map op_name -> set of failed impl_ids
 
         # Register at_fork handler for multi-process safety
-        # os.register_at_fork is unavailable on Windows.
-        with suppress(AttributeError):
+        try:
             os.register_at_fork(after_in_child=self._reset_after_fork)
+        except AttributeError:
+            # os.register_at_fork not available (Windows)
+            pass
 
     @property
     def registry(self) -> OpRegistry:
@@ -147,7 +146,7 @@ class OpManager:
             self._failed_impls.clear()
             logger.debug(f"Policy epoch bumped to {self._state.policy_epoch}")
 
-    def clear_failed_impls(self, op_name: str | None = None) -> None:
+    def clear_failed_impls(self, op_name: Optional[str] = None) -> None:
         """
         Clear the failed implementations cache.
 
@@ -165,7 +164,7 @@ class OpManager:
                 del self._failed_impls[op_name]
                 logger.debug(f"Cleared failed implementations cache for op '{op_name}'")
 
-    def get_failed_impls(self, op_name: str | None = None) -> dict[str, set[str]]:
+    def get_failed_impls(self, op_name: Optional[str] = None) -> Dict[str, Set[str]]:
         """
         Get the failed implementations cache.
 
@@ -206,8 +205,7 @@ class OpManager:
 
             # Register built-in operators
             from . import builtin_ops
-            if self._register_builtins:
-                builtin_ops.register_builtins(self._registry)
+            builtin_ops.register_builtins(self._registry)
 
             # Invalidate cache
             self._state.policy_epoch += 1
@@ -239,7 +237,7 @@ class OpManager:
         """Print detailed list of registered operators and their implementations."""
         snap = self._registry.snapshot()
 
-        logger.info("\n%s", "=" * 80)
+        logger.info("\n" + "="*80)
         logger.info("VLLM-FL Dispatch: Registered Operators")
         logger.info("="*80)
 
@@ -256,7 +254,7 @@ class OpManager:
                 vendor_info = f", vendor={impl.vendor}" if impl.vendor else ""
                 logger.info(f"  {available} {impl.impl_id} (kind={impl.kind.value}, priority={impl.priority}{vendor_info})")
 
-        logger.info("\n%s\n", "=" * 80)
+        logger.info("\n" + "="*80 + "\n")
 
     def _matches_vendor_filters(self, impl: OpImpl, policy: SelectionPolicy) -> bool:
         """Check if implementation matches policy vendor filters."""
@@ -271,7 +269,10 @@ class OpManager:
             return False
 
         # Check allow list (if specified)
-        return policy.allow_vendors is None or impl.vendor in policy.allow_vendors
+        if policy.allow_vendors is not None and impl.vendor not in policy.allow_vendors:
+            return False
+
+        return True
 
     def _default_order(self, policy: SelectionPolicy) -> list[str]:
         """Get default selection order based on policy."""
@@ -328,7 +329,7 @@ class OpManager:
         candidates = self._compute_candidates(op_name, policy)
         order = policy.per_op_order_dict.get(op_name) or self._default_order(policy)
 
-        chosen: OpImpl | None = None
+        chosen: Optional[OpImpl] = None
         for token in order:
             matches = [c for c in candidates if match_token(c, token)]
             if not matches:
@@ -491,8 +492,10 @@ class OpManager:
         try:
             result = fn(*args, **kwargs)
         except Exception:
-            with suppress(Exception):
+            try:
                 dump_cleanup(op_name)
+            except Exception:
+                pass
             raise
 
         try:
@@ -610,7 +613,7 @@ class OpManager:
 
 
 # Global default instance
-_default_manager: OpManager | None = None
+_default_manager: Optional[OpManager] = None
 _manager_lock = threading.RLock()
 
 
