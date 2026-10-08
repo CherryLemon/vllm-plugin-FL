@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Register and activate the plugin-owned GLM5-Next runtime components."""
 
-import os
-from functools import wraps
+from functools import lru_cache, wraps
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
 
 import torch
-
 from vllm.logger import init_logger
-from vllm.model_executor.models.config import (
-    HybridAttentionMambaModelConfig,
-)
+from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
 from vllm.platforms import current_platform
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
@@ -26,10 +22,7 @@ from vllm_fl.activation import (
     register_plan_provider,
 )
 from vllm_fl.dispatch.policy import SelectionPolicy
-from vllm_fl.kernels.glm5_next.provider import (
-    get_glm5_provider,
-    use_nvidia_reference,
-)
+from vllm_fl.kernels.glm5_next.provider import use_nvidia_reference
 from vllm_fl.runtime.model_policy import (
     ModelPolicyError,
     ModelPolicyFactory,
@@ -83,12 +76,6 @@ def glm5_portable_moe_defaults() -> MoEDispatchDefaults:
     )
 
 
-def _is_missing_cache_op(exc: AttributeError, op_name: str) -> bool:
-    """Return whether vLLM failed because ``_C_cache_ops`` lacks an op."""
-    message = str(exc)
-    return "_C_cache_ops" in message and op_name in message
-
-
 def _has_vllm_cache_op(op_name: str) -> bool:
     """Probe the extension ABI without invoking a device kernel."""
     try:
@@ -98,163 +85,92 @@ def _has_vllm_cache_op(op_name: str) -> bool:
     return True
 
 
-def _concat_and_cache_mla_bf16_fallback(
-    kv_c: torch.Tensor,
-    k_pe: torch.Tensor,
-    kv_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    kv_cache_dtype: str,
-    scale: torch.Tensor,
-) -> None:
-    """Correctness fallback for a vendor MLA backend without its cache op.
-
-    This is deliberately limited to BF16 cache semantics.  Quantized cache
-    formats require the vendor or FlagGems implementation because ``scale``
-    participates in the stored representation.
-    """
-    del scale
-    if kv_cache_dtype not in ("auto", "bfloat16"):
-        raise NotImplementedError(
-            "GLM5-Next portable concat_and_cache_mla only supports BF16 KV "
-            f"cache, got {kv_cache_dtype!r}"
-        )
-    source = kv_c if k_pe.shape[-1] == 0 else torch.cat((kv_c, k_pe), dim=-1)
-    slots = slot_mapping.flatten().to(torch.int64)
-    valid = slots >= 0
-    cache_flat = kv_cache.view(-1, kv_cache.shape[-1])
-    cache_flat[slots[valid]] = source[valid]
+@lru_cache(maxsize=None)
+def _concat_handles_zero_rope(concat) -> bool:
+    device = current_platform.device_type
+    q = torch.ones((1, 1, 512), dtype=torch.bfloat16, device=device)
+    rope = torch.empty((1, 1, 0), dtype=q.dtype, device=device)
+    out = torch.full_like(q, -2)
+    try:
+        concat(q, rope, out)
+    except (AttributeError, NotImplementedError):
+        return False
+    except RuntimeError as exc:
+        # The native ABI rejects zero RoPE before launching its cache kernel.
+        # Recognize only this shape guard; device/execution failures propagate.
+        message = str(exc).strip()
+        guard = "rope_dim must be 64, got 0"
+        if message == guard or (
+            message.startswith("concat_mla_q, ") and message.endswith(", " + guard)
+        ):
+            return False
+        raise
+    return bool(torch.equal(q, out))
 
 
 def _mla_boundary_patches(custom_ops, fingerprint) -> list[PendingPatch]:
-    """Keep vendor sparse MLA while filling its optional vLLM ABI edges.
-
-    Vendor backends remain responsible for the actual sparse attention.  The
-    wrappers below only cover GLM5-Next's zero-width RoPE query and the common
-    BF16 cache-write ABI that some OOT vLLM builds do not provide.
-    """
     if custom_ops is None:
         from vllm import _custom_ops as custom_ops
+    from vllm_fl.kernels.glm5_next.indexer_backend import _load_flaggems_op
 
     patches = []
 
     def stage(attr, replacement):
+        original = getattr(custom_ops, attr)
         patches.append(
             PendingPatch(
                 target=f"{custom_ops.__name__}.{attr}",
                 owner=custom_ops,
                 attr=attr,
                 replacement=replacement,
-                pristine=getattr(custom_ops, attr),
+                pristine=original,
                 fingerprint=fingerprint,
                 phase="worker",
             )
         )
 
-    strict_flaggems = get_glm5_provider() == "flaggems"
+    concat = custom_ops.concat_mla_q
+    if not getattr(
+        concat, "_glm5_next_nope_fix", False
+    ) and not _concat_handles_zero_rope(concat):
+        query_op = _load_flaggems_op("concat_mla_q", "concat_mla_q")
+        if query_op is None:
+            raise RuntimeError(
+                "GLM zero-RoPE boundary requires FlagGems-vllm concat_mla_q"
+            )
 
-    concat_mla_q = custom_ops.concat_mla_q
-    if not getattr(concat_mla_q, "_glm5_next_nope_fix", False):
-
-        @wraps(concat_mla_q)
-        def concat_mla_q_nope(ql_nope, q_pe, q_out):
-            if strict_flaggems:
-                raise RuntimeError(
-                    "VLLM_FL_GLM5_PROVIDER=flaggems was requested, but the "
-                    "stock/vendor sparse-MLA path called "
-                    "vllm._custom_ops.concat_mla_q. The worker did not select "
-                    "FlagGemsSparseMLABackend; check the worker environment, "
-                    "Plugin FL patch/version, and vendor backend overrides."
-                )
+        @wraps(concat)
+        def concat_nope(q_nope, q_pe, q_out):
             if q_pe.shape[-1] == 0:
-                q_out.copy_(ql_nope)
-                return None
-            return concat_mla_q(ql_nope, q_pe, q_out)
+                return query_op(q_nope, q_pe, q_out)
+            return concat(q_nope, q_pe, q_out)
 
-        concat_mla_q_nope._glm5_next_nope_fix = True
-        concat_mla_q_nope._glm5_next_original = concat_mla_q
-        stage("concat_mla_q", concat_mla_q_nope)
+        concat_nope._glm5_next_nope_fix = True
+        stage("concat_mla_q", concat_nope)
 
-    concat_and_cache_mla = custom_ops.concat_and_cache_mla
+    cache = custom_ops.concat_and_cache_mla
     if not _has_vllm_cache_op("concat_and_cache_mla") and not getattr(
-        concat_and_cache_mla, "_glm5_next_vendor_fallback", False
+        cache, "_glm5_next_vendor_fallback", False
     ):
-        native_cache_op_available = True
-        flaggems_cache_writer = None
-        flaggems_cache_writer_loaded = False
+        writer = _load_flaggems_op("concat_and_cache_mla", "concat_and_cache_mla")
+        if writer is None:
+            raise RuntimeError(
+                "GLM MLA cache boundary requires FlagGems-vllm concat_and_cache_mla"
+            )
 
-        @wraps(concat_and_cache_mla)
-        def concat_and_cache_mla_vendor_first(
-            kv_c,
-            k_pe,
-            kv_cache,
-            slot_mapping,
-            kv_cache_dtype,
-            scale,
-        ):
-            nonlocal native_cache_op_available
-            nonlocal flaggems_cache_writer
-            nonlocal flaggems_cache_writer_loaded
-
-            if native_cache_op_available:
-                try:
-                    return concat_and_cache_mla(
-                        kv_c,
-                        k_pe,
-                        kv_cache,
-                        slot_mapping,
-                        kv_cache_dtype,
-                        scale,
-                    )
-                except AttributeError as exc:
-                    if not _is_missing_cache_op(exc, "concat_and_cache_mla"):
-                        raise
-                    native_cache_op_available = False
-                    logger.warning(
-                        "Vendor vLLM has no _C_cache_ops.concat_and_cache_mla; "
-                        "trying FlagGems and then the BF16 correctness fallback"
-                    )
-
-            if not flaggems_cache_writer_loaded:
-                flaggems_cache_writer_loaded = True
-                try:
-                    from flag_gems.fused.concat_and_cache_mla import (
-                        concat_and_cache_mla as flaggems_cache_writer_impl,
-                    )
-
-                    flaggems_cache_writer = flaggems_cache_writer_impl
-                except (ImportError, AttributeError, OSError):
-                    flaggems_cache_writer = None
-
-            if flaggems_cache_writer is not None:
-                # The writer is selected once when it is first loaded.  It may
-                # already have written to the cache before raising, so an error
-                # is propagated instead of retried against the Torch fallback
-                # (which would double-write or corrupt the KV cache).
-                flag_cache_dtype = (
-                    "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype
-                )
-                return flaggems_cache_writer(
-                    kv_c,
-                    k_pe,
-                    kv_cache,
-                    slot_mapping,
-                    kv_cache_dtype=flag_cache_dtype,
-                    scale=scale,
-                )
-
-            return _concat_and_cache_mla_bf16_fallback(
+        @wraps(cache)
+        def cache_write(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale):
+            return writer(
                 kv_c,
                 k_pe,
                 kv_cache,
                 slot_mapping,
-                kv_cache_dtype,
+                "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
                 scale,
             )
 
-        concat_and_cache_mla_vendor_first._glm5_next_vendor_fallback = True
-        concat_and_cache_mla_vendor_first._glm5_next_original = concat_and_cache_mla
-        stage("concat_and_cache_mla", concat_and_cache_mla_vendor_first)
-
+        cache_write._glm5_next_vendor_fallback = True
+        stage("concat_and_cache_mla", cache_write)
     return patches
 
 
@@ -271,103 +187,7 @@ def _silu_and_mul_with_clamp_oot(op, self, x):
     return op(x[..., :dim], x[..., dim:], self.swiglu_limit)
 
 
-def _mhc_rms_norm(
-    layer_input: torch.Tensor,
-    norm_weight: torch.Tensor | None,
-    norm_eps: float,
-) -> torch.Tensor:
-    """Apply the RMSNorm fused by the CUDA mHC reference kernels."""
-    if norm_weight is None:
-        return layer_input
-    layer_input_fp32 = layer_input.float()
-    inv_rms = torch.rsqrt(
-        layer_input_fp32.square().mean(dim=-1, keepdim=True) + norm_eps
-    )
-    return (layer_input_fp32 * inv_rms * norm_weight.float()).to(layer_input.dtype)
-
-
-def _mhc_pre_oot_with_norm(
-    op,
-    self,
-    residual,
-    fn,
-    hc_scale,
-    hc_base,
-    rms_eps,
-    hc_pre_eps,
-    hc_sinkhorn_eps,
-    hc_post_mult_value,
-    sinkhorn_repeat,
-    n_splits=1,
-    norm_weight=None,
-    norm_eps=0.0,
-):
-    post_mix, comb_mix, layer_input = op(
-        self,
-        residual,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-    )
-    return (
-        post_mix,
-        comb_mix,
-        _mhc_rms_norm(layer_input, norm_weight, norm_eps),
-    )
-
-
-def _mhc_fused_post_pre_oot_with_norm(
-    op,
-    self,
-    x,
-    residual,
-    post_layer_mix,
-    comb_res_mix,
-    fn,
-    hc_scale,
-    hc_base,
-    rms_eps,
-    hc_pre_eps,
-    hc_sinkhorn_eps,
-    hc_post_mult_value,
-    sinkhorn_repeat,
-    n_splits=1,
-    tile_n=1,
-    norm_weight=None,
-    norm_eps=0.0,
-):
-    residual_cur, post_mix, comb_mix, layer_input = op(
-        self,
-        x,
-        residual,
-        post_layer_mix,
-        comb_res_mix,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-        tile_n,
-    )
-    return (
-        residual_cur,
-        post_mix,
-        comb_mix,
-        _mhc_rms_norm(layer_input, norm_weight, norm_eps),
-    )
-
-
-def _bind_portable_forward(owner, name, flag, normalize=None, cuda_max_tokens=0):
+def _bind_portable_forward(owner, name, flag, normalize=None):
     """Use the existing policy binding for portable custom-op dispatch."""
     from vllm_fl.dispatch.binding import OperatorBinding
     from vllm_fl.dispatch.manager import OpManager
@@ -380,15 +200,26 @@ def _bind_portable_forward(owner, name, flag, normalize=None, cuda_max_tokens=0)
         manager.registry.register_impl(
             OpImpl(name, "glm5.flaggems", BackendImplKind.DEFAULT, flag)
         )
+
+    def native(*args, **kwargs):
+        return owner.forward_cuda(*args, **kwargs)
+
+    native._is_available = use_nvidia_reference
     manager.registry.register_impl(
-        OpImpl(name, "glm5.torch", BackendImplKind.REFERENCE, owner.forward_native)
+        OpImpl(name, "glm5.cuda", BackendImplKind.VENDOR, native, vendor="cuda")
+    )
+
+    def reference(*args, **kwargs):
+        return owner.forward_native(*args, **kwargs)
+
+    reference._is_available = lambda: current_platform.device_type == "cpu"
+    manager.registry.register_impl(
+        OpImpl(name, "glm5.torch", BackendImplKind.REFERENCE, reference)
     )
     binding = OperatorBinding(manager, name)
 
     @wraps(owner.forward_native)
     def forward(self, *args, **kwargs):
-        if cuda_max_tokens and args[0].shape[0] <= cuda_max_tokens:
-            return self.forward_cuda(*args, **kwargs)
         if normalize is not None:
             return normalize(binding, self, *args, **kwargs)
         return binding(self, *args, **kwargs)
@@ -509,7 +340,7 @@ def _glm5_fingerprint() -> str:
         release = version("vllm").split("+", 1)[0]
     except PackageNotFoundError:  # pragma: no cover - vLLM must be installed
         release = "unknown"
-    return f"glm5_next_runtime@vllm{release}:provider={get_glm5_provider()}"
+    return f"glm5_next_runtime@vllm{release}"
 
 
 def _is_glm5_model(vllm_config) -> bool:
@@ -542,7 +373,6 @@ def validate_glm5_config(vllm_config) -> None:
     """
     # Model selection has already matched GLM here; registration must never
     # validate a model-specific environment variable.
-    get_glm5_provider()
     parallel = getattr(vllm_config, "parallel_config", None)
     if getattr(parallel, "pipeline_parallel_size", 1) != 1:
         raise ModelPolicyError(
@@ -584,23 +414,23 @@ def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
     if not use_mla:
         return None
 
-    provider = get_glm5_provider()
-    # The model's auto provider selects portable kernels on non-NVIDIA too.
-    # The active GLM plan owns this override; generic dispatch stays unchanged.
-    auto_portable = provider == "auto" and not use_nvidia_reference()
-    if provider != "flaggems" and not auto_portable:
-        return None
+    from vllm_fl.dispatch.policy import get_policy
 
+    policy = get_policy()
+    order = (
+        policy.get_per_op_order("flash_mla_sparse_fwd" if use_sparse else "attention")
+        or policy.get_default_order()
+    )
+    native_allowed = "cuda" not in policy.deny_vendors and (
+        not policy.allow_vendors or "cuda" in policy.allow_vendors
+    )
+    if use_nvidia_reference() and native_allowed and order[0] != "flagos":
+        return None
     from vllm_fl.dispatch.backends.flaggems.flaggems import FlagGemsBackend
 
     flaggems_backend = FlagGemsBackend()
     if not flaggems_backend.is_available():
-        if provider == "flaggems":
-            raise RuntimeError("VLLM_FL_GLM5_PROVIDER=flaggems requires FlagGems")
-        raise RuntimeError(
-            "GLM5 auto provider selected a portable MLA backend because the "
-            "NVIDIA ABI/DeepGEMM is unavailable, but FlagGems is not installed"
-        )
+        raise RuntimeError("GLM portable MLA requires the paired FlagGems libraries")
     backend_path = (
         "vllm_fl.dispatch.backends.flaggems.impl.mla_sparse.FlagGemsSparseMLABackend"
         if use_sparse
@@ -618,61 +448,32 @@ def _mhc_patches(fingerprint: str) -> list[PendingPatch]:
     from vllm.model_executor.layers.activation import SiluAndMulWithClamp
     from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
 
-    native = use_nvidia_reference()
-    limit = (
-        int(os.environ.get("VLLM_FL_GLM5_MHC_CUDA_MAX_TOKENS", "0")) if native else 0
-    )
-    owners = (MHCPreOp, MHCPostOp, MHCFusedPostPreOp)
-    if native and limit <= 0:
-        specs = [(owner, owner.forward_cuda) for owner in owners]
-    else:
-        from vllm_fl.kernels.glm5_next.indexer_backend import _load_flaggems_op
+    from vllm_fl.kernels.glm5_next.indexer_backend import _load_flaggems_op
 
-        pre = _load_flaggems_op("mhc", "mhc_pre")
-        post = _load_flaggems_op("mhc", "mhc_post")
+    def bind_library(op):
+        def call(self, *args, **kwargs):
+            return op(*args, **kwargs)
 
-        def fused(self, x, residual, post_mix, comb_mix, *pre_args):
-            residual = post(x, residual, post_mix, comb_mix)
-            # tile_n belongs only to the fused native kernel.
-            return (residual, *pre(residual, *pre_args[:-1]))
+        return call
 
-        specs = [
-            (owner, _bind_portable_forward(owner, name, flag, normalize, limit))
-            for owner, name, flag, normalize in (
-                (
-                    MHCPreOp,
-                    "mhc_pre",
-                    (lambda self, *a, **kw: pre(*a, **kw)) if pre else None,
-                    _mhc_pre_oot_with_norm,
-                ),
-                (
-                    MHCPostOp,
-                    "mhc_post",
-                    (lambda self, *a, **kw: post(*a, **kw)) if post else None,
-                    None,
-                ),
-                (
-                    MHCFusedPostPreOp,
-                    "mhc_fused_post_pre",
-                    fused if pre and post else None,
-                    _mhc_fused_post_pre_oot_with_norm,
-                ),
+    specs = []
+    for owner, name, api in (
+        (MHCPreOp, "mhc_pre", "mhc_pre_with_norm"),
+        (MHCPostOp, "mhc_post", "mhc_post"),
+        (MHCFusedPostPreOp, "mhc_fused_post_pre", "mhc_fused_post_pre_with_norm"),
+        (SiluAndMulWithClamp, "silu_and_mul_with_clamp", "silu_and_mul_with_clamp"),
+    ):
+        op = _load_flaggems_op(api, api)
+        flag = (
+            None
+            if op is None
+            else (
+                partial(_silu_and_mul_with_clamp_oot, op)
+                if name == "silu_and_mul_with_clamp"
+                else bind_library(op)
             )
-        ]
-        if not native:
-            clamp = _load_flaggems_op(
-                "silu_and_mul_with_clamp", "silu_and_mul_with_clamp"
-            )
-            specs.append(
-                (
-                    SiluAndMulWithClamp,
-                    _bind_portable_forward(
-                        SiluAndMulWithClamp,
-                        "silu_and_mul_with_clamp",
-                        partial(_silu_and_mul_with_clamp_oot, clamp) if clamp else None,
-                    ),
-                )
-            )
+        )
+        specs.append((owner, _bind_portable_forward(owner, name, flag)))
     return [
         _pending_attr(owner, "forward_oot", value, fingerprint, ("self",))
         for owner, value in specs
@@ -705,9 +506,7 @@ def _apply_glm5_activation() -> None:
     # registration for every model; the config-time and registry hooks stay
     # there because vLLM needs them before the worker exists, but the metadata
     # builder and KV-block zeroer hooks are runner-side and now follow the plan.
-    from vllm_fl.patches.glm5_next_kpool import (
-        glm5_next_kpool_runtime_patches,
-    )
+    from vllm_fl.patches.glm5_next_kpool import glm5_next_kpool_runtime_patches
 
     patches.extend(glm5_next_kpool_runtime_patches(fingerprint))
 
@@ -751,13 +550,7 @@ def _glm5_runtime_plan(vllm_config, device_caps, user_policy):
     # indexer bindings. Explicit per-op user choices keep precedence.
     from vllm_fl.kernels.glm5_next.provider import INDEXER_OPERATORS
 
-    order = (
-        ("vendor:cuda", "flagos", "reference")
-        if use_nvidia_reference()
-        else ("flagos", "reference")
-    )
-    if policy.prefer != "flagos":
-        order = policy.get_default_order()
+    order = policy.get_default_order()
     merged = {name: list(order) for name in INDEXER_OPERATORS}
     merged.update(policy.per_op_order_dict)
     policy = SelectionPolicy.from_dict(
@@ -776,23 +569,17 @@ def _glm5_runtime_plan(vllm_config, device_caps, user_policy):
 
 def _register_glm5_next_registrations() -> None:
     """Idempotent config/model registration (safe at plugin import time)."""
-    from vllm.model_executor.models import (
-        config as model_config,
-        registry as model_registry,
-    )
-    from vllm.transformers_utils import (
-        config as transformers_config,
-        model_arch_config_convertor,
-    )
+    from vllm.model_executor.models import config as model_config
+    from vllm.model_executor.models import registry as model_registry
+    from vllm.transformers_utils import config as transformers_config
+    from vllm.transformers_utils import model_arch_config_convertor
 
     from vllm_fl.configs.glm5_next import (
         Glm5NextConfig,
         Glm5NextTextConfig,
         Glm5NextVisionConfig,
     )
-    from vllm_fl.patches.glm5_next_kpool import (
-        install_glm5_next_kpool,
-    )
+    from vllm_fl.patches.glm5_next_kpool import install_glm5_next_kpool
 
     install_glm5_next_kpool()
 

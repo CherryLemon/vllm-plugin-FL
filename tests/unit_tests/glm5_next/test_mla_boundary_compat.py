@@ -1,208 +1,272 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Initialize MLA compatibility from native capabilities, before state writes.
 
-import sys
+Public library operators are explicitly stubbed here; numerical correctness is
+covered by the operator-library tests. These tests exercise real patch binding.
+"""
+
 from types import ModuleType
 
 import pytest
 import torch
 
+from vllm_fl.kernels.glm5_next import indexer_backend
 from vllm_fl.patches import glm5_next_runtime as glm5_patch
 
 _install_mla_boundary_compat_ops = glm5_patch._install_mla_boundary_compat_ops
 
 
 @pytest.fixture(autouse=True)
-def clean_worker_patch_records():
+def clean_worker_patch_records(monkeypatch):
     from vllm_fl.activation import reset_activation_for_tests
 
     reset_activation_for_tests()
+    glm5_patch._concat_handles_zero_rope.cache_clear()
+    monkeypatch.setattr(glm5_patch.current_platform, "device_type", "cpu")
     yield
     reset_activation_for_tests()
+    glm5_patch._concat_handles_zero_rope.cache_clear()
 
 
-def _fake_ops(*, cache_impl):
+def _fake_ops(*, cache_impl, query_impl=None):
     module = ModuleType("fake_vllm_custom_ops")
 
     def concat_mla_q(q_nope, q_pe, output):
         output.copy_(torch.cat((q_nope, q_pe), dim=-1))
 
-    module.concat_mla_q = concat_mla_q
+    module.concat_mla_q = query_impl or concat_mla_q
     module.concat_and_cache_mla = cache_impl
     return module
 
 
-def test_mla_boundary_compat_keeps_vendor_fast_paths(monkeypatch) -> None:
-    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
-    calls = {"cache": 0, "q": 0}
+def _public_ops(monkeypatch, *, query=None, writer=None):
+    ops = {"concat_mla_q": query, "concat_and_cache_mla": writer}
+    requested = []
 
-    def vendor_cache(kv_c, k_pe, cache, slots, cache_dtype, scale):
-        del k_pe, slots, cache_dtype, scale
-        calls["cache"] += 1
-        cache.view(-1, cache.shape[-1])[: kv_c.shape[0]].copy_(kv_c)
+    def load(module, name):
+        assert module == name
+        requested.append(name)
+        return ops[name]
 
-    ops = _fake_ops(cache_impl=vendor_cache)
-    original_q = ops.concat_mla_q
+    monkeypatch.setattr(indexer_backend, "_load_flaggems_op", load)
+    return requested
 
-    def counted_q(*args):
-        calls["q"] += 1
-        return original_q(*args)
 
-    ops.concat_mla_q = counted_q
+def test_supported_native_query_and_cache_keep_identity(monkeypatch):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
+    calls = []
+
+    def native_query(q, rope, out):
+        calls.append("query")
+        out.copy_(torch.cat((q, rope), dim=-1))
+
+    def native_cache(*args):
+        calls.append("cache")
+
+    ops = _fake_ops(cache_impl=native_cache, query_impl=native_query)
+    requested = _public_ops(monkeypatch)
+    assert not _install_mla_boundary_compat_ops(ops)
+    assert not _install_mla_boundary_compat_ops(ops)
+    assert ops.concat_mla_q is native_query
+    assert ops.concat_and_cache_mla is native_cache
+    assert calls == ["query"]  # stable capability is probed once
+    assert not requested
+    q = torch.randn(2, 3, 4)
+    for rope_width in (0, 2):
+        rope = torch.randn(2, 3, rope_width)
+        out = torch.empty(2, 3, 4 + rope_width)
+        ops.concat_mla_q(q, rope, out)
+        torch.testing.assert_close(out, torch.cat((q, rope), -1))
+    assert calls == ["query", "query", "query"]
+
+
+def test_zero_rope_guard_preserves_positive_rope_native_path(monkeypatch):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
+    calls = []
+
+    def native_query(q, rope, out):
+        calls.append("native")
+        if rope.shape[-1]:
+            out.copy_(torch.cat((q, rope), -1))
+
+    def public_query(q, rope, out):
+        calls.append("public")
+        out.copy_(torch.cat((q, rope), -1))
+
+    ops = _fake_ops(cache_impl=lambda *args: None, query_impl=native_query)
+    requested = _public_ops(monkeypatch, query=public_query)
     assert _install_mla_boundary_compat_ops(ops)
     assert not _install_mla_boundary_compat_ops(ops)
-
-    q_nope = torch.randn(2, 3, 4)
-    q_pe_empty = torch.empty(2, 3, 0)
-    q_out = torch.empty_like(q_nope)
-    ops.concat_mla_q(q_nope, q_pe_empty, q_out)
-    torch.testing.assert_close(q_out, q_nope)
-    assert calls["q"] == 0
-
-    q_pe = torch.randn(2, 3, 2)
-    q_out_with_pe = torch.empty(2, 3, 6)
-    ops.concat_mla_q(q_nope, q_pe, q_out_with_pe)
-    torch.testing.assert_close(q_out_with_pe, torch.cat((q_nope, q_pe), -1))
-    assert calls["q"] == 1
-
-    kv_c = torch.randn(3, 4)
-    cache = torch.zeros(2, 4, 4)
-    ops.concat_and_cache_mla(
-        kv_c,
-        torch.empty(3, 0),
-        cache,
-        torch.arange(3),
-        "auto",
-        torch.ones(1),
-    )
-    assert calls["cache"] == 1
-    torch.testing.assert_close(cache.view(-1, 4)[:3], kv_c)
+    assert requested == ["concat_mla_q"]
+    assert calls == ["native"]
+    q = torch.randn(2, 3, 4)
+    # Start with the valid native condition, then change only the RoPE width.
+    for rope_width, implementation in ((2, "native"), (0, "public")):
+        rope = torch.randn(2, 3, rope_width)
+        out = torch.empty(2, 3, 4 + rope_width)
+        before = len(calls)
+        ops.concat_mla_q(q, rope, out)
+        assert calls[before:] == [implementation]
+        torch.testing.assert_close(out, torch.cat((q, rope), -1))
 
 
-def test_mla_cache_missing_vendor_op_uses_bf16_slot_fallback(
-    monkeypatch,
-) -> None:
+def test_missing_cache_abi_selects_public_writer_before_native_call(monkeypatch):
     monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
-    calls = {"cache": 0}
+    calls = []
 
-    def missing_vendor_cache(*args, **kwargs):
-        calls["cache"] += 1
-        raise AttributeError(
-            "'_OpNamespace' '_C_cache_ops' object has no attribute "
-            "'concat_and_cache_mla'"
-        )
+    def missing_native(*args):
+        calls.append("native")
+        pytest.fail("missing ABI was executed")
 
-    # Make the test independent of whether its host environment has FlagGems.
-    monkeypatch.setitem(sys.modules, "flag_gems.fused.concat_and_cache_mla", None)
-    ops = _fake_ops(cache_impl=missing_vendor_cache)
-    _install_mla_boundary_compat_ops(ops)
+    def writer(kv, rope, cache, slots, cache_dtype, scale):
+        calls.append(cache_dtype)
+        assert rope.shape[-1] == 0
+        valid = slots >= 0
+        cache.view(-1, kv.shape[-1])[slots[valid]] = kv[valid]
 
-    kv_c = torch.arange(12, dtype=torch.float32).view(4, 3)
+    ops = _fake_ops(cache_impl=missing_native)
+    requested = _public_ops(monkeypatch, writer=writer)
+    assert _install_mla_boundary_compat_ops(ops)
+    assert not _install_mla_boundary_compat_ops(ops)
+    assert requested == ["concat_and_cache_mla"]
+    kv = torch.arange(12, dtype=torch.float32).view(4, 3)
     slots = torch.tensor([0, 3, -1, 7])
-    cache = torch.zeros(2, 4, 3)
-    empty_pe = torch.empty(4, 0)
-    scale = torch.ones(1)
-
-    ops.concat_and_cache_mla(kv_c, empty_pe, cache, slots, "bfloat16", scale)
-    torch.testing.assert_close(cache.view(-1, 3)[slots[:2]], kv_c[:2])
-    torch.testing.assert_close(cache.view(-1, 3)[slots[3:]], kv_c[3:])
-
-    # The missing native ABI is remembered, so subsequent calls do not pay
-    # for another exception before taking the fallback.
-    cache.zero_()
-    ops.concat_and_cache_mla(kv_c, empty_pe, cache, slots, "auto", scale)
-    assert calls["cache"] == 1
-
-    with pytest.raises(NotImplementedError, match="only supports BF16"):
-        ops.concat_and_cache_mla(kv_c, empty_pe, cache, slots, "fp8_ds_mla", scale)
-
-
-def test_flaggems_writer_failure_after_write_is_not_retried(monkeypatch) -> None:
-    """Finding 6: a writer error after a possible write must propagate."""
-    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
-    calls = {"cache": 0}
-
-    def missing_vendor_cache(*args, **kwargs):
-        raise AttributeError(
-            "'_OpNamespace' '_C_cache_ops' object has no attribute "
-            "'concat_and_cache_mla'"
+    for dtype in ("bfloat16", "auto"):
+        cache = torch.zeros(2, 4, 3)
+        ops.concat_and_cache_mla(
+            kv, torch.empty(4, 0), cache, slots, dtype, torch.ones(1)
         )
+        torch.testing.assert_close(cache.view(-1, 3)[slots[slots >= 0]], kv[slots >= 0])
+    assert calls == ["auto", "auto"]
 
-    fake_module = ModuleType("flag_gems.fused.concat_and_cache_mla")
 
-    def writer(kv_c, k_pe, cache, slots, *, kv_cache_dtype, scale):
-        del k_pe, kv_cache_dtype, scale
-        calls["cache"] += 1
-        cache.view(-1, cache.shape[-1])[slots] = 1.0
-        raise RuntimeError("writer failed after writing")
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, NotImplementedError, torch.OutOfMemoryError]
+)
+def test_writer_failure_after_mutation_is_not_retried(monkeypatch, error_type):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+    calls = []
+    error = error_type("writer failed after writing")
 
-    fake_module.concat_and_cache_mla = writer
-    monkeypatch.setitem(
-        sys.modules, "flag_gems.fused.concat_and_cache_mla", fake_module
-    )
+    def writer(kv, rope, cache, slots, cache_dtype, scale):
+        calls.append("public")
+        cache.view(-1, kv.shape[-1])[slots] = 1
+        raise error
 
-    ops = _fake_ops(cache_impl=missing_vendor_cache)
+    ops = _fake_ops(cache_impl=lambda *args: calls.append("native"))
+    _public_ops(monkeypatch, writer=writer)
     _install_mla_boundary_compat_ops(ops)
-
-    with pytest.raises(RuntimeError, match="after writing"):
+    cache = torch.zeros(2, 4, 3)
+    with pytest.raises(error_type) as caught:
         ops.concat_and_cache_mla(
             torch.zeros(2, 3),
             torch.empty(2, 0),
-            torch.zeros(2, 4, 3),
+            cache,
             torch.tensor([0, 1]),
             "auto",
             torch.ones(1),
         )
-    assert calls["cache"] == 1
+    assert caught.value is error
+    assert calls == ["public"]
+    assert torch.equal(cache.view(-1, 3)[:2], torch.ones(2, 3))
 
 
-def test_mla_cache_does_not_hide_unrelated_vendor_errors(monkeypatch) -> None:
-    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+def test_unrelated_native_error_propagates_when_abi_exists(monkeypatch):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
+    calls = []
 
-    def broken_vendor_cache(*args, **kwargs):
+    def broken_native(*args):
+        calls.append("native")
         raise AttributeError("vendor metadata is missing")
 
-    ops = _fake_ops(cache_impl=broken_vendor_cache)
-    _install_mla_boundary_compat_ops(ops)
-
+    ops = _fake_ops(cache_impl=broken_native)
+    requested = _public_ops(monkeypatch)
+    assert not _install_mla_boundary_compat_ops(ops)
     with pytest.raises(AttributeError, match="vendor metadata"):
         ops.concat_and_cache_mla(
-            torch.randn(1, 3),
+            torch.ones(1, 3),
             torch.empty(1, 0),
             torch.zeros(1, 1, 3),
             torch.zeros(1, dtype=torch.int64),
             "auto",
             torch.ones(1),
         )
+    assert calls == ["native"]
+    assert not requested
 
 
-def test_mla_cache_wrapper_is_not_installed_when_vendor_abi_exists(
-    monkeypatch,
-) -> None:
+def test_missing_public_writer_does_not_partially_install_query_patch(monkeypatch):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+
+    def no_zero_rope(q, rope, out):
+        if rope.shape[-1]:
+            out.copy_(torch.cat((q, rope), -1))
+
+    ops = _fake_ops(cache_impl=lambda *args: None, query_impl=no_zero_rope)
+    query, cache = ops.concat_mla_q, ops.concat_and_cache_mla
+    _public_ops(monkeypatch, query=lambda q, rope, out: out.copy_(q))
+    with pytest.raises(RuntimeError, match="requires FlagGems-vllm"):
+        _install_mla_boundary_compat_ops(ops)
+    assert ops.concat_mla_q is query
+    assert ops.concat_and_cache_mla is cache
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "rope_dim must be 64, got 0",
+        "concat_mla_q, /workspace/csrc/libtorch_stable/cache_kernels.cu:1563, rope_dim must be 64, got 0",
+    ],
+)
+def test_zero_rope_native_shape_guard_selects_public_boundary(monkeypatch, guard):
     monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
+    calls = []
 
-    def vendor_cache(*args, **kwargs):
-        return None
+    def native_query(q, rope, out):
+        calls.append("native")
+        if not rope.shape[-1]:
+            raise RuntimeError(guard)
+        out.copy_(torch.cat((q, rope), -1))
 
-    ops = _fake_ops(cache_impl=vendor_cache)
-    _install_mla_boundary_compat_ops(ops)
+    def public_query(q, rope, out):
+        calls.append("public")
+        out.copy_(torch.cat((q, rope), -1))
 
-    assert ops.concat_and_cache_mla is vendor_cache
+    ops = _fake_ops(cache_impl=lambda *args: None, query_impl=native_query)
+    requested = _public_ops(monkeypatch, query=public_query)
+    assert _install_mla_boundary_compat_ops(ops)
+    assert not _install_mla_boundary_compat_ops(ops)
+    assert requested == ["concat_mla_q"]
+    assert calls == ["native"]
+    q = torch.ones(1, 1, 512, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    ops.concat_mla_q(q, torch.empty(1, 1, 0, dtype=q.dtype), out)
+    assert calls == ["native", "public"]
+    torch.testing.assert_close(out, q)
 
 
-def test_explicit_flaggems_rejects_accidental_vendor_attention(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(glm5_patch, "get_glm5_provider", lambda: "flaggems")
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("kernel launch failed"),
+        torch.OutOfMemoryError("CUDA out of memory"),
+        RuntimeError("rope_dim must be 64, got 8"),
+    ],
+)
+def test_native_probe_propagates_unrecognized_execution_error(monkeypatch, error):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
+    calls = []
 
-    def vendor_cache(*args, **kwargs):
-        return None
+    def broken_query(q, rope, out):
+        calls.append("native")
+        raise error
 
-    ops = _fake_ops(cache_impl=vendor_cache)
-    _install_mla_boundary_compat_ops(ops)
-
-    with pytest.raises(RuntimeError, match="did not select FlagGemsSparseMLABackend"):
-        ops.concat_mla_q(
-            torch.randn(1, 2, 3),
-            torch.empty(1, 2, 0),
-            torch.empty(1, 2, 3),
-        )
+    ops = _fake_ops(cache_impl=lambda *args: None, query_impl=broken_query)
+    original = ops.concat_mla_q
+    requested = _public_ops(monkeypatch)
+    with pytest.raises(type(error)) as caught:
+        _install_mla_boundary_compat_ops(ops)
+    assert caught.value is error
+    assert ops.concat_mla_q is original
+    assert calls == ["native"]
+    assert not requested

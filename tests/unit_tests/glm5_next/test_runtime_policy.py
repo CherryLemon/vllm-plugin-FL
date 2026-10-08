@@ -19,11 +19,11 @@ from vllm_fl.runtime.model_policy import (
 def _reset():
     reset_activation_for_tests()
     reset_model_policy_for_tests()
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
     yield
     reset_activation_for_tests()
     reset_model_policy_for_tests()
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
 
 
 def _glm_config():
@@ -51,8 +51,8 @@ def _other_config():
 
 
 def test_glm_registration_binds_runtime_policy_factory(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
-    provider.get_glm5_provider.cache_clear()
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
+    provider._has_nvidia_reference_kernels.cache_clear()
 
     assert glm_patch.register_glm5_next_support() is True
 
@@ -66,8 +66,8 @@ def test_glm_registration_binds_runtime_policy_factory(monkeypatch):
 
 
 def test_glm_runtime_plan_preserves_explicit_user_order(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
-    provider.get_glm5_provider.cache_clear()
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
+    provider._has_nvidia_reference_kernels.cache_clear()
     assert glm_patch.register_glm5_next_support() is True
 
     user_policy = SelectionPolicy.from_dict(
@@ -79,11 +79,54 @@ def test_glm_runtime_plan_preserves_explicit_user_order(monkeypatch):
 
 
 def test_glm_runtime_plan_ignores_other_models(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
-    provider.get_glm5_provider.cache_clear()
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
+    provider._has_nvidia_reference_kernels.cache_clear()
     assert glm_patch.register_glm5_next_support() is True
 
     policy = SelectionPolicy.from_dict(prefer="reference")
     plan = build_model_runtime_plan(_other_config(), None, policy)
     assert plan.selection_policy is policy
     assert plan.attention_backend is None
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_attention_override_tracks_public_policy_and_native_capability(
+    monkeypatch, sparse
+):
+    from vllm_fl.dispatch.backends.flaggems.flaggems import FlagGemsBackend
+    from vllm_fl.dispatch.policy import policy_context
+
+    available_checks = []
+    native_capability = [True]
+    monkeypatch.setattr(glm_patch, "use_nvidia_reference", lambda: native_capability[0])
+    monkeypatch.setattr(
+        FlagGemsBackend, "is_available", lambda self: available_checks.append(1) or True
+    )
+    op = "flash_mla_sparse_fwd" if sparse else "attention"
+    vendor = SelectionPolicy.from_dict(prefer="vendor")
+    flagos = SelectionPolicy.from_dict(prefer="vendor", per_op_order={op: ["flagos"]})
+    denied = SelectionPolicy.from_dict(prefer="vendor", deny_vendors={"cuda"})
+    expected = "FlagGemsSparseMLABackend" if sparse else "MLAFLBackend"
+    # Begin with a valid native selection, then change only one public condition.
+    for policy, native, uses_library in (
+        (vendor, True, False),
+        (flagos, True, True),
+        (vendor, True, False),
+        (denied, True, True),
+        (vendor, False, True),
+    ):
+        native_capability[0] = native
+        before = len(available_checks)
+        with policy_context(policy):
+            result = glm_patch._glm5_attention_override(True, sparse)
+        if uses_library:
+            assert result.endswith(expected)
+            assert len(available_checks) == before + 1
+        else:
+            assert result is None
+            assert len(available_checks) == before
+    # Non-MLA must bypass model-specific capability/dependency work entirely.
+    before = len(available_checks)
+    with policy_context(flagos):
+        assert glm_patch._glm5_attention_override(False, sparse) is None
+    assert len(available_checks) == before

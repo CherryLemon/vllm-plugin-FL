@@ -16,7 +16,6 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
-
 from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
@@ -48,11 +47,8 @@ except ImportError:
         pass
 
 
-from vllm.distributed.parallel_state import (
-    get_pcp_group,
-    get_pp_group,
-    get_tp_group,
-)
+import vllm_fl.envs as fl_envs
+from vllm.distributed.parallel_state import get_pcp_group, get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
@@ -70,8 +66,6 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-
-import vllm_fl.envs as fl_envs
 from vllm_fl.dispatch.io_common import managed_inference_mode
 from vllm_fl.utils import get_flag_gems_whitelist_blacklist
 
@@ -363,14 +357,11 @@ class WorkerFL(WorkerBase):
             else:
                 flag_gems.enable(**kwargs)
 
-        mm_status = configure_flaggems(
+        configure_flaggems(
             enable_flaggems,
             use_flaggems=fl_envs.USE_FLAGGEMS,
             whitelist=whitelist,
             blacklist=blacklist,
-        )
-        logger.info(
-            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
         )
 
     # def sleep(self, level: int = 1) -> None:

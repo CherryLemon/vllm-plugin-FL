@@ -9,10 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_fl.kernels.glm5_next.indexer_backend import (
-    Glm5NextIndexerBackend,
-    _dequantize_grouped,
-)
+from vllm_fl.kernels.glm5_next.indexer_backend import Glm5NextIndexerBackend
 from vllm_fl.patches import glm5_next_runtime as patch
 from vllm_fl.runtime.model_policy import ModelPolicyError, validate_model_config
 
@@ -52,41 +49,63 @@ def test_unsupported_modes_rejected_at_early_and_final_config(arch, mode):
 
 
 @pytest.mark.parametrize("tokens", [128, 512, 2051])
-@pytest.mark.parametrize("missing_op", [True, False])
-def test_mqa_fallback_uses_real_prefill_scale_shape(tokens, missing_op, monkeypatch):
+def test_mqa_adapter_preserves_prefill_scale_shape(tokens, monkeypatch):
     backend = Glm5NextIndexerBackend()
     monkeypatch.setattr(backend, "is_nvidia", False)
+    calls = []
+    sentinel = object()
 
-    def reject(*args, **kwargs):
-        raise NotImplementedError("unsupported shape")
+    def public_mqa(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
 
-    monkeypatch.setattr(backend, "_flag", lambda *args: None if missing_op else reject)
-    # This is the caller's squeezed [N] scale, including N == head_dim where
-    # accidental broadcasting used to succeed with the wrong values.
+    monkeypatch.setattr(backend, "_flag", lambda *args: public_mqa)
+    # Stub the public operator boundary, retaining the squeezed [N] scale ABI.
     keys = torch.ones(tokens, 128)
     scales = torch.arange(1, tokens + 1, dtype=torch.float32)
-    query = torch.ones(2, 3, 128)
-    weights = torch.ones(2, 3)
-    starts, ends = torch.tensor([0, 1]), torch.tensor([tokens, tokens - 1])
-    actual = backend.mqa_logits((query, None), (keys, scales), weights, starts, ends)
-    expected = (384 * scales).expand(2, -1).clone()
-    expected[1, 0] = expected[1, -1] = -torch.inf
-    torch.testing.assert_close(actual, expected)
-
-
-def test_grouped_scales_and_invalid_shape():
-    values = torch.ones(2, 4)
-    scales = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
-    torch.testing.assert_close(
-        _dequantize_grouped(values, scales),
-        torch.tensor([[2.0, 2.0, 3.0, 3.0], [4.0, 4.0, 5.0, 5.0]]),
+    args = (
+        (torch.ones(2, 3, 128), None),
+        (keys, scales),
+        torch.ones(2, 3),
+        torch.tensor([0, 1]),
+        torch.tensor([tokens, tokens - 1]),
     )
-    with pytest.raises(ValueError, match="Scale shape"):
-        _dequantize_grouped(values, torch.ones(3))
+    assert backend.mqa_logits(*args) is sentinel
+    assert len(calls) == 1
+    assert calls[0][0][1][0] is keys
+    assert calls[0][0][1][1] is scales
+    assert scales.shape == (tokens,)
+    assert calls[0][1] == {}
 
 
-@pytest.mark.parametrize("provider", ["flaggems", "auto"])
-def test_fresh_process_attention_dispatch_and_vision_import_isolation(provider):
+@pytest.mark.parametrize("missing_op", [False, True])
+def test_mqa_unavailable_or_unsupported_has_no_numeric_reference(
+    monkeypatch, missing_op
+):
+    backend = Glm5NextIndexerBackend()
+    monkeypatch.setattr(backend, "is_nvidia", False)
+    calls = []
+
+    def unsupported(*args, **kwargs):
+        calls.append("public")
+        raise NotImplementedError("unsupported scale layout")
+
+    monkeypatch.setattr(
+        backend, "_flag", lambda *args: None if missing_op else unsupported
+    )
+    expected = RuntimeError if missing_op else NotImplementedError
+    with pytest.raises(expected):
+        backend.mqa_logits(
+            (torch.ones(2, 3, 128), None),
+            (torch.ones(128, 128), torch.ones(128)),
+            torch.ones(2, 3),
+            torch.zeros(2, dtype=torch.int32),
+            torch.full((2,), 128, dtype=torch.int32),
+        )
+    assert calls == ([] if missing_op else ["public"])
+
+
+def test_fresh_process_attention_dispatch_and_vision_import_isolation():
     code = r"""
 from types import SimpleNamespace
 import re
@@ -100,7 +119,7 @@ from vllm_fl.patches import glm5_next_runtime as patch
 from vllm_fl.platform import PlatformFL
 from vllm_fl.dispatch.backends.flaggems.flaggems import FlagGemsBackend
 
-# Force the auto -> portable condition without replacing dispatch or logger.
+# Select the portable capability condition without replacing dispatch.
 provider._has_nvidia_reference_kernels = lambda: False
 set_global_policy(SelectionPolicy.from_dict(per_op_order={
     "attention_backend": ["flagos", "vendor:cuda"],
@@ -150,7 +169,7 @@ for sparse, expected in ((False, "MLAFLBackend"), (True, "FlagGemsSparseMLABacke
     assert PlatformFL.get_attn_backend_cls(None, selector).endswith(expected)
 print("review contracts passed")
 """
-    env = dict(os.environ, VLLM_FL_GLM5_PROVIDER=provider, VLLM_PLUGINS="fl")
+    env = dict(os.environ, VLLM_PLUGINS="fl")
     result = subprocess.run(
         [sys.executable, "-c", code],
         env=env,

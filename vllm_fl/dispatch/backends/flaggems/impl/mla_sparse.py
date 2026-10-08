@@ -4,21 +4,16 @@
 
 The metadata and cache contract match vLLM 0.24's sparse MLA backend.  Kernel
 selection is backend-neutral: use FlagGems when its sparse MLA/cache writer is
-available, otherwise retain a slow PyTorch correctness implementation.
+available. Initialization rejects missing kernels before cache execution.
 """
 
 from __future__ import annotations
 
-import importlib
-import importlib.metadata
-import os
-import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
 import torch
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -38,186 +33,42 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
-def _flagtree_version_tuple() -> tuple[int, ...] | None:
-    """Return the numeric FlagTree release tuple when package metadata exists."""
-    try:
-        version = importlib.metadata.version("flagtree")
-    except importlib.metadata.PackageNotFoundError:
-        return None
-    numbers = re.match(r"^(\d+(?:\.\d+)*)", version)
-    if numbers is None:
-        return None
-    return tuple(int(part) for part in numbers.group(1).split("."))
-
-
-def _configure_sparse_mla_tle(loaded: Any) -> None:
-    """Select the known-good FlagGems sparse-MLA implementation.
-
-    FlagTree 0.6.1 exposes the complete TLE API, but its select-encodings pass
-    rejects the FlagGems sparse-MLA kernel at the scalar ``local_ptr`` load.
-    Keep using FlagGems' non-TLE Triton implementation for released versions
-    through 0.6.1.  The override is intentionally plugin-scoped so an upstream
-    fix can be qualified without changing the process-wide FlagGems setting.
-    """
-    if not getattr(loaded, "HAS_TLE_FLASHMLA_SPARSE", False):
-        return
-
-    mode = os.getenv("VLLM_FL_GLM5_SPARSE_MLA_TLE", "auto").strip().lower()
-    if mode not in {"auto", "0", "1", "false", "true", "off", "on"}:
-        raise ValueError(
-            "VLLM_FL_GLM5_SPARSE_MLA_TLE must be auto, on/1/true, or "
-            f"off/0/false; got {mode!r}"
-        )
-    if mode in {"1", "true", "on"}:
-        return
-
-    tle = getattr(loaded, "tle", None)
-    tle_gpu = getattr(tle, "gpu", None)
-    required_gpu_apis = ("alloc", "copy", "local_ptr", "warp_specialize")
-    missing_api = not hasattr(tle, "pipe") or any(
-        not hasattr(tle_gpu, api) for api in required_gpu_apis
-    )
-    flagtree_version = _flagtree_version_tuple()
-    known_bad_release = flagtree_version is not None and flagtree_version <= (0, 6, 1)
-    explicitly_disabled = mode in {"0", "false", "off"}
-    if explicitly_disabled or missing_api or known_bad_release:
-        loaded.HAS_TLE_FLASHMLA_SPARSE = False
-        if explicitly_disabled:
-            reason = "disabled by VLLM_FL_GLM5_SPARSE_MLA_TLE"
-        elif missing_api:
-            reason = "required FlagTree pipe/GPU APIs are unavailable"
-        else:
-            reason = (
-                "FlagTree <= 0.6.1 fails TritonTleSelectEncodings for the "
-                "FlagGems sparse-MLA kernel"
-            )
-        logger.warning_once(
-            "FlagGems sparse MLA TLE path is %s; using its non-TLE Triton kernel",
-            reason,
-        )
-
-
 def _flag_op(module: str, name: str):
-    try:
-        loaded = importlib.import_module(f"flag_gems.fused.{module}")
-        if module == "flashmla_sparse":
-            _configure_sparse_mla_tle(loaded)
-        return getattr(loaded, name)
-    except (ImportError, AttributeError, OSError):
-        return None
+    from vllm_fl.kernels.glm5_next.indexer_backend import _load_flaggems_op
 
-
-# Opt-in gate for CUDA-graph capture of the portable sparse MLA path.  Default
-# off: the Torch fallback performs host scalar reads and cannot be captured, so
-# graph support is only advertised after a real capture preflight proves the
-# selected FlagGems kernels are capturable for the requested head size.
-_GRAPH_ENV = "VLLM_FL_GLM5_MLA_SPARSE_GRAPH"
-_GRAPH_PROBE_CACHE: dict[int, tuple[bool, str | None]] = {}
-
-
-def _graph_opt_in() -> bool:
-    return os.getenv(_GRAPH_ENV, "0").strip().lower() in {"1", "true", "on", "yes"}
+    return _load_flaggems_op(module, name)
 
 
 def _resolve_sparse_mla_kernels():
-    """Resolve both kernels once; either may be ``None`` (Torch fallback)."""
-    return (
-        _flag_op("concat_and_cache_mla", "concat_and_cache_mla"),
-        _flag_op("flashmla_sparse", "flash_mla_sparse_fwd"),
-    )
+    from vllm_fl.dispatch.binding import OperatorBinding
+    from vllm_fl.dispatch.manager import OpManager
+    from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+    from vllm_fl.utils import use_flaggems_op
 
+    manager = OpManager()
+    bindings = []
+    for name in ("concat_and_cache_mla", "flash_mla_sparse_fwd"):
+        op = _flag_op(name, name)
+        if op is None:
+            raise RuntimeError(f"Sparse MLA requires FlagGems-vllm {name}")
 
-def _run_graph_capture_probe(head_size: int) -> tuple[bool, str | None]:
-    """Attempt a real capture/replay of the kernels on scratch tensors.
+        def call(*args, _op=op, **kwargs):
+            return _op(*args, **kwargs)
 
-    This is the only trustworthy way to decide graph support: Triton wrappers
-    may hide host synchronizations.  Any exception -- including a missing kernel
-    -- downgrades to ``NEVER`` rather than risking a failed capture mid-serving.
-    """
-    writer, sparse = _resolve_sparse_mla_kernels()
-    if writer is None or sparse is None:
-        return False, "FlagGems sparse MLA kernels are unavailable"
-    if not torch.cuda.is_available():
-        return False, "CUDA is not available for a graph capture preflight"
-    try:
-        device = torch.device("cuda", torch.cuda.current_device())
-        # GLM5-Next is 512-latent (NoPE); DeepSeek-V3.2 adds a 64-wide RoPE.
-        pe_dim = 64 if head_size >= 576 else 0
-        kv_lora = head_size - pe_dim
-        block_size = 64
-        num_tokens = 1
-        num_heads = 64
-        topk = 2048
-        cache = torch.zeros(
-            block_size, block_size, head_size, dtype=torch.bfloat16, device=device
+        call._is_available = lambda _name=name: use_flaggems_op(_name)
+        manager.registry.register_impl(
+            OpImpl(name, "glm5.flaggems", BackendImplKind.DEFAULT, call)
         )
-        kv_c = torch.zeros(num_tokens, kv_lora, dtype=torch.bfloat16, device=device)
-        k_pe = torch.zeros(num_tokens, 1, pe_dim, dtype=torch.bfloat16, device=device)
-        slots = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        scale = torch.ones(1, dtype=torch.float32, device=device)
-        query = torch.zeros(
-            num_tokens, num_heads, head_size, dtype=torch.bfloat16, device=device
+        binding = OperatorBinding(
+            manager, name, graph_capabilities={"glm5.flaggems": False}
         )
-        indices = torch.zeros(num_tokens, 1, topk, dtype=torch.int32, device=device)
-        lengths = torch.zeros(num_tokens, dtype=torch.int32, device=device)
-        flat_cache = cache.view(-1, 1, head_size)
-
-        def run():
-            writer(
-                kv_c,
-                k_pe.squeeze(1),
-                cache,
-                slots,
-                kv_cache_dtype="auto",
-                scale=scale,
-            )
-            return sparse(
-                query,
-                flat_cache,
-                indices,
-                0.5,
-                d_v=kv_lora,
-                topk_length=lengths,
-            )[0]
-
-        run()
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-        graph.replay()
-        torch.cuda.synchronize()
-        return True, None
-    except Exception as exc:  # noqa: BLE001 - downgrade any failure to NEVER
-        return False, f"{type(exc).__name__}: {exc}"
+        binding.describe()
+        bindings.append(binding)
+    return tuple(bindings)
 
 
-def _probe_graph_capture(head_size: int) -> tuple[bool, str | None]:
-    if head_size not in _GRAPH_PROBE_CACHE:
-        _GRAPH_PROBE_CACHE[head_size] = _run_graph_capture_probe(int(head_size))
-    return _GRAPH_PROBE_CACHE[head_size]
-
-
-def sparse_mla_cudagraph_support(
-    head_size: int | None,
-) -> tuple[AttentionCGSupport, str | None]:
-    """Resolve graph support from a config-time capability filter.
-
-    Returns ``NEVER`` while a non-capturable Torch fallback is reachable, when
-    the opt-in gate is closed, or when the per-shape capture preflight fails.
-    Only a proven-capturable kernel pair yields ``UNIFORM_BATCH``.
-    """
-    writer, sparse = _resolve_sparse_mla_kernels()
-    if writer is None or sparse is None:
-        return AttentionCGSupport.NEVER, "a non-capturable Torch fallback is reachable"
-    if not _graph_opt_in():
-        return AttentionCGSupport.NEVER, f"{_GRAPH_ENV} is not enabled"
-    if head_size is None:
-        return AttentionCGSupport.NEVER, "no head size is available for the preflight"
-    ok, reason = _probe_graph_capture(head_size)
-    if not ok:
-        return AttentionCGSupport.NEVER, f"graph capture preflight failed ({reason})"
-    return AttentionCGSupport.UNIFORM_BATCH, None
+def sparse_mla_cudagraph_support(head_size):
+    return AttentionCGSupport.NEVER, "Sparse MLA runs at the eager attention boundary"
 
 
 @dataclass
@@ -237,14 +88,7 @@ class FlagGemsSparseMLAMetadata(AttentionMetadata):
 class FlagGemsSparseMLAMetadataBuilder(
     AttentionMetadataBuilder[FlagGemsSparseMLAMetadata]
 ):
-    # The class-level value stays conservative (NEVER).  Graph support is
-    # resolved through ``get_cudagraph_support`` so vLLM's capability interface
-    # can see the verified answer: the sparse implementation selects its kernels
-    # in ``__init__`` and its correctness fallback (``_sparse_mla_torch``)
-    # performs host scalar reads (``int(valid_lengths[row].item())``), which
-    # cannot be captured.  UNIFORM_BATCH is only returned after an opt-in,
-    # per-shape capture preflight proves the selected FlagGems kernels are
-    # capturable and the fallback is unreachable for the captured shape.
+    # Sparse MLA remains an eager attention boundary.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
     @classmethod
@@ -416,30 +260,6 @@ def _convert_request_to_physical_indices(
     return compact[..., :width].to(torch.int32), valid_lengths
 
 
-def _sparse_mla_torch(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    scale: float,
-    value_dim: int,
-    valid_lengths: torch.Tensor,
-) -> torch.Tensor:
-    rows, heads, _ = q.shape
-    output = torch.zeros(rows, heads, value_dim, dtype=q.dtype, device=q.device)
-    for row in range(rows):
-        length = int(valid_lengths[row].item())
-        if length == 0:
-            continue
-        selected = indices[row, :length].to(torch.int64)
-        selected_kv = kv.index_select(0, selected).squeeze(1).float()
-        scores = torch.einsum("hd,kd->hk", q[row].float(), selected_kv) * scale
-        probabilities = torch.softmax(scores, dim=-1)
-        output[row] = torch.einsum(
-            "hk,kv->hv", probabilities, selected_kv[:, :value_dim]
-        ).to(output.dtype)
-    return output
-
-
 class FlagGemsSparseMLAImpl(SparseMLAAttentionImpl[FlagGemsSparseMLAMetadata]):
     def __init__(
         self,
@@ -478,82 +298,27 @@ class FlagGemsSparseMLAImpl(SparseMLAAttentionImpl[FlagGemsSparseMLAMetadata]):
             indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
 
-        # Select the implementation once, at initialization, and never switch
-        # at runtime.  A dynamic fallback that runs after a kernel launched or
-        # after the KV cache was written can double-write or corrupt state, so
-        # the portable path is either fully kernel-backed or fully Torch.  Graph
-        # support is only advertised for the fully kernel-backed case (see
-        # ``sparse_mla_cudagraph_support``); the Torch branch is eager-only and
-        # the capture guard below enforces it.
         self._cache_writer, self._sparse_attn = _resolve_sparse_mla_kernels()
-        self._capturable = (
-            self._cache_writer is not None and self._sparse_attn is not None
-        )
-        if (self._cache_writer is None) != (self._sparse_attn is None):
-            logger.warning_once(
-                "FlagGems sparse MLA has only one of its two kernels available "
-                "(cache_writer=%s, sparse_attn=%s); the missing half uses the "
-                "eager Torch path",
-                self._cache_writer is not None,
-                self._sparse_attn is not None,
-                scope="local",
-            )
-
-    def _forbid_fallback_under_capture(self) -> None:
-        # Graph support is only advertised after a capture preflight, so the
-        # fallback must never run inside a captured region.  This is a hard
-        # guard in case kernels disappear between the preflight and replay.
-        if (
-            not self._capturable
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
-        ):
-            raise RuntimeError(
-                "FlagGems sparse MLA Torch fallback cannot run under CUDA graph "
-                "capture; only the kernel-backed path is capturable"
-            )
 
     def do_kv_cache_update(
-        self,
-        kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: torch.Tensor,
+        self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
     ) -> None:
         if kv_cache.numel() == 0:
             return
-        self._forbid_fallback_under_capture()
-        if self._cache_writer is not None:
-            # Kernel-backed path: once the writer is entered it may have
-            # written to the cache, so an exception is propagated to the caller
-            # rather than retried against another implementation.
-            flag_cache_dtype = (
-                "auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype
-            )
-            self._cache_writer(
-                kv_c_normed,
-                k_pe.squeeze(1),
-                kv_cache,
-                slot_mapping.flatten(),
-                kv_cache_dtype=flag_cache_dtype,
-                scale=k_scale,
-            )
-            return
-        # No kernel selected for this process: validate the layout before
-        # writing anything to the real cache, then use the eager Torch path.
-        if kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError("Portable MLA cache write only supports BF16")
-        source = (
-            kv_c_normed
-            if k_pe.shape[-1] == 0
-            else torch.cat((kv_c_normed, k_pe.squeeze(1)), dim=-1)
+        self._cache_writer(
+            kv_c_normed,
+            k_pe.squeeze(1),
+            kv_cache,
+            slot_mapping.flatten(),
+            kv_cache_dtype="auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype,
+            scale=k_scale,
         )
-        slots = slot_mapping.flatten().to(torch.int64)
-        valid = slots >= 0
-        cache_flat = kv_cache.view(-1, kv_cache.shape[-1])
-        cache_flat[slots[valid]] = source[valid]
+
+    @staticmethod
+    def _concat_query(q_nope, q_pe):
+        from flaggems_vllm import concat_query
+
+        return concat_query(q_nope, q_pe)
 
     def forward_mqa(
         self,
@@ -563,10 +328,9 @@ class FlagGemsSparseMLAImpl(SparseMLAAttentionImpl[FlagGemsSparseMLAMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del layer
-        self._forbid_fallback_under_capture()
         if isinstance(q, tuple):
             q_nope, q_pe = q
-            q = q_nope if q_pe.shape[-1] == 0 else torch.cat((q_nope, q_pe), dim=-1)
+            q = q_nope if q_pe.shape[-1] == 0 else self._concat_query(q_nope, q_pe)
         num_tokens = q.shape[0]
         if self.topk_indices_buffer is None:
             raise RuntimeError("Sparse MLA requires the indexer's top-k buffer")
@@ -577,37 +341,22 @@ class FlagGemsSparseMLAImpl(SparseMLAAttentionImpl[FlagGemsSparseMLAMetadata]):
             request_topk,
             attn_metadata.block_size,
         )
-        cache = kv_c_and_k_pe_cache.contiguous().view(
+        from flaggems_vllm import contiguous_copy, pad_attention_heads
+
+        cache = contiguous_copy(kv_c_and_k_pe_cache).view(
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
         actual_heads = q.shape[1]
         padded_heads = 64 if actual_heads <= 64 else 128
-        if actual_heads not in (64, 128):
-            q_padded = q.new_zeros(num_tokens, padded_heads, q.shape[-1])
-            q_padded[:, :actual_heads].copy_(q)
-        else:
-            q_padded = q
-
-        if self._sparse_attn is not None:
-            # Kernel-backed path: propagate failures instead of silently
-            # falling back to a non-capturable Torch implementation.
-            output = self._sparse_attn(
-                q_padded.contiguous(),
-                cache,
-                physical_topk.unsqueeze(1).contiguous(),
-                self.softmax_scale,
-                d_v=self.kv_lora_rank,
-                topk_length=valid_lengths.contiguous(),
-            )[0]
-        else:
-            output = _sparse_mla_torch(
-                q_padded,
-                cache,
-                physical_topk,
-                self.softmax_scale,
-                self.kv_lora_rank,
-                valid_lengths,
-            )
+        q_padded = pad_attention_heads(q, padded_heads)
+        output = self._sparse_attn(
+            q_padded,
+            cache,
+            physical_topk.unsqueeze(1).contiguous(),
+            self.softmax_scale,
+            d_v=self.kv_lora_rank,
+            topk_length=valid_lengths.contiguous(),
+        )[0]
         return output[:, :actual_heads], None
 
 

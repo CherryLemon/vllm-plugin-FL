@@ -119,7 +119,7 @@ def test_unknown_model_returns_default_plan():
 
 
 def test_build_plan_is_pure_and_does_not_touch_env(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
+    monkeypatch.setenv("VLLM_FL_FLAGOS_WHITELIST", "mm")
     register_model_policy_factory(_factory())
     env_before = dict(os.environ)
     config = _config(architectures=["ModelForCausalLM"])

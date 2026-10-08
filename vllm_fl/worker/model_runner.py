@@ -7,7 +7,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -163,7 +162,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
-from vllm.utils.platform_utils import num_compute_units, is_pin_memory_available, num_compute_units
+from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
 from vllm.utils.torch_utils import (
     get_dtype_size,
     is_quantized_kv_cache,
@@ -7351,14 +7350,6 @@ class ModelRunnerFL(
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
 
-        if os.getenv("VLLM_FL_DEBUG_KV_CACHE") == "1":
-            logger.warning(
-                "KV cache config before reshape: tensors=%s groups=%s "
-                "kernel_block_sizes=%s",
-                self.kv_cache_config.kv_cache_tensors,
-                self.kv_cache_config.kv_cache_groups,
-                kernel_block_sizes,
-            )
 
         # Map layer names to (offset, block_stride) within the packed
         # backing tensor so we can create strided views per layer.
@@ -7410,21 +7401,6 @@ class ModelRunnerFL(
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
-                    if os.getenv("VLLM_FL_DEBUG_KV_CACHE") == "1":
-                        logger.warning(
-                            "KV cache reshape layer=%s spec=%s backend=%s "
-                            "raw_bytes=%d num_blocks=%d kernel_blocks=%d "
-                            "kernel_block_size=%d shape=%s packing=%s",
-                            layer_name,
-                            kv_cache_spec,
-                            attn_backend.__name__,
-                            raw_tensor.numel(),
-                            num_blocks,
-                            kernel_num_blocks,
-                            kernel_block_size,
-                            kv_cache_shape,
-                            packing,
-                        )
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)

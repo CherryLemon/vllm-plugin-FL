@@ -1,17 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Scope tests: GLM registration must not rewrite process-global state, and the
-GLM provider environment must not change the generic path of other models."""
+GLM capability checks must not change the generic path of other models."""
 
 import os
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_fl.activation import (
-    ActivationConflict,
-    activate,
-    reset_activation_for_tests,
-)
+from vllm_fl.activation import ActivationConflict, activate, reset_activation_for_tests
 from vllm_fl.kernels.glm5_next import provider
 from vllm_fl.patches import glm5_next_runtime as glm_patch
 
@@ -19,19 +15,19 @@ from vllm_fl.patches import glm5_next_runtime as glm_patch
 @pytest.fixture(autouse=True)
 def _reset():
     reset_activation_for_tests()
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
     yield
     reset_activation_for_tests()
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
 
 
 def test_registration_does_not_mutate_env_or_shared_classes(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
     monkeypatch.setenv("VLLM_FL_FLAGOS_WHITELIST", "grouped_topk,moe_sum")
     monkeypatch.setenv(
         "VLLM_FL_PER_OP", "moe_align_block_size=vendor.cuda;fused_moe=reference"
     )
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
 
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 
@@ -40,13 +36,9 @@ def test_registration_does_not_mutate_env_or_shared_classes(monkeypatch):
     indexer_before = DeepseekV32IndexerBackend.indexes_kv_by_block_stride.__func__(
         DeepseekV32IndexerBackend
     )
-    mhc_before = None
-    try:
-        from vllm.model_executor.layers.mhc import MHCPreOp
+    from vllm.model_executor.layers.mhc import MHCPreOp
 
-        mhc_before = MHCPreOp.forward_oot
-    except Exception:
-        MHCPreOp = None
+    mhc_before = MHCPreOp.forward_oot
 
     assert glm_patch.register_glm5_next_support() is True
 
@@ -57,8 +49,7 @@ def test_registration_does_not_mutate_env_or_shared_classes(monkeypatch):
         )
         is indexer_before
     )
-    if MHCPreOp is not None:
-        assert MHCPreOp.forward_oot is mhc_before
+    assert MHCPreOp.forward_oot is mhc_before
 
 
 def test_is_glm5_model_matcher():
@@ -103,13 +94,12 @@ def test_plan_provider_returns_none_for_non_glm():
 
 
 def test_platform_ignores_glm_provider_without_active_plan(monkeypatch):
-    """A GLM provider env alone must not change a non-GLM MLA model's path.
+    """A GLM capability check must preserve a non-GLM MLA model's path.
 
-    The generic dispatch result (``call_op``) must be reached verbatim when no
-    plan is active, even with ``VLLM_FL_GLM5_PROVIDER=flaggems`` set.
+    The generic dispatch result must be reached verbatim when no plan is active.
     """
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
-    provider.get_glm5_provider.cache_clear()
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
+    provider._has_nvidia_reference_kernels.cache_clear()
     reset_activation_for_tests()
 
     import vllm_fl.dispatch as dispatch
@@ -126,8 +116,8 @@ def test_platform_ignores_glm_provider_without_active_plan(monkeypatch):
 
 
 def test_portable_moe_defaults_expose_required_impls(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
-    provider.get_glm5_provider.cache_clear()
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
+    provider._has_nvidia_reference_kernels.cache_clear()
 
     defaults = glm_patch.glm5_portable_moe_defaults()
     assert "moe_align_block_size" in defaults.whitelist_ops
@@ -156,23 +146,15 @@ def _protect_patched_state(monkeypatch):
         "indexes_kv_by_block_stride",
         DeepseekV32IndexerBackend.indexes_kv_by_block_stride,
     )
-    from vllm.model_executor.layers.mhc import (
-        MHCFusedPostPreOp,
-        MHCPostOp,
-        MHCPreOp,
-    )
+    from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
 
     for mhc_cls in (MHCPreOp, MHCPostOp, MHCFusedPostPreOp):
         monkeypatch.setattr(mhc_cls, "forward_oot", mhc_cls.forward_oot)
-    try:
-        from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 
-        monkeypatch.setattr(
-            SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
-        )
-    except (ImportError, AttributeError):
-        # Reduced vLLM builds may omit this optional activation class.
-        pass
+    monkeypatch.setattr(
+        SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
+    )
     from vllm import _custom_ops
 
     for name in ("concat_mla_q", "concat_and_cache_mla"):
@@ -198,7 +180,7 @@ def _protect_patched_state(monkeypatch):
 
 def test_real_glm_activation_applies_before_model_construction(monkeypatch):
     _protect_patched_state(monkeypatch)
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
 
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 
@@ -233,7 +215,7 @@ def test_registration_leaves_worker_kpool_paths_pristine():
 
 def test_real_glm_activation_binds_kpool_runtime_patches(monkeypatch):
     _protect_patched_state(monkeypatch)
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
 
     from vllm_fl.patches import glm5_next_kpool as kpool
 
@@ -247,7 +229,7 @@ def test_real_glm_activation_binds_kpool_runtime_patches(monkeypatch):
 
 def test_foreign_prepatch_conflicts_without_partial_side_effect(monkeypatch):
     _protect_patched_state(monkeypatch)
-    provider.get_glm5_provider.cache_clear()
+    provider._has_nvidia_reference_kernels.cache_clear()
 
     from vllm.model_executor.layers.mhc import MHCPreOp
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend

@@ -10,10 +10,9 @@ from collections.abc import Iterable
 from types import MethodType
 
 import torch
+import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from einops import rearrange
 from torch import nn
-
-import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ParallelConfig, VllmConfig
@@ -45,11 +44,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.mhc import (
-    MHCFusedPostPreOp,
-    MHCPostOp,
-    MHCPreOp,
-)
+from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -92,21 +87,12 @@ if use_nvidia_reference():
 else:
     mhc_pre_broadcast_tilelang = None
 
-if current_platform.is_cuda():
-    import vllm.model_executor.layers.mamba.ops.causal_conv1d as conv_ops
-    from vllm.model_executor.layers.fla.ops.kda import fused_recurrent_kda
-
-    from vllm_fl.kernels.glm5_next.safe_kda import (
-        chunk_kda_with_safe_gate,
-        fused_safe_kda_gate,
-    )
-else:
-    from vllm_fl.kernels.glm5_next import portable as conv_ops
-    from vllm_fl.kernels.glm5_next.portable import (
-        chunk_kda_with_safe_gate,
-        fused_recurrent_kda,
-        safe_kda_gate as fused_safe_kda_gate,
-    )
+from vllm_fl.kernels.glm5_next import causal_conv as conv_ops
+from vllm_fl.kernels.glm5_next.safe_kda import (
+    chunk_kda_with_safe_gate,
+    fused_recurrent_kda,
+    fused_safe_kda_gate,
+)
 
 if use_nvidia_reference():
     SiluAndMulWithClamp = VllmSiluAndMulWithClamp
@@ -135,13 +121,8 @@ else:
 
 
 from vllm_fl.kernels.glm5_next.indexer_backend import INDEXER_BACKEND
-from vllm_fl.kernels.glm5_next.sparse_attn_indexer_kpool import (
-    SparseAttnIndexerKpool,
-)
-from vllm_fl.models.glm5_next_kpool import (
-    Glm5NextIndexerCache,
-    Glm5NextTailCache,
-)
+from vllm_fl.kernels.glm5_next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
+from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerCache, Glm5NextTailCache
 
 logger = init_logger(__name__)
 
@@ -511,8 +492,10 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
             zero_idx = non_spec_state_indices_tensor[~has_initial_state]
-            recurrent_state[zero_idx] = 0
-            initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
+            INDEXER_BACKEND._kpool("zero_state_rows", recurrent_state, zero_idx)
+            initial_state = INDEXER_BACKEND._kpool(
+                "gather_state_rows", recurrent_state, non_spec_state_indices_tensor
+            )
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -531,7 +514,12 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 lower_bound=self.kda_lower_bound,
             )
             # Init cache
-            recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+            INDEXER_BACKEND._kpool(
+                "scatter_state_rows",
+                recurrent_state,
+                non_spec_state_indices_tensor,
+                last_recurrent_state,
+            )
         else:
             assert non_spec_query_start_loc is not None
             g1 = fused_safe_kda_gate(
@@ -557,9 +545,11 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
                 ],
                 ssm_state_indices=non_spec_state_indices_tensor,
             )
-        core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-            0, :num_actual_tokens
-        ]
+        INDEXER_BACKEND._kpool(
+            "copy_to",
+            core_attn_out_non_spec[0, :num_actual_tokens],
+            core_attn_out[0, :num_actual_tokens],
+        )
 
     _forward = _forward_reference_safe_gate
 

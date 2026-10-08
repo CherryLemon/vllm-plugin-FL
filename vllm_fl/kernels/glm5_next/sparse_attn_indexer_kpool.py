@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
-import os
 
 import torch
-
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -20,9 +18,7 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadata,
-)
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_fl.kernels.glm5_next.indexer_backend import (
@@ -74,8 +70,8 @@ def _kpool_compress_insert(
     idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
     INDEXER_BACKEND.kpool_compress_and_write_cache(
         kv_cache,
-        k[idx],  # [n, kpool, head_dim]
-        gate_score[idx],
+        INDEXER_BACKEND.gather_rows(k, idx),  # [n, kpool, head_dim]
+        INDEXER_BACKEND.gather_rows(gate_score, idx),
         ape,
         slot_mapping.to(torch.int64),
         pool_size=kpool,
@@ -135,6 +131,10 @@ def _scatter_decode_tokens_by_request(
     (``requires_padding``) decode batch; uniform batches use a zero-copy
     reshape.
     """
+    if tokens.is_floating_point():
+        return INDEXER_BACKEND.scatter_decode_tokens(
+            tokens, pad_value, num_requests, lmax, scatter_indices
+        )
     req_id, intra = scatter_indices
     out = torch.full(
         (num_requests, lmax, *tokens.shape[1:]),
@@ -385,11 +385,7 @@ def sparse_attn_indexer_kpool(
                 # requests), corrupting one pool at each request's
                 # prompt->decode boundary. Invisible on single-request probes;
                 # hit by every concurrent-serving batch.
-                if (
-                    tail_kv_cache is not None
-                    and tail_prefix is not None
-                    and os.environ.get("VLLM_KPOOL_SKIP_TAIL_CACHE") != "1"
-                ):
+                if tail_kv_cache is not None and tail_prefix is not None:
                     tail_meta = attn_metadata.get(_resolve_layer_name(tail_prefix))
                     if tail_meta is not None:
                         assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
@@ -585,7 +581,6 @@ def sparse_attn_indexer_kpool(
             and compress_ape is not None
             and positions is not None
             and not skip_k_cache_insert
-            and os.environ.get("VLLM_KPOOL_SKIP_DECODE_WRITE") != "1"
         ):
             num_requests = attn_metadata_narrowed.num_decodes
             use_uniform, group_lens, lmax = _decode_write_layout(
@@ -626,8 +621,14 @@ def sparse_attn_indexer_kpool(
                 shape2 = (num_requests, next_n)
                 dec_k = k[:num_decode_tokens].view(*shape2, head_dim)
                 dec_gate = gate_score[:num_decode_tokens].view(*shape2, head_dim)
-                dec_slot = slot_mapping[:num_decode_tokens].view(num_requests, num_decode_tokens // num_requests)
-                dec_pos = positions[:num_decode_tokens].to(torch.int32).view(num_requests, num_decode_tokens // num_requests)
+                dec_slot = slot_mapping[:num_decode_tokens].view(
+                    num_requests, num_decode_tokens // num_requests
+                )
+                dec_pos = (
+                    positions[:num_decode_tokens]
+                    .to(torch.int32)
+                    .view(num_requests, num_decode_tokens // num_requests)
+                )
             tail_meta = (
                 attn_metadata.get(_resolve_layer_name(tail_prefix))
                 if tail_prefix is not None
@@ -650,7 +651,9 @@ def sparse_attn_indexer_kpool(
                     scatter_idx,
                 )
             else:
-                dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(num_requests, num_decode_tokens // num_requests)
+                dec_tail_slot = tail_meta.slot_mapping[:num_decode_tokens].view(
+                    num_requests, num_decode_tokens // num_requests
+                )
             # The compress kernel writes the raw fp8 cache (not the quant view);
             # pass the underlying kv_cache, not kv_cache_quant_view.
             if dec_tail_slot is not None:
@@ -684,18 +687,26 @@ def sparse_attn_indexer_kpool(
             # can't produce NaN/Inf in the logits kernel.
             if q_scale is not None:
                 padded_q_quant_decode_tokens = INDEXER_BACKEND.pack_seq(
-                    q_quant[:num_decode_tokens], decode_lens, pad_value=0
+                    q_quant[:num_decode_tokens],
+                    decode_lens,
+                    pad_value=0,
+                    max_length=1,
                 )
                 padded_q_scale = INDEXER_BACKEND.pack_seq(
-                    q_scale[:num_decode_tokens], decode_lens, pad_value=0
+                    q_scale[:num_decode_tokens],
+                    decode_lens,
+                    pad_value=0,
+                    max_length=1,
                 )
             else:
                 padded_q_quant_decode_tokens = INDEXER_BACKEND.pack_seq(
-                    q_quant[:num_decode_tokens], decode_lens
+                    q_quant[:num_decode_tokens],
+                    decode_lens,
+                    max_length=1,
                 )
                 padded_q_scale = None
             padded_weights = INDEXER_BACKEND.pack_seq(
-                weights[:num_decode_tokens], decode_lens, pad_value=0
+                weights[:num_decode_tokens], decode_lens, pad_value=0, max_length=1
             ).reshape(-1, *weights.shape[1:])
         else:
             padded_q_quant_decode_tokens = q_quant[:num_decode_tokens].reshape(
@@ -791,7 +802,9 @@ def sparse_attn_indexer_kpool(
         if decode_metadata.requires_padding:
             # Drop padded query rows introduced by the next_n padding above.
             out = INDEXER_BACKEND.unpack_seq(
-                out.reshape(batch_size, -1, out.shape[-1]), decode_lens
+                out.reshape(batch_size, -1, out.shape[-1]),
+                decode_lens,
+                total_tokens=num_decode_tokens,
             )
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
@@ -960,9 +973,9 @@ class SparseAttnIndexerKpool(CustomOp):
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
-        assert isinstance(q_quant, torch.Tensor), (
-            "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
-        )
+        assert isinstance(
+            q_quant, torch.Tensor
+        ), "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,

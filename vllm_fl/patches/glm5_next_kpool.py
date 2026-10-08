@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 from dataclasses import replace
 from functools import wraps
 
@@ -354,10 +353,7 @@ def install_glm5_next_kpool() -> None:
         kv_cache_utils,
         single_type_kv_cache_manager,
     )
-    from vllm.v1.kv_cache_interface import (
-        KVCacheConfig,
-        KVCacheTensor,
-    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
     from vllm.v1.worker import utils as worker_utils
 
     # Upstream GLM5-Next rounds the hybrid attention block *after* accounting
@@ -595,74 +591,6 @@ def install_glm5_next_kpool() -> None:
 
         concurrency._glm5_kpool = True
         stage(kv_cache_utils, "get_max_concurrency_for_kv_cache_config", concurrency)
-
-    # Opt-in scheduler-capacity diagnostics.  This remains dormant in normal
-    # serving and is useful on immutable-vLLM FlagOS images because it reports
-    # the plugin-owned cache-manager view without modifying the vLLM package.
-    if os.environ.get("VLLM_FL_GLM5_DEBUG_KV_CAPACITY") == "1":
-        from vllm.v1.core.kv_cache_manager import KVCacheManager
-
-        original_allocate_slots = KVCacheManager.allocate_slots
-        if not getattr(original_allocate_slots, "_glm5_capacity_debug", False):
-
-            @wraps(original_allocate_slots)
-            def allocate_slots_with_capacity_debug(
-                self, request, num_new_tokens, *args, **kwargs
-            ):
-                result = original_allocate_slots(
-                    self, request, num_new_tokens, *args, **kwargs
-                )
-                if result is None and any(
-                    isinstance(manager, KpoolTailManager)
-                    for manager in self.coordinator.single_type_managers
-                ):
-                    count = getattr(self, "_glm5_capacity_debug_count", 0)
-                    if count < 8:
-                        self._glm5_capacity_debug_count = count + 1
-                        probe_tokens = min(
-                            request.num_computed_tokens + num_new_tokens,
-                            self.max_model_len,
-                        )
-                        per_manager = []
-                        for manager in self.coordinator.single_type_managers:
-                            try:
-                                required = manager.get_num_blocks_to_allocate(
-                                    request.request_id,
-                                    probe_tokens,
-                                    [],
-                                    request.num_computed_tokens,
-                                    probe_tokens,
-                                )
-                            except Exception as exc:  # pragma: no cover - debug only
-                                required = f"error:{exc!r}"
-                            per_manager.append(
-                                {
-                                    "manager": type(manager).__name__,
-                                    "block_size": manager.block_size,
-                                    "required": required,
-                                    "held": len(
-                                        manager.req_to_blocks.get(
-                                            request.request_id, ()
-                                        )
-                                    ),
-                                }
-                            )
-                        logger.warning(
-                            "GLM5 KV capacity rejection: request=%s "
-                            "prompt_tokens=%d computed=%d new=%d free=%d/%d "
-                            "managers=%s",
-                            request.request_id,
-                            request.num_tokens,
-                            request.num_computed_tokens,
-                            num_new_tokens,
-                            self.block_pool.get_num_free_blocks(),
-                            self.block_pool.num_gpu_blocks,
-                            per_manager,
-                        )
-                return result
-
-            allocate_slots_with_capacity_debug._glm5_capacity_debug = True
-            stage(KVCacheManager, "allocate_slots", allocate_slots_with_capacity_debug)
 
     from vllm.config.compilation import CompilationConfig
 

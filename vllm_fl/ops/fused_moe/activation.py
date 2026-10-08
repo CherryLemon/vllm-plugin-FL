@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
-
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.activation import (
-    MoEActivation,
     apply_moe_activation as upstream_apply_moe_activation,
 )
 
@@ -46,18 +45,11 @@ def apply_moe_activation(
                     activation, output, input, clamp_limit=clamp_limit
                 )
             dim = input.shape[-1] // 2
-            try:
-                from flag_gems.fused.silu_and_mul_with_clamp import (
-                    silu_and_mul_with_clamp_out,
-                )
+            from flaggems_vllm import silu_and_mul_with_clamp_out
 
-                silu_and_mul_with_clamp_out(
-                    input[..., :dim], input[..., dim:], output, clamp_limit
-                )
-            except (ImportError, OSError, NotImplementedError):
-                gate = input[..., :dim].clamp(max=clamp_limit)
-                up = input[..., dim:].clamp(min=-clamp_limit, max=clamp_limit)
-                output.copy_(F.silu(gate) * up)
+            silu_and_mul_with_clamp_out(
+                input[..., :dim], input[..., dim:], output, clamp_limit
+            )
     elif activation == MoEActivation.GELU:
         output.copy_(_gelu_and_mul(None, input))
     elif activation == MoEActivation.SWIGLUOAI:

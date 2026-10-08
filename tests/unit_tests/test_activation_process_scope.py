@@ -8,7 +8,6 @@ same model and refuse a different one.
 """
 
 import multiprocessing as mp
-import os
 from types import SimpleNamespace
 
 
@@ -66,9 +65,11 @@ def _probe_state():
 
 def _child_spawn_activate(conn):
     try:
-        # Force the portable GLM provider so the plan contributes the
-        # capability-required MoE defaults this test asserts on.
-        os.environ["VLLM_FL_GLM5_PROVIDER"] = "flaggems"
+        # The actual capability check contributes portable MoE defaults.
+        from vllm_fl.kernels.glm5_next import provider
+
+        provider._has_vllm_native_extension = lambda: False
+        provider._has_nvidia_reference_kernels.cache_clear()
         import vllm_fl
 
         # Production bootstrap: the general-plugin loader calls this entry
@@ -141,25 +142,17 @@ def test_spawn_worker_activates_real_plan_and_policy():
 def _protect_real_activation_state(monkeypatch):
     """Snapshot every class/module attribute the real GLM activation patches."""
     from vllm import _custom_ops
-    from vllm.model_executor.layers.mhc import (
-        MHCFusedPostPreOp,
-        MHCPostOp,
-        MHCPreOp,
-    )
+    from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
     from vllm.v1.attention.backends.mla import indexer as indexer_backend
     from vllm.v1.worker import utils as worker_utils
 
     for mhc_cls in (MHCPreOp, MHCPostOp, MHCFusedPostPreOp):
         monkeypatch.setattr(mhc_cls, "forward_oot", mhc_cls.forward_oot)
-    try:
-        from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 
-        monkeypatch.setattr(
-            SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
-        )
-    except (ImportError, AttributeError):
-        # Reduced vLLM builds may omit this optional activation class.
-        pass
+    monkeypatch.setattr(
+        SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
+    )
     monkeypatch.setattr(
         indexer_backend.DeepseekV32IndexerBackend,
         "indexes_kv_by_block_stride",
@@ -185,10 +178,10 @@ def _protect_real_activation_state(monkeypatch):
 
 def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
     _protect_real_activation_state(monkeypatch)
-    monkeypatch.setenv("VLLM_FL_GLM5_PROVIDER", "flaggems")
     from vllm_fl.kernels.glm5_next import provider
 
-    provider.get_glm5_provider.cache_clear()
+    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
+    provider._has_nvidia_reference_kernels.cache_clear()
     import vllm_fl
 
     vllm_fl.register_model()
