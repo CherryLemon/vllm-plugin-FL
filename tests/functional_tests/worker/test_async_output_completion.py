@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Actual CUDA stream callbacks, D2H visibility and graph replay."""
 
+import importlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -20,7 +22,10 @@ def pool():
     if not torch.cuda.is_available() or torch.version.hip:
         pytest.skip("requires NVIDIA CUDA")
     # vLLM's extension must coexist with the plugin extension; it owns _C too.
-    import vllm._C  # noqa: F401
+    name = (
+        "vllm._C" if importlib.util.find_spec("vllm._C") else "vllm._C_stable_libtorch"
+    )
+    importlib.import_module(name)
 
     original = torch.ops._C.weak_ref_tensor.default
     import vllm_fl._C  # noqa: F401
