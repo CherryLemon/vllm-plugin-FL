@@ -165,7 +165,7 @@ def test_model_runner_output_matches_event_completion(pool, monkeypatch, kind):
         assert (
             results[0].sampled_token_ids == results[1].sampled_token_ids == [[17], []]
         )
-        for field in ("logprob_token_ids", "logprobs", "selected_token_ranks"):
+        for field in ("logprob_token_ids", "logprobs", "sampled_token_ranks"):
             torch.testing.assert_close(
                 torch.as_tensor(getattr(results[0].logprobs, field)),
                 torch.as_tensor(getattr(results[1].logprobs, field)),
