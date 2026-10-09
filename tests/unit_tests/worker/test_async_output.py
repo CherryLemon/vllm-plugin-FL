@@ -36,22 +36,24 @@ def pool(monkeypatch):
             os.close(fd)
 
 
-def test_default_never_constructs_native_pool(monkeypatch):
-    monkeypatch.delenv("VLLM_FL_ASYNC_OUTPUT_NATIVE_COMPLETION", raising=False)
-    constructor = Mock(side_effect=AssertionError("default must use Event"))
-    monkeypatch.setattr(output, "_NativeEventfdCompletionPool", constructor)
-    monkeypatch.setattr(output, "_native_completion_pool", None)
-    assert output._get_native_completion_pool() is None
-    constructor.assert_not_called()
+def test_event_completion_synchronizes():
     event = Mock()
     output._wait_for_async_output_event(event, None)
     event.synchronize.assert_called_once_with()
 
 
-def test_invalid_enable_flag_is_rejected(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_ASYNC_OUTPUT_NATIVE_COMPLETION", "maybe")
-    with pytest.raises(ValueError):
-        output._get_native_completion_pool()
+def test_supported_platform_uses_native_without_enable_flag(monkeypatch):
+    monkeypatch.setattr(output, "_native_completion_pool", None)
+    platform = SimpleNamespace(is_cuda=lambda: True, is_rocm=lambda: False)
+    monkeypatch.setitem(
+        sys.modules, "vllm.platforms", SimpleNamespace(current_platform=platform)
+    )
+    pool = Mock(spec=output._NativeEventfdCompletionPool)
+    factory = Mock(return_value=pool)
+    monkeypatch.setattr(output, "_create_native_completion_pool", factory)
+    assert output._get_native_completion_pool() is pool
+    assert output._get_native_completion_pool() is pool
+    factory.assert_called_once_with()
 
 
 def test_notification_releases_slot_without_cuda_calls(pool):
@@ -89,10 +91,11 @@ def test_query_error_or_cancellation_propagates_and_retires(pool, error):
     event.synchronize.assert_not_called()
 
 
-def test_completed_copy_without_callback_is_safe_but_retires_slot(pool):
+def test_completed_copy_without_callback_still_times_out(pool):
     completion = pool.enqueue(SimpleNamespace(cuda_stream=123))
     event = Mock(query=Mock(return_value=True))
-    output._wait_for_async_output_event(event, completion)
+    with pytest.raises(TimeoutError):
+        output._wait_for_async_output_event(event, completion)
     event.synchronize.assert_not_called()
     assert pool._quarantined == {0}
 
@@ -117,14 +120,15 @@ def test_close_interrupts_wait_and_retains_callback_fd(pool):
     os.eventfd_write(pool._event_fds[0], 1)
 
 
-def test_enqueue_failure_and_exhaustion_keep_event_fallback(pool):
+def test_exhaustion_uses_event_but_enqueue_failure_propagates(pool):
     stream = SimpleNamespace(cuda_stream=123)
     completion = pool.enqueue(stream)
     assert completion is not None
     assert pool.enqueue(stream) is None
     pool.release(0)
     pool._enqueue_op.return_value = 999
-    assert pool.enqueue(stream) is None
+    with pytest.raises(RuntimeError, match="status 999"):
+        pool.enqueue(stream)
     assert not pool._supported
 
 
@@ -141,7 +145,6 @@ def test_worker_shutdown_disables_pool_and_preserves_pending_callback(
 
 @pytest.mark.parametrize("cuda,rocm", [(False, False), (False, True), (True, True)])
 def test_non_nvidia_platform_never_loads_extension(monkeypatch, cuda, rocm):
-    monkeypatch.setenv("VLLM_FL_ASYNC_OUTPUT_NATIVE_COMPLETION", "1")
     monkeypatch.setattr(output, "_native_completion_pool", None)
     platform = SimpleNamespace(is_cuda=lambda: cuda, is_rocm=lambda: rocm)
     monkeypatch.setitem(
@@ -154,17 +157,41 @@ def test_non_nvidia_platform_never_loads_extension(monkeypatch, cuda, rocm):
 
 
 def test_missing_extension_retains_event_fallback(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_ASYNC_OUTPUT_NATIVE_COMPLETION", "1")
     monkeypatch.setattr(output, "_native_completion_pool", None)
     platform = SimpleNamespace(is_cuda=lambda: True, is_rocm=lambda: False)
     monkeypatch.setitem(
         sys.modules, "vllm.platforms", SimpleNamespace(current_platform=platform)
     )
 
-    class MissingPool:
-        def __init__(self):
-            raise ImportError("extension unavailable")
-
-    monkeypatch.setattr(output, "_NativeEventfdCompletionPool", MissingPool)
+    factory = Mock(return_value=None)
+    monkeypatch.setattr(output, "_create_native_completion_pool", factory)
     assert output._get_native_completion_pool() is None
     assert output._native_completion_pool is False
+    assert output._get_native_completion_pool() is None
+    factory.assert_called_once_with()
+
+
+def test_partial_construction_closes_created_descriptors(monkeypatch):
+    if not hasattr(os, "eventfd"):
+        pytest.skip("Linux eventfd unavailable")
+    fd = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+    monkeypatch.setattr(output.os, "eventfd", Mock(side_effect=[fd, OSError("limit")]))
+    with pytest.raises(OSError, match="limit"):
+        output._NativeEventfdCompletionPool(Mock(), capacity=2)
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_runtime_initialization_error_propagates(monkeypatch):
+    monkeypatch.setattr(output, "_native_completion_pool", None)
+    platform = SimpleNamespace(is_cuda=lambda: True, is_rocm=lambda: False)
+    monkeypatch.setitem(
+        sys.modules, "vllm.platforms", SimpleNamespace(current_platform=platform)
+    )
+    monkeypatch.setattr(
+        output,
+        "_create_native_completion_pool",
+        Mock(side_effect=RuntimeError("broken extension")),
+    )
+    with pytest.raises(RuntimeError, match="broken extension"):
+        output._get_native_completion_pool()

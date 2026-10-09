@@ -20,7 +20,6 @@ using CUhostFn = void (*)(void*);
 using CuLaunchHostFunc = CUresult (*)(CUstream, CUhostFn, void*);
 
 constexpr CUresult kCudaSuccess = 0;
-constexpr int64_t kInvalidArgument = -1;
 constexpr int64_t kDriverUnavailable = -2;
 constexpr int64_t kSymbolUnavailable = -3;
 
@@ -58,9 +57,14 @@ void notify_eventfd(void* user_data) {
 
 }  // namespace
 
+bool cuda_eventfd_completion_supported() {
+  std::call_once(load_driver_once, load_cuda_driver);
+  return load_status == kCudaSuccess;
+}
+
 int64_t enqueue_cuda_eventfd_completion(int64_t stream_ptr, int64_t event_fd) {
-  if (stream_ptr == 0 || event_fd <= 0 || event_fd > INT32_MAX) {
-    return kInvalidArgument;
+  if (event_fd < 0 || event_fd > INT32_MAX) {
+    return 1;  // CUDA_ERROR_INVALID_VALUE. Stream 0 is a valid default stream.
   }
   std::call_once(load_driver_once, load_cuda_driver);
   if (load_status != kCudaSuccess || cu_launch_host_func == nullptr) {

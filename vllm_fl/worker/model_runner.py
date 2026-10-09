@@ -292,7 +292,6 @@ from vllm_fl.worker.common_attention_metadata import (
     compute_common_attention_metadata,
 )
 
-
 GraphWrapper = GraphWrapper
 
 if TYPE_CHECKING:
