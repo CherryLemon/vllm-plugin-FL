@@ -255,35 +255,38 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        from vllm_fl.flaggems_runtime import configure_flaggems
-
-        whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-
-        def enable_flaggems(library):
+        if fl_envs.USE_FLAGGEMS:
             import flag_gems
 
-            kwargs = dict(
-                record=rank == 0, once=True,
-                path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
-            )
-            if library is not None:
-                kwargs["lib"] = library
-            if whitelist is not None:
-                flag_gems.only_enable(include=whitelist, **kwargs)
-            elif blacklist:
-                flag_gems.enable(unused=blacklist, **kwargs)
-            else:
-                flag_gems.enable(**kwargs)
+            # Get whitelist and blacklist from environment variables
+            whitelist, blacklist = get_flag_gems_whitelist_blacklist()
 
-        mm_status = configure_flaggems(
-            enable_flaggems,
-            use_flaggems=fl_envs.USE_FLAGGEMS,
-            whitelist=whitelist,
-            blacklist=blacklist,
-        )
-        logger.info(
-            "FlagGems shape-aware MM: %s (%s)", mm_status.status, mm_status.reason
-        )
+            # Only rank 0 records the oplist to avoid file truncation and
+            # interleaved writes when tensor-parallel-size > 1.
+            should_record = (rank == 0)
+
+            # Use whitelist if specified (takes precedence over blacklist)
+            if whitelist:
+                logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
+                flag_gems.only_enable(
+                    include=whitelist,
+                    record=should_record,
+                    once=True,
+                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                )
+            elif blacklist:
+                logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
+                flag_gems.enable(
+                    unused=blacklist,
+                    record=should_record,
+                    once=True,
+                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                )
+            else:
+                logger.info("[FlagGems] Enable all ops")
+                flag_gems.enable(
+                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH
+                )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator

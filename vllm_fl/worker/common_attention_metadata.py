@@ -19,30 +19,15 @@ from vllm_fl.compilation.graph import Graph
 logger = init_logger(__name__)
 
 
-@dataclass(frozen=True)
-class MetadataPolicy:
-    requested: str
-    mode: str
-    reason: str
+def common_attention_metadata_enabled() -> bool:
+    """Keep the original producer on platforms without kernel validation.
 
-
-def resolve_metadata_policy(*, use_ubatching=False, async_spec_decode=False):
-    """Resolve producer and graph independently, once at runner construction."""
-    value = os.environ.get("VLLM_FL_COMMON_ATTENTION_METADATA", "stock")
-    mode = {"0": "stock", "1": "graph"}.get(value, value)
-    if mode not in ("stock", "eager", "graph"):
-        raise ValueError(
-            "VLLM_FL_COMMON_ATTENTION_METADATA must be stock, eager, graph, 0 or 1"
-        )
-    if mode != "stock" and (use_ubatching or async_spec_decode):
-        return MetadataPolicy(
-            mode, "stock", "ubatching/async speculative decode is not validated"
-        )
-    if mode == "graph" and not supports_accelerator_graph():
-        return MetadataPolicy(mode, "eager", "platform graph API is unavailable")
-    return MetadataPolicy(
-        mode, mode, "explicit opt-in" if mode != "stock" else "stock producer"
-    )
+    The pointer-table Triton kernel is currently validated on NVIDIA. Other
+    platforms can opt in for validation; setting 0 restores the old producer
+    (not merely eager execution of the new kernel).
+    """
+    value = os.environ.get("VLLM_FL_COMMON_ATTENTION_METADATA")
+    return current_platform.is_cuda() if value is None else value == "1"
 
 
 def supports_accelerator_graph() -> bool:
@@ -300,98 +285,28 @@ def compute_common_attention_metadata(
     )
 
 
-@dataclass(frozen=True)
-class PreparedMetadata:
-    """Receipt for one completed producer invocation, never a caller promise.
-
-    All slot entries (including token padding), request rows up to num_reqs,
-    and num_computed_tokens up to num_reqs have been produced on this stream.
-    A subsequent producer call or buffer invalidation expires this receipt.
-    """
-
-    owner: "CommonAttentionMetadataGraphRunner"
-    generation: int
-    sequence: int
-    num_reqs: int
-    max_num_tokens: int
-    used_graph: bool
-
-    def validate(self, block_table: Any, num_reqs: int, num_tokens: int) -> None:
-        if (
-            self.owner.block_table is not block_table
-            or self.generation != self.owner.generation
-            or self.sequence != self.owner.sequence
-            or num_reqs > self.num_reqs
-            or num_tokens > self.max_num_tokens
-        ):
-            raise RuntimeError("Expired or insufficient common metadata receipt")
-
-
-def _tensor_signature(tensor: torch.Tensor) -> tuple:
-    return (
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.dtype,
-        tensor.device,
-    )
-
-
-def _buffer_signature(block_table: Any, tensors: tuple) -> tuple:
-    groups = tuple(
-        (
-            _tensor_signature(t.block_table.gpu),
-            _tensor_signature(t.slot_mapping.gpu),
-            t.block_size,
-            t.max_num_batched_tokens,
-            t.pcp_world_size,
-            t.pcp_rank,
-            t.dcp_world_size,
-            t.dcp_rank,
-            t.cp_kv_cache_interleave_size,
-        )
-        for t in block_table.block_tables
-    )
-    return groups, tuple(_tensor_signature(t) for t in tensors)
-
-
 class CommonAttentionMetadataGraphRunner:
-    """Own fixed-address buffers for one InputBatch generation.
+    """Own metadata graphs and their buffers for one InputBatch.
 
-    Call clear() after stream synchronization and BEFORE replacing any input,
-    output, group layout, or CP geometry. Debug mode additionally rejects
-    unannounced replacements. Retained references prevent address/id reuse.
+    Synchronize and clear() before replacing buffers or block/CP geometry.
     """
 
-    def __init__(self, *, debug: bool | None = None) -> None:
-        self.graphs: dict[tuple[int, int], Any] = {}
-        self._buffers: dict[tuple[int, int], tuple] = {}
-        self._signatures: dict[tuple[int, int], tuple] = {}
+    def __init__(self) -> None:
+        self.graphs: dict[int, Any] = {}
+        self._buffers: dict[int, tuple] = {}
         self.block_table: Any = None
-        self.generation = 0
-        self.sequence = 0
-        self.captures = 0
-        self.replays = 0
-        self.eager_calls = 0
-        self.debug = (
-            os.environ.get("VLLM_LOGGING_LEVEL") == "DEBUG" if debug is None else debug
-        )
         self._graph_capture_supported = supports_accelerator_graph()
         self.graph_pool = None
-        self._missing_graph_keys: set[tuple[int, int]] = set()
+        self._missing_graph_keys: set[int] = set()
         self._warned_graph_unavailable = False
 
     def clear(self) -> None:
-        # Producer pointer tables share the owner's InputBatch generation.
         if self.block_table is not None and hasattr(self.block_table, _LAYOUT_ATTR):
             delattr(self.block_table, _LAYOUT_ATTR)
         self.graphs.clear()
         self._buffers.clear()
-        self._signatures.clear()
         self._missing_graph_keys.clear()
         self.block_table = None
-        self.generation += 1
-        self.sequence += 1
 
     def run(
         self,
@@ -405,25 +320,11 @@ class CommonAttentionMetadataGraphRunner:
         use_graph: bool,
         capture: bool = False,
         compute: Callable = compute_common_attention_metadata,
-    ) -> PreparedMetadata:
+    ) -> bool:
         if self.block_table is not block_table:
-            # ModelRunner also clears BEFORE retiring an InputBatch. This
-            # handles standalone callers retaining multiple table owners.
             self.clear()
             self.block_table = block_table
-        self.sequence += 1
         tensors = (query_start_loc, positions, seq_lens, num_computed_tokens)
-        key = (self.generation, num_reqs)
-        if (
-            self.debug
-            and key in self._signatures
-            and self._signatures[key] != _buffer_signature(block_table, tensors)
-        ):
-            raise RuntimeError(
-                "Metadata buffers/layout changed; synchronize and clear() before rebinding"
-            )
-
-        used_graph = False
         if use_graph and not self._graph_capture_supported:
             if not self._warned_graph_unavailable:
                 logger.warning(
@@ -432,45 +333,31 @@ class CommonAttentionMetadataGraphRunner:
                 self._warned_graph_unavailable = True
             use_graph = False
 
-        graph = self.graphs.get(key) if use_graph else None
+        graph = self.graphs.get(num_reqs) if use_graph else None
         if use_graph and capture and graph is None:
             if self.graph_pool is None:
                 self.graph_pool = current_platform.get_global_graph_pool()
-            # Compile before capture even if model graph warmups are zero.
+            # Compile and materialize pointer tables before capture.
             compute(block_table, num_reqs, *tensors)
             graph = Graph.graph()
             with current_platform.torch_device_fn.graph(graph, pool=self.graph_pool):
                 compute(block_table, num_reqs, *tensors)
-            self.graphs[key] = graph
-            self.captures += 1
-            self._buffers[key] = tensors + tuple(
+            self.graphs[num_reqs] = graph
+            self._buffers[num_reqs] = tensors + tuple(
                 tensor
                 for table in block_table.block_tables
                 for tensor in (table.block_table.gpu, table.slot_mapping.gpu)
             )
-            if self.debug:
-                self._signatures[key] = _buffer_signature(block_table, tensors)
 
         if graph is not None:
             # Capture records work; the first caller also consumes the output.
             graph.replay()
-            if not capture:
-                self.replays += 1
-            used_graph = True
-        else:
-            if use_graph and key not in self._missing_graph_keys:
-                logger.warning(
-                    "Metadata graph for %d requests missing; using eager producer",
-                    num_reqs,
-                )
-                self._missing_graph_keys.add(key)
-            compute(block_table, num_reqs, *tensors)
-            self.eager_calls += 1
-
-        capacity = min(
-            (t.max_num_batched_tokens for t in block_table.block_tables),
-            default=positions.numel(),
-        )
-        return PreparedMetadata(
-            self, self.generation, self.sequence, num_reqs, capacity, used_graph
-        )
+            return True
+        if use_graph and num_reqs not in self._missing_graph_keys:
+            logger.warning(
+                "Metadata graph for %d requests missing; using eager producer",
+                num_reqs,
+            )
+            self._missing_graph_keys.add(num_reqs)
+        compute(block_table, num_reqs, *tensors)
+        return False

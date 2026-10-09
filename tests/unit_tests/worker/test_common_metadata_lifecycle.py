@@ -1,72 +1,55 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
 
-import pytest
 import torch
 
-from vllm_fl.worker import common_attention_metadata as metadata
+
+def test_producer_success_enables_cleanup_skip_in_eager_mode():
+    from unittest.mock import Mock
+
+    from vllm.config import CUDAGraphMode
+
+    from vllm_fl.worker.model_runner import ModelRunnerFL
+
+    runner = object.__new__(ModelRunnerFL)
+    runner.common_attention_metadata_graph = SimpleNamespace(
+        run=Mock(return_value=False)
+    )
+    runner.input_batch = SimpleNamespace(block_table=object())
+    runner.parallel_config = SimpleNamespace(use_ubatching=False)
+    runner.query_start_loc = SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32))
+    runner.positions = torch.zeros(16, dtype=torch.int64)
+    runner.seq_lens = torch.zeros(2, dtype=torch.int32)
+    runner.num_computed_tokens = torch.zeros(2, dtype=torch.int32)
+    assert runner._run_common_attention_metadata(2, CUDAGraphMode.NONE)
+    assert (
+        runner.common_attention_metadata_graph.run.call_args.kwargs["use_graph"]
+        is False
+    )
+    runner.common_attention_metadata_graph = None
+    assert not runner._run_common_attention_metadata(2, CUDAGraphMode.NONE)
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        (None, "stock"),
-        ("stock", "stock"),
-        ("0", "stock"),
-        ("eager", "eager"),
-        ("graph", "graph"),
-        ("1", "graph"),
-    ],
-)
-def test_modes_are_independent(monkeypatch, value, expected):
-    monkeypatch.setattr(metadata, "supports_accelerator_graph", lambda: True)
-    if value is None:
-        monkeypatch.delenv("VLLM_FL_COMMON_ATTENTION_METADATA", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_FL_COMMON_ATTENTION_METADATA", value)
-    assert metadata.resolve_metadata_policy().mode == expected
+def test_producer_failure_propagates_before_consumers_skip_cleanup():
+    from unittest.mock import Mock
 
+    import pytest
 
-@pytest.mark.parametrize("value", ["", "true", "2", "Graph", "graph "])
-def test_mode_typo_is_rejected(monkeypatch, value):
-    monkeypatch.setenv("VLLM_FL_COMMON_ATTENTION_METADATA", value)
-    with pytest.raises(ValueError, match="must be"):
-        metadata.resolve_metadata_policy()
+    from vllm.config import CUDAGraphMode
 
+    from vllm_fl.worker.model_runner import ModelRunnerFL
 
-@pytest.mark.parametrize(
-    "kwargs", [{"use_ubatching": True}, {"async_spec_decode": True}]
-)
-def test_unvalidated_schedulers_use_stock(monkeypatch, kwargs):
-    monkeypatch.setenv("VLLM_FL_COMMON_ATTENTION_METADATA", "graph")
-    assert metadata.resolve_metadata_policy(**kwargs).mode == "stock"
-
-
-def test_graph_api_fallback_is_distinct_from_producer_validation(monkeypatch):
-    monkeypatch.setenv("VLLM_FL_COMMON_ATTENTION_METADATA", "graph")
-    monkeypatch.setattr(metadata, "supports_accelerator_graph", lambda: False)
-    policy = metadata.resolve_metadata_policy()
-    assert policy.requested == "graph" and policy.mode == "eager"
-    assert "API" in policy.reason
-
-
-def test_receipt_cannot_skip_padding_after_another_step_or_rebind(monkeypatch):
-    monkeypatch.setattr(metadata, "supports_accelerator_graph", lambda: False)
-    runner = metadata.CommonAttentionMetadataGraphRunner()
-    table = SimpleNamespace(block_tables=[])
-    buffers = (torch.zeros(3), torch.zeros(16), torch.zeros(2), torch.zeros(2))
-    receipt = runner.run(table, 2, *buffers, use_graph=False, compute=Mock())
-    receipt.validate(table, 2, 16)
-    for reqs, tokens in [(3, 16), (2, 17)]:
-        with pytest.raises(RuntimeError, match="insufficient"):
-            receipt.validate(table, reqs, tokens)
-    runner.run(table, 2, *buffers, use_graph=False, compute=Mock())
-    with pytest.raises(RuntimeError, match="Expired"):
-        receipt.validate(table, 2, 16)
-    receipt = runner.run(table, 2, *buffers, use_graph=False, compute=Mock())
-    runner.clear()
-    with pytest.raises(RuntimeError, match="Expired"):
-        receipt.validate(table, 2, 16)
+    runner = object.__new__(ModelRunnerFL)
+    runner.common_attention_metadata_graph = SimpleNamespace(
+        run=Mock(side_effect=RuntimeError("metadata launch failed"))
+    )
+    runner.input_batch = SimpleNamespace(block_table=object())
+    runner.parallel_config = SimpleNamespace(use_ubatching=False)
+    runner.query_start_loc = SimpleNamespace(gpu=torch.zeros(3, dtype=torch.int32))
+    runner.positions = torch.zeros(16, dtype=torch.int64)
+    runner.seq_lens = torch.zeros(2, dtype=torch.int32)
+    runner.num_computed_tokens = torch.zeros(2, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="metadata launch failed"):
+        runner._run_common_attention_metadata(2, CUDAGraphMode.NONE)
 
 
 def test_input_batch_replacement_clears_graphs_before_releasing_owner(monkeypatch):
@@ -108,28 +91,6 @@ def test_input_batch_replacement_clears_graphs_before_releasing_owner(monkeypatc
     )
     runner.may_reinitialize_input_batch(config, [8])
     assert runner.input_batch is new
-
-
-@pytest.mark.parametrize("method", ["_get_slot_mappings", "_build_attention_metadata"])
-def test_consumers_reject_expired_receipt_before_skipping_cleanup(monkeypatch, method):
-    from vllm_fl.worker.model_runner import ModelRunnerFL
-
-    monkeypatch.setattr(metadata, "supports_accelerator_graph", lambda: False)
-    producer = metadata.CommonAttentionMetadataGraphRunner()
-    table = SimpleNamespace(block_tables=[])
-    buffers = (torch.zeros(3), torch.zeros(16), torch.zeros(2), torch.zeros(2))
-    receipt = producer.run(table, 2, *buffers, use_graph=False, compute=Mock())
-    producer.clear()
-    runner = object.__new__(ModelRunnerFL)
-    runner.input_batch = SimpleNamespace(block_table=table)
-    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
-    kwargs = (
-        dict(num_tokens_padded=4, num_reqs_padded=2, num_tokens_unpadded=4)
-        if method == "_get_slot_mappings"
-        else dict(num_tokens=4, num_reqs=2, max_query_len=2)
-    )
-    with pytest.raises(RuntimeError, match="Expired"):
-        getattr(runner, method)(prepared_metadata=receipt, **kwargs)
 
 
 def test_shutdown_releases_common_graphs_before_model_and_workspace(monkeypatch):

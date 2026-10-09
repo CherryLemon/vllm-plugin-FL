@@ -41,7 +41,7 @@ def test_padded_rows_clear_only_group_width_in_strided_storage():
         if not capture:
             query.copy_(torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32))
             lengths.copy_(torch.tensor([2, 12, 0, 0], dtype=torch.int32))
-        receipt = runner.run(
+        runner.run(
             table,
             4,
             query,
@@ -51,7 +51,6 @@ def test_padded_rows_clear_only_group_width_in_strided_storage():
             use_graph=True,
             capture=capture,
         )
-        receipt.validate(table, 4, 16)
         torch.cuda.synchronize()
         for group, expected in zip(
             table.block_tables, _expected_slots(table, query, positions)
@@ -205,7 +204,7 @@ def test_common_attention_metadata_graph_replay_uses_updated_metadata(
         use_graph=True,
         capture=True,
     )
-    assert used_graph.used_graph
+    assert used_graph
     current_platform.torch_device_fn.synchronize()
     for actual, expected in zip(
         (group.slot_mapping.gpu for group in table.block_tables),
@@ -236,7 +235,7 @@ def test_common_attention_metadata_graph_replay_uses_updated_metadata(
         use_graph=True,
         capture=False,
     )
-    assert used_graph.used_graph
+    assert used_graph
     current_platform.torch_device_fn.synchronize()
     for actual, expected in zip(
         (group.slot_mapping.gpu for group in table.block_tables),
@@ -275,7 +274,7 @@ def test_common_attention_metadata_graph_off_runs_eager(
     )
     current_platform.torch_device_fn.synchronize()
 
-    assert not used_graph.used_graph
+    assert not used_graph
     assert runner.graphs == {}
     for actual, expected in zip(
         (group.slot_mapping.gpu for group in table.block_tables),
@@ -355,7 +354,7 @@ def test_common_attention_metadata_graph_unavailable_falls_back_to_eager(
     )
     current_platform.torch_device_fn.synchronize()
 
-    assert not used_graph.used_graph
+    assert not used_graph
     assert runner.graphs == {}
     torch.testing.assert_close(
         num_computed_tokens,
@@ -441,7 +440,6 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
         parallel_config=SimpleNamespace(num_ubatches=1),
     )
     runner.parallel_config = SimpleNamespace(use_ubatching=False)
-    runner.common_metadata_policy = SimpleNamespace(mode="graph")
     runner.scheduler_config = SimpleNamespace(max_num_seqs=4)
     runner.max_num_reqs = 4
     runner.max_num_tokens = 16
@@ -495,10 +493,7 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
             BatchDescriptor(num_tokens=2, num_reqs=2), mode, num_warmups=0
         )
     extent = 4 if mode == CUDAGraphMode.PIECEWISE else 2
-    assert (
-        runner.common_attention_metadata_graph.generation,
-        extent,
-    ) in runner.common_attention_metadata_graph.graphs
+    assert extent in runner.common_attention_metadata_graph.graphs
     torch.testing.assert_close(
         runner.query_start_loc.gpu.cpu(),
         torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
@@ -518,7 +513,7 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
         runner.seq_lens.copy_(
             torch.tensor([6, 8, 10, 0], dtype=torch.int32, device=device)
         )
-        assert runner._run_common_attention_metadata(3, mode).used_graph
+        assert runner._run_common_attention_metadata(3, mode)
         assert not runner.common_attention_metadata_graph._missing_graph_keys
         torch.testing.assert_close(
             runner.num_computed_tokens.cpu(),
@@ -526,37 +521,31 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
         )
 
 
-def test_graph_rebind_requires_invalidation_and_receipt_expires(device):
+def test_graph_clear_recaptures_replaced_output(device):
     if not supports_accelerator_graph():
         pytest.skip("Accelerator graph capture is unavailable")
     table = _make_block_table(device)
-    runner = CommonAttentionMetadataGraphRunner(debug=True)
+    runner = CommonAttentionMetadataGraphRunner()
     query = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32, device=device)
     positions = torch.zeros(16, dtype=torch.int64, device=device)
     seq = torch.tensor([3, 4, 0, 0], dtype=torch.int32, device=device)
     output = torch.empty_like(seq)
-    receipt = runner.run(
+    assert runner.run(
         table, 4, query, positions, seq, output, use_graph=True, capture=True
     )
-    old_generation = receipt.generation
     current_platform.torch_device_fn.synchronize()
-    new_output = torch.full_like(output, -100)
-    with pytest.raises(RuntimeError, match="buffers/layout changed"):
-        runner.run(table, 4, query, positions, seq, new_output, use_graph=True)
-    # Invalidate before rebinding, then capture into the new addresses.
     runner.clear()
-    new_receipt = runner.run(
+    assert not hasattr(table, "_vllm_fl_common_attention_metadata_layout")
+    output.fill_(-100)
+    new_output = torch.full_like(output, -200)
+    assert runner.run(
         table, 4, query, positions, seq, new_output, use_graph=True, capture=True
     )
-    assert new_receipt.generation > old_generation
-    with pytest.raises(RuntimeError, match="Expired"):
-        receipt.validate(table, 4, 16)
+    current_platform.torch_device_fn.synchronize()
     torch.testing.assert_close(
         new_output, torch.tensor([2, 3, 0, 0], device=device, dtype=torch.int32)
     )
-    table.block_tables[0].cp_kv_cache_interleave_size *= 2
-    with pytest.raises(RuntimeError, match="buffers/layout changed"):
-        runner.run(table, 4, query, positions, seq, new_output, use_graph=True)
+    assert torch.all(output == -100)
 
 
 @pytest.mark.parametrize("mode", ["stock", "eager", "graph"])
@@ -564,7 +553,7 @@ def test_metadata_modes_with_prefix_positions_and_request_reorder(device, mode):
     if mode == "graph" and not supports_accelerator_graph():
         pytest.skip("Accelerator graph capture is unavailable")
     table = _make_block_table(device)
-    runner = CommonAttentionMetadataGraphRunner(debug=True)
+    runner = CommonAttentionMetadataGraphRunner()
     query = torch.tensor([0, 2, 4, 4, 4], dtype=torch.int32, device=device)
     positions = torch.tensor([2, 3, 8, 9] + [0] * 12, dtype=torch.int64, device=device)
     seq = torch.tensor([4, 10, 0, 0], dtype=torch.int32, device=device)
@@ -595,8 +584,7 @@ def test_metadata_modes_with_prefix_positions_and_request_reorder(device, mode):
                 use_graph=mode == "graph",
                 capture=step == 0,
             )
-            assert receipt.used_graph == (mode == "graph")
-            receipt.validate(table, 4, 16)
+            assert receipt == (mode == "graph")
         for group, expected in zip(
             table.block_tables, _expected_slots(table, query, positions)
         ):

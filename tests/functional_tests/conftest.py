@@ -13,7 +13,7 @@ from the root tests/conftest.py. Only functional-specific fixtures belong here.
 import pytest
 
 
-@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     """Force clean exit after all plugins finish to avoid NPU GC destructor crash.
 
@@ -21,22 +21,14 @@ def pytest_sessionfinish(session, exitstatus):
     during interpreter shutdown, causing a segfault at a random GC location
     (e.g. _pytest/mark/structures.py) even after all tests have passed.
 
-    The outer hook wrapper resumes after other session-finish hooks, including
-    terminal reporting, have flushed their output. Only a loaded torch_npu
-    runtime needs the forced exit; other platforms use normal pytest teardown.
-    os._exit() then bypasses Python GC, preventing the NPU destructor crash.
+    trylast=True ensures this hook runs after all other plugins (json-report,
+    coverage, etc.) have flushed their output files. os._exit() then bypasses
+    Python GC entirely, preventing the NPU destructor crash.
 
     Secondary fix: also drains any residual inductor SubprocPool whose
     _read_thread would segfault when the subprocess pipe breaks on NPU teardown.
     Primary guard for that is TORCHINDUCTOR_COMPILE_THREADS=1 in ascend.yaml.
     """
-    yield
-
-    import sys
-
-    if "torch_npu" not in sys.modules:
-        return
-
     import contextlib
     import os
     import threading
@@ -71,6 +63,4 @@ def pytest_sessionfinish(session, exitstatus):
                 read_thread.join(timeout=3.0)
 
     # --- bypass Python GC to avoid NPU destructor memory corruption ---
-    sys.stdout.flush()
-    sys.stderr.flush()
     os._exit(int(exitstatus))
