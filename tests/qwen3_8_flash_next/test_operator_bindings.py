@@ -4,8 +4,12 @@ import flaggems_vllm
 import pytest
 import torch
 
-from vllm_fl.models.qwen3_8_flash_next.gpu.ops import hyperconnection, ple_fusion
-from vllm_fl.models.qwen3_8_flash_next.gpu.ops import ple_state, qsa
+from vllm_fl.models.qwen3_8_flash_next.gpu.ops import (
+    hyperconnection,
+    ple_fusion,
+    ple_state,
+    qsa,
+)
 
 
 @pytest.mark.parametrize(
