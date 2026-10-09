@@ -19,6 +19,10 @@ from vllm_fl.worker.async_output import (
 
 @pytest.fixture
 def pool():
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda() or current_platform.is_rocm():
+        pytest.skip("native completion requires NVIDIA CUDA")
     if not torch.cuda.is_available() or torch.version.hip:
         pytest.skip("requires NVIDIA CUDA")
     # vLLM's extension must coexist with the plugin extension; it owns _C too.
