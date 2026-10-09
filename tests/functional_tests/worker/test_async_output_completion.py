@@ -54,8 +54,11 @@ def test_callback_observes_fresh_copies_and_reuses_descriptors(
         graph = None
         if use_graph:
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            capture_stream = torch.cuda.Stream(device=device_index)
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.graph(graph, stream=capture_stream):
                 source.add_(1)
+            torch.cuda.current_stream().wait_stream(capture_stream)
             source.zero_()
         descriptors = list(pool._event_fds)
         for value in range(1, 33):
@@ -65,7 +68,7 @@ def test_callback_observes_fresh_copies_and_reuses_descriptors(
                 source.fill_(value)
             destination.fill_(-1)
             with torch.cuda.stream(stream):
-                stream.wait_stream(torch.cuda.default_stream())
+                stream.wait_stream(torch.cuda.current_stream())
                 destination.copy_(source, non_blocking=True)
                 event = torch.cuda.Event()
                 event.record()
@@ -162,7 +165,13 @@ def test_model_runner_output_matches_event_completion(pool, monkeypatch, kind):
         assert (
             results[0].sampled_token_ids == results[1].sampled_token_ids == [[17], []]
         )
-        assert results[0].logprobs == results[1].logprobs
+        for field in ("logprob_token_ids", "logprobs", "selected_token_ranks"):
+            torch.testing.assert_close(
+                torch.as_tensor(getattr(results[0].logprobs, field)),
+                torch.as_tensor(getattr(results[1].logprobs, field)),
+                rtol=0,
+                atol=0,
+            )
     else:
         assert results[0].pooler_output[1] is results[1].pooler_output[1] is None
         torch.testing.assert_close(
