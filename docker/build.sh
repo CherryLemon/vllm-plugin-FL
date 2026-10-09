@@ -36,12 +36,12 @@ METAX_PYTHON_VERSION="${METAX_PYTHON_VERSION:-3.12}"
 METAX_PYTHON_TAG="${METAX_PYTHON_TAG:-py312}"
 METAX_MACA_VERSION="${METAX_MACA_VERSION:-3.7.0.107}"
 METAX_VLLM_VERSION="${METAX_VLLM_VERSION:-0.20.2}"
-MUSA_BASE_IMAGE="${MUSA_BASE_IMAGE:-registry.mthreads.com/mcconline/inference/vllm:v0.20.2-ph1-4.3.5-torch2.7.1-v1.1.0}"
+MUSA_BASE_IMAGE="${MUSA_BASE_IMAGE:-harbor.baai.ac.cn/flagrelease-public/flagrelease_mthreads-gmi_vllm024plugin_base:08281629}"
 MUSA_VERSION="${MUSA_VERSION:-4.3.5}"
-MUSA_VLLM_VERSION="${MUSA_VLLM_VERSION:-0.20.2}"
+MUSA_VLLM_VERSION="${MUSA_VLLM_VERSION:-0.24.0}"
 MUSA_PYTHON_VERSION="${MUSA_PYTHON_VERSION:-3.10}"
-MUSA_TORCH_VERSION="${MUSA_TORCH_VERSION:-2.7.1}"
-MUSA_FLAGGEMS_VERSION="${MUSA_FLAGGEMS_VERSION:-5.0.0}"
+MUSA_TORCH_VERSION="${MUSA_TORCH_VERSION:-2.9.0}"
+MUSA_FLAGGEMS_VERSION="${MUSA_FLAGGEMS_VERSION:-5.3.2.post1.dev22+gb1f939eb5}"
 ASCEND_VLLM_VERSION="${ASCEND_VLLM_VERSION:-0.20.2}"
 ASCEND_BASE_IMAGE="${ASCEND_BASE_IMAGE:-quay.io/ascend/vllm-ascend:v0.20.2rc1-a3}"
 ASCEND_FLAGGEMS_VERSION="${ASCEND_FLAGGEMS_VERSION:-3e6528cf04f5f964a7b0fa6628de6f0410dbfd02}"
@@ -54,14 +54,14 @@ ILUVATAR_DRIVER_VERSION="${ILUVATAR_DRIVER_VERSION:-4.5.0}"
 ILUVATAR_PYTHON_VERSION="${ILUVATAR_PYTHON_VERSION:-3.12}"
 ILUVATAR_TORCH_VERSION="${ILUVATAR_TORCH_VERSION:-2.10.0}"
 ILUVATAR_VLLM_VERSION="${ILUVATAR_VLLM_VERSION:-0.24.0}"
-KUNLUNXIN_BASE_IMAGE="${KUNLUNXIN_BASE_IMAGE:-harbor.baai.ac.cn/plugin/xvllm-ubuntu2204-py310-torch29-0200:v20.0.10.0}"
+KUNLUNXIN_BASE_IMAGE="${KUNLUNXIN_BASE_IMAGE:-harbor.baai.ac.cn/plugin/kunlunxin001-gems5.4.0-treenone-triton3.0.0-cx0.13.0-plugin0.3.0-vllm0.24.0-cp310-pt29-x64-v5.0.21.43:20260917}"
 KUNLUNXIN_DRIVER_VERSION="${KUNLUNXIN_DRIVER_VERSION:-5.0.21.43}"
 KUNLUNXIN_PYTHON_VERSION="${KUNLUNXIN_PYTHON_VERSION:-3.10}"
 KUNLUNXIN_TORCH_VERSION="${KUNLUNXIN_TORCH_VERSION:-2.9.0}"
-KUNLUNXIN_VLLM_VERSION="${KUNLUNXIN_VLLM_VERSION:-0.20.2}"
-KUNLUNXIN_FLAGGEMS_REF="${KUNLUNXIN_FLAGGEMS_REF:-v5.0.0}"
+KUNLUNXIN_VLLM_VERSION="${KUNLUNXIN_VLLM_VERSION:-0.24.0}"
+KUNLUNXIN_FLAGGEMS_REF="${KUNLUNXIN_FLAGGEMS_REF:-v5.4.0}"
 KUNLUNXIN_FLAGCX_REF="${KUNLUNXIN_FLAGCX_REF:-v0.13.0}"
-KUNLUNXIN_PLUGIN_FL_REF="${KUNLUNXIN_PLUGIN_FL_REF:-38e7dbc20197e2db742c4e4c9687d36ea4df9900}"
+KUNLUNXIN_PLUGIN_FL_REF="${KUNLUNXIN_PLUGIN_FL_REF:-fd5c727fcdb607bc4354cd11384761bb5d5ecfba}"
 HYGON_BASE_IMAGE="${HYGON_BASE_IMAGE:-harbor.sourcefind.cn:5443/dcu/admin/base/custom:vllm0.20.0-ubuntu22.04-dtk26.04-py3.10-MiniCPM-V-4.6}"
 HYGON_VLLM_VERSION="${HYGON_VLLM_VERSION:-0.20.2}"
 HYGON_DTK_VERSION="${HYGON_DTK_VERSION:-26.04}"
@@ -70,6 +70,7 @@ HYGON_RUNTIME_LIB_DIR="${HYGON_RUNTIME_LIB_DIR:-/opt/hyhal/lib}"
 HYGON_RUNTIME_ROOTS="${HYGON_RUNTIME_ROOTS:-/opt/dtk:/opt/hyhal:/usr/local/hyhal}"
 FLAGGEMS_VERSION="${FLAGGEMS_VERSION:-62d70b9e858ec407572153ee8cdf65cc24a637d5}"
 VLLM_PLUGIN_FL_VERSION="${VLLM_PLUGIN_FL_VERSION:-ffa2ee3eb3831f3873dd0966d12fc8e0b4e6e3d4}"
+VLLM_PLUGIN_FL_PACKAGE_VERSION="${VLLM_PLUGIN_FL_PACKAGE_VERSION:-$(git -C "${SCRIPT_DIR}/.." describe --tags --always --dirty 2>/dev/null | sed -E 's/^v//; s/-([0-9]+)-g/\.dev\1+g/; s/-dirty/\.dirty/' || printf '0.0.0')}"
 
 # ---- Build options ----
 PLATFORM="${PLATFORM:-cuda}"
@@ -199,8 +200,8 @@ VERSIONS (override via environment variables):
     METAX_VLLM_VERSION   vLLM version installed in empty mode (default: ${METAX_VLLM_VERSION})
   MUSA:
     MUSA_BASE_IMAGE      Moore Threads base image (default: ${MUSA_BASE_IMAGE})
-    MUSA_VERSION         MUSA version used in image tag (default: ${MUSA_VERSION})
-    MUSA_VLLM_VERSION    vLLM empty-mode version (default: ${MUSA_VLLM_VERSION})
+    MUSA_VERSION         MUSA version in the FlagOS stack (default: ${MUSA_VERSION})
+    MUSA_VLLM_VERSION    vLLM version in base image (default: ${MUSA_VLLM_VERSION})
     MUSA_PYTHON_VERSION  Python version in base image (default: ${MUSA_PYTHON_VERSION})
     MUSA_TORCH_VERSION   PyTorch version in base image (default: ${MUSA_TORCH_VERSION})
     MUSA_FLAGGEMS_VERSION FlagGems version in base image (default: ${MUSA_FLAGGEMS_VERSION})
@@ -319,8 +320,13 @@ fi
 # Build
 # ==============================================================================
 
-# Build context is the platform-specific directory (e.g. docker/ascend/)
+# Most Dockerfiles only need their platform directory. Enflame and MUSA also
+# bake the checked-out vllm-plugin-FL package into the image, so they require
+# the repository root as their build context.
 BUILD_CONTEXT="${SCRIPT_DIR}/${PLATFORM}"
+if [[ "${PLATFORM}" == "enflame" || "${PLATFORM}" == "musa" ]]; then
+    BUILD_CONTEXT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 
 # Platform-specific build args and auto-tag
 BUILD_ARGS=()
@@ -379,12 +385,18 @@ elif [[ "${PLATFORM}" == "metax" ]]; then
 elif [[ "${PLATFORM}" == "musa" ]]; then
     PYTHON_VERSION="${MUSA_PYTHON_VERSION}"
     VLLM_VERSION="${MUSA_VLLM_VERSION}"
+    if [[ "${IMAGE_NAME}" == "harbor.baai.ac.cn/flagscale/vllm-plugin-fl" ]]; then
+        IMAGE_NAME="harbor.baai.ac.cn/flagos-dev/vllm-plugin-fl"
+    fi
     BUILD_ARGS+=(
         --build-arg "MUSA_BASE_IMAGE=${MUSA_BASE_IMAGE}"
+        --build-arg "VLLM_VERSION=${MUSA_VLLM_VERSION}"
+        --build-arg "TORCH_VERSION=${MUSA_TORCH_VERSION}"
         --build-arg "FLAGGEMS_VERSION=${MUSA_FLAGGEMS_VERSION}"
+        --build-arg "VLLM_PLUGIN_FL_PACKAGE_VERSION=${VLLM_PLUGIN_FL_PACKAGE_VERSION}"
     )
     if [[ -z "${IMAGE_TAG}" ]]; then
-        IMAGE_TAG="musa${MUSA_VERSION}-vllm${VLLM_VERSION}-torch${MUSA_TORCH_VERSION}-py${MUSA_PYTHON_VERSION}-${TARGET}"
+        IMAGE_TAG="v${MUSA_VLLM_VERSION}-musa-${TARGET}"
     fi
 elif [[ "${PLATFORM}" == "enflame" ]]; then
     PYTHON_VERSION="${ENFLAME_PYTHON_VERSION}"
@@ -396,6 +408,7 @@ elif [[ "${PLATFORM}" == "enflame" ]]; then
         --build-arg "ENFLAME_BASE_IMAGE=${ENFLAME_BASE_IMAGE}"
         --build-arg "VLLM_VERSION=${ENFLAME_VLLM_VERSION}"
         --build-arg "DRIVER_VERSION=${ENFLAME_DRIVER_VERSION}"
+        --build-arg "VLLM_PLUGIN_FL_PACKAGE_VERSION=${VLLM_PLUGIN_FL_PACKAGE_VERSION}"
     )
     if [[ -z "${IMAGE_TAG}" ]]; then
         IMAGE_TAG="v${ENFLAME_VLLM_VERSION}-enflame-ci"
@@ -464,10 +477,12 @@ elif [[ "${PLATFORM}" == "musa" ]]; then
     msg "  MUSA base:      ${MUSA_BASE_IMAGE}"
     msg "  MUSA PyTorch:   ${MUSA_TORCH_VERSION}"
     msg "  FlagGems:       ${MUSA_FLAGGEMS_VERSION}"
+    msg "  Plugin:         ${VLLM_PLUGIN_FL_PACKAGE_VERSION}"
 elif [[ "${PLATFORM}" == "enflame" ]]; then
     msg "  Driver:         ${ENFLAME_DRIVER_VERSION}"
     msg "  Enflame Python: ${ENFLAME_PYTHON_VERSION}"
     msg "  Base image:     ${ENFLAME_BASE_IMAGE}"
+    msg "  Plugin:         ${VLLM_PLUGIN_FL_PACKAGE_VERSION}"
 elif [[ "${PLATFORM}" == "iluvatar" ]]; then
     msg "  Driver:         ${ILUVATAR_DRIVER_VERSION}"
     msg "  Iluvatar Python: ${ILUVATAR_PYTHON_VERSION}"
