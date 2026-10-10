@@ -10,6 +10,7 @@ import json
 from copy import deepcopy
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import requests
 from huggingface_hub import try_to_load_from_cache
@@ -32,8 +33,13 @@ def no_network(monkeypatch):
     def unexpected_request(*args, **kwargs):
         raise AssertionError("Processor cache regression attempted HTTP transport")
 
+    async def unexpected_async_request(*args, **kwargs):
+        raise AssertionError("Processor cache regression attempted HTTP transport")
+
     monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
     monkeypatch.setattr(requests.Session, "request", unexpected_request)
+    monkeypatch.setattr(httpx.Client, "send", unexpected_request)
+    monkeypatch.setattr(httpx.AsyncClient, "send", unexpected_async_request)
 
 
 def write_checkpoint(path, *, image_tokens=512, video_tokens=1024, word_id=7):
