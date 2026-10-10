@@ -647,7 +647,7 @@ class Glm5NextVisionTransformer(nn.Module):
 
 
 class Glm5NextProcessingInfo(Glm4vProcessingInfo):
-    """Build the checkpoint's custom image/video processor locally."""
+    """Build the checkpoint's custom image/video processor."""
 
     def get_hf_processor(self, **kwargs: object):
         processor = getattr(self, "_glm5_hf_processor", None)
@@ -656,7 +656,17 @@ class Glm5NextProcessingInfo(Glm4vProcessingInfo):
                 Glm5NextProcessor,
             )
 
-            processor = Glm5NextProcessor.from_pretrained(self.ctx.model_config.model)
+            model_config = self.ctx.model_config
+            load_kwargs = {
+                "revision": model_config.revision,
+                "tokenizer_revision": model_config.tokenizer_revision,
+                "token": model_config.hf_token,
+                "trust_remote_code": model_config.trust_remote_code,
+                **kwargs,
+            }
+            processor = Glm5NextProcessor.from_pretrained(
+                model_config.model, **load_kwargs
+            )
             processor.configure_serving(self.ctx.get_merged_mm_kwargs({}))
             self._glm5_hf_processor = processor
         return processor

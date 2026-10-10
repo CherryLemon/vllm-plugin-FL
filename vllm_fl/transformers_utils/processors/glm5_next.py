@@ -18,7 +18,6 @@ are derived from the token bounds; there is no ``size``-edge budget.
 
 import json
 import math
-import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,7 +38,6 @@ from transformers.image_utils import (
     SizeDict,
     get_image_size,
 )
-from transformers.models.auto.image_processing_auto import get_image_processor_config
 from transformers.processing_utils import (
     ImagesKwargs,
     MultiModalData,
@@ -50,6 +48,7 @@ from transformers.processing_utils import (
 )
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import TensorType
+from transformers.utils.hub import cached_file
 from transformers.video_processing_utils import BaseVideoProcessor
 from transformers.video_utils import (
     VideoInput,
@@ -1084,10 +1083,31 @@ class Glm5NextProcessor(ProcessorMixin):
         from transformers import AutoTokenizer
 
         model_path = pretrained_model_name_or_path
-        tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
+        hub_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "cache_dir",
+                "force_download",
+                "proxies",
+                "token",
+                "revision",
+                "local_files_only",
+                "subfolder",
+            )
+            if key in kwargs
+        }
+        config_file = cached_file(model_path, "processor_config.json", **hub_kwargs)
+        with open(config_file, encoding="utf-8") as f:
+            processor_config = json.load(f)
+
+        tokenizer_kwargs = dict(kwargs)
+        tokenizer_revision = tokenizer_kwargs.pop("tokenizer_revision", None)
+        if tokenizer_revision is not None:
+            tokenizer_kwargs["revision"] = tokenizer_revision
+        tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
 
         ip_cfg = _normalize_processor_config(
-            dict(get_image_processor_config(model_path)),
+            dict(processor_config.get("image_processor", {})),
             default_min_tokens=16,
             default_max_tokens=8000,
             is_video=False,
@@ -1097,13 +1117,12 @@ class Glm5NextProcessor(ProcessorMixin):
             **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
         )
 
-        with open(os.path.join(model_path, "processor_config.json")) as f:
-            vp_cfg = _normalize_processor_config(
-                dict(json.load(f)["video_processor"]),
-                default_min_tokens=16,
-                default_max_tokens=240000,
-                is_video=True,
-            )
+        vp_cfg = _normalize_processor_config(
+            dict(processor_config["video_processor"]),
+            default_min_tokens=16,
+            default_max_tokens=240000,
+            is_video=True,
+        )
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
         )
