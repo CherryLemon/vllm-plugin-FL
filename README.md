@@ -102,7 +102,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
     GLM5.3-Flash also requires the paired public operators in
     [FlagGems-vllm PR #900](https://github.com/flagos-ai/FlagGems-vllm/pull/900).
     The `glm5` extra pins commit
-    `470d49a20bdc355adc2a75ff2b53062566a3903d` and TileLang 0.1.9:
+    `60a4ede515e4c72cef80f13aebc105eb11d558aa` and TileLang 0.1.9:
     ```sh
     VLLM_VENDOR=cuda pip install --no-build-isolation '.[glm5]'
     ```
