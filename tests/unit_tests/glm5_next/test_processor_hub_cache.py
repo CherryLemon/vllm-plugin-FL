@@ -16,7 +16,7 @@ import requests
 from huggingface_hub import try_to_load_from_cache
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers import AutoTokenizer, BertConfig, PreTrainedTokenizerFast
 
 from vllm_fl.transformers_utils.processors import glm5_next as processor_module
 from vllm_fl.transformers_utils.processors.glm5_next import Glm5NextProcessor
@@ -59,6 +59,13 @@ def write_checkpoint(path, *, image_tokens=512, video_tokens=1024, word_id=7):
         unk_token="[UNK]",
     )
     tokenizer.save_pretrained(path)
+    BertConfig(
+        vocab_size=word_id + 1,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+    ).save_pretrained(path)
     config = {
         "processor_class": "Glm5NextProcessor",
         "image_processor": {
