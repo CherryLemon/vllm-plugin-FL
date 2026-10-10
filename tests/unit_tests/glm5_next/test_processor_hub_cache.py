@@ -253,11 +253,15 @@ def test_missing_processor_config_raises_without_defaults(
         (local_checkpoint / "processor_config.json").unlink()
         model = str(local_checkpoint)
         kwargs = {}
+        missing_config_error = "processor_config.json"
     else:
         (hub_cache.snapshots[REVISION_A] / "processor_config.json").unlink()
         model = REPO_ID
         kwargs = dict(cache_dir=str(hub_cache.cache_dir), revision="main")
-    with pytest.raises(OSError, match="processor_config.json"):
+        missing_config_error = (
+            r"processor_config\.json|couldn't find them in (?:the )?cached files"
+        )
+    with pytest.raises(OSError, match=missing_config_error):
         Glm5NextProcessor.from_pretrained(model, local_files_only=True, **kwargs)
 
 
