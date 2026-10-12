@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
+import sys
 from dataclasses import replace
 from functools import wraps
 
@@ -476,6 +478,83 @@ def install_glm5_next_kpool() -> None:
 
         get_groups._glm5_kpool = True
         stage(kv_cache_utils, "get_kv_cache_groups", get_groups)
+
+    original_block_sizes = kv_cache_utils.resolve_kv_cache_block_sizes
+    if not getattr(original_block_sizes, "_glm5_kpool", False):
+
+        @wraps(original_block_sizes)
+        def resolve_block_sizes(kv_cache_config, vllm_config):
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            groups = kv_cache_config.kv_cache_groups
+            if not _is_glm5_kpool_groups(groups):
+                return original_block_sizes(kv_cache_config, vllm_config)
+
+            parallel = vllm_config.parallel_config
+            if (
+                parallel.decode_context_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+            ):
+                raise ValueError("GLM5-Next K-pool does not support context parallelism")
+
+            if (
+                vllm_config.cache_config.enable_prefix_caching
+                or vllm_config.kv_transfer_config is not None
+            ) and any(
+                isinstance(group.kv_cache_spec, MambaSpec)
+                and group.kv_cache_spec.mamba_cache_mode != "align"
+                for group in groups
+            ):
+                raise ValueError(
+                    "GLM5-Next K-pool prefix caching requires aligned KDA state pages"
+                )
+
+            # Worker alignment can enlarge MLA/KDA pages after engine config
+            # resolution. The request-owned tail still has a kpool-token page,
+            # so the upstream fallback to scheduler-size hashes cannot divide
+            # every group. Use the actual groups for both granularities, even
+            # when hashing is inactive; tail pages remain excluded from hits.
+            block_sizes = [group.kv_cache_spec.block_size for group in groups]
+            requested = vllm_config.cache_config.hash_block_size
+            hash_block_size = (
+                requested if requested is not None else math.gcd(*block_sizes)
+            )
+            if any(size % hash_block_size != 0 for size in block_sizes):
+                raise ValueError(
+                    f"Invalid hash_block_size={hash_block_size}; GLM5-Next KV "
+                    f"group block sizes={block_sizes} must be divisible by it"
+                )
+            return math.lcm(*block_sizes), hash_block_size
+
+        resolve_block_sizes._glm5_kpool = True
+        stage(kv_cache_utils, "resolve_kv_cache_block_sizes", resolve_block_sizes)
+        engine_core = sys.modules.get("vllm.v1.engine.core")
+        if engine_core is not None and hasattr(
+            engine_core, "resolve_kv_cache_block_sizes"
+        ):
+            if engine_core.resolve_kv_cache_block_sizes is not original_block_sizes:
+                raise RuntimeError("GLM5-Next KV block resolver has an unexpected owner")
+            stage(engine_core, "resolve_kv_cache_block_sizes", resolve_block_sizes)
+
+    coordinator_cls = kv_cache_coordinator.HybridKVCacheCoordinator
+    original_verify_groups = coordinator_cls.verify_and_split_kv_cache_groups
+    if not getattr(original_verify_groups, "_glm5_kpool", False):
+
+        @wraps(original_verify_groups)
+        def verify_groups(self):
+            original_verify_groups(self)
+            if _is_glm5_kpool_groups(self.kv_cache_config.kv_cache_groups):
+                # Tail rings contain unfinished pools and are rebuilt per
+                # request. They neither supply nor constrain prefix hits;
+                # keep their allocator manager, excluding only hit lookup.
+                self.attention_groups = [
+                    group
+                    for group in self.attention_groups
+                    if group.manager_cls is not KpoolTailManager
+                ]
+
+        verify_groups._glm5_kpool = True
+        stage(coordinator_cls, "verify_and_split_kv_cache_groups", verify_groups)
 
     original_pool_bytes = kv_cache_utils._pool_bytes_per_block
     if not getattr(original_pool_bytes, "_glm5_kpool", False):
