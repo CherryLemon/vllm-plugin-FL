@@ -54,15 +54,15 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
     ) -> None:
         backends.append(backends.pop(backends.index(backend)))
 
-    runtime_platform = _get_current_platform()
+    current_platform = _get_current_platform()
 
-    if runtime_platform.is_rocm():
+    if current_platform.is_rocm():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.AITER,
             UnquantizedMoeBackend.TRITON,
             UnquantizedMoeBackend.BATCHED_TRITON,
         ]
-    elif runtime_platform.is_cuda():
+    elif current_platform.is_cuda():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.FLASHINFER_TRTLLM,
             UnquantizedMoeBackend.FLASHINFER_CUTLASS,
@@ -76,9 +76,9 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         if moe_config.moe_parallel_config.dp_size > 1:
             _move_to_back(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.FLASHINFER_CUTLASS)
 
-    elif runtime_platform.is_xpu():
+    elif current_platform.is_xpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
-    elif runtime_platform.is_cpu():
+    elif current_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
     else:
         # PlatformFL is intentionally OOT.  Unknown CUDA-alike vendors (for
@@ -110,20 +110,20 @@ def select_unquantized_moe_backend_oot(
     # This module can be imported while vLLM is still resolving the OOT
     # platform plugin.  Resolve the platform again at selection time instead
     # of relying on the module-level object captured during plugin import.
-    runtime_platform = _get_current_platform()
+    current_platform = _get_current_platform()
 
-    if runtime_platform.is_cpu():
+    if current_platform.is_cpu():
         # TODO: migrate to MK structure.
         return UnquantizedMoeBackend.CPU, None
 
-    if runtime_platform.is_tpu():
+    if current_platform.is_tpu():
         return UnquantizedMoeBackend.TPU, None
 
     # Keep the FlagGems Triton path for both the default and an explicitly
     # requested Triton backend.  Other explicit choices remain authoritative;
     # in particular, do not make AITER/FlashInfer unreachable on AMD/NVIDIA.
     rocm_aiter_requested = (
-        runtime_platform.is_rocm()
+        current_platform.is_rocm()
         and (
             envs.is_set("VLLM_ROCM_USE_AITER")
             or envs.is_set("VLLM_ROCM_USE_AITER_MOE")
@@ -133,7 +133,7 @@ def select_unquantized_moe_backend_oot(
     )
     if (
         prefer_flaggems_experts
-        and runtime_platform.is_out_of_tree()
+        and current_platform.is_out_of_tree()
         and use_flaggems()
         and (
             moe_config.moe_backend == "triton"
@@ -350,13 +350,13 @@ class TritonExpertsFL(TritonExperts):
     ):
         # Resolve after platform activation for every vendor branch. This module
         # can be imported while the OOT platform is still being selected.
-        runtime_platform = _get_current_platform()
+        current_platform = _get_current_platform()
         # vLLM 0.24 routes unquantized MoE through this modular Experts API.
         # Reuse the Kunlunxin implementation migrated from the known-good
         # plugin instead of entering the generic Triton two-GEMM pipeline.
         if (
             self._lora_context is None
-            and getattr(runtime_platform, "vendor_name", None) == "kunlunxin"
+            and getattr(current_platform, "vendor_name", None) == "kunlunxin"
         ):
             from vllm_fl.dispatch.backends.vendor.kunlunxin.impl.fused_moe.fused_moe import (
                 fused_experts_impl as klx_fused_experts_impl,
@@ -396,7 +396,7 @@ class TritonExpertsFL(TritonExperts):
         # generic Triton pipeline below, whose activation dispatch supports it.
         if (
             self._lora_context is None
-            and runtime_platform.is_cuda()
+            and current_platform.is_cuda()
             and activation == MoEActivation.SILU
             and self.gemm1_clamp_limit is None
         ):
