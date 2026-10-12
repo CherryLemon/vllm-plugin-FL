@@ -212,6 +212,12 @@ HY4-Preview currently targets NVIDIA H100, vLLM 0.24.0, the MXFP8 preview
 checkpoint, BF16 activations and BF16 portable KV. Other chips, multimodal serving and portable FP8 KV
 are not validated. Sparse indexer providers use explicit entry points while
 preserving the real CUDA platform identity.
+The portable sparse indexer currently requires `--enforce-eager`. The pinned
+paged MQA logits API reads context lengths on the CPU and cannot be captured
+in a CUDA Graph. The shared CachedOp prewarming from
+[vllm-plugin-FL #552](https://github.com/flagos-ai/vllm-plugin-FL/pull/552) is
+used after model loading; it does not remove this operator restriction or
+make the current FlagGems `libentry` implementation Dynamo-traceable.
 
 ### Run a Task
 

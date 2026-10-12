@@ -136,6 +136,14 @@ def test_explicit_flaggems_prefill_obeys_per_op_order(monkeypatch, order, allowe
                 runtime.validate_hy4_runtime(config)
 
 
+def test_portable_indexer_rejects_graph_mode_before_weight_loading(monkeypatch):
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
+    config = _prefill_config()
+    config.model_config.enforce_eager = False
+    with pytest.raises(ValueError, match="requires enforce_eager=True"):
+        runtime.validate_hy4_runtime(config)
+
+
 @pytest.fixture
 def native_prefill(monkeypatch):
     import vllm.model_executor.layers.attention.mla_attention as mla

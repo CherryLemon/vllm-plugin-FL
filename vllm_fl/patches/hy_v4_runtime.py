@@ -175,6 +175,14 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     native_indexer = all(
         impl.kind == BackendImplKind.VENDOR for impl in selected.values()
     )
+    if not native_indexer and not getattr(
+        vllm_config.model_config, "enforce_eager", True
+    ):
+        raise ValueError(
+            "HY4 portable sparse indexer currently requires enforce_eager=True: "
+            "the pinned paged MQA logits API synchronizes context lengths on CPU "
+            "and cannot be CUDA-graph captured"
+        )
     cache = _resolve_registered_operator("concat_and_cache_mla")
     concat = _resolve_registered_operator("concat_mla_q")
     native_cache = cache.kind == BackendImplKind.VENDOR
