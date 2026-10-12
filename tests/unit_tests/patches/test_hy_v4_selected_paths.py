@@ -21,7 +21,7 @@ from vllm_fl.patches import hy_v4_runtime as runtime
         ({"prefer": "vendor", "allow_vendors": {"ascend"}}, "flagos"),
     ],
 )
-def test_runtime_resolution_obeys_common_policy(options, selected):
+def test_runtime_resolution_obeys_common_policy(monkeypatch, options, selected):
     from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
 
     calls = []
@@ -33,16 +33,31 @@ def test_runtime_resolution_obeys_common_policy(options, selected):
         calls.append("vendor")
 
     with policy_context(SelectionPolicy.from_dict(**options)):
-        implementation = runtime._resolve_runtime_operator(
-            "hy4_test", [("flagos", flagos), ("vendor", vendor)]
+        from vllm_fl.dispatch.manager import get_default_manager
+        from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+
+        manager = get_default_manager()
+        manager.ensure_initialized()
+        manager.registry.register_many(
+            [
+                OpImpl("hy4_test", "test.flagos", BackendImplKind.DEFAULT, flagos),
+                OpImpl(
+                    "hy4_test",
+                    "test.vendor",
+                    BackendImplKind.VENDOR,
+                    vendor,
+                    vendor="cuda",
+                ),
+            ]
         )
+        implementation = runtime._resolve_registered_operator("hy4_test").fn
         assert not calls
         implementation()
     assert calls == [selected]
 
 
 @pytest.mark.parametrize("error_type", [NotImplementedError, RuntimeError])
-def test_selected_runtime_failure_is_not_retried(error_type):
+def test_selected_runtime_failure_is_not_retried(monkeypatch, error_type):
     import torch
 
     from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
@@ -61,9 +76,24 @@ def test_selected_runtime_failure_is_not_retried(error_type):
         out.fill_(2)
 
     with policy_context(SelectionPolicy()):
-        implementation = runtime._resolve_runtime_operator(
-            "hy4_test", [("flagos", flagos), ("vendor", vendor)]
+        from vllm_fl.dispatch.manager import get_default_manager
+        from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+
+        manager = get_default_manager()
+        manager.ensure_initialized()
+        manager.registry.register_many(
+            [
+                OpImpl("hy4_test", "test.flagos", BackendImplKind.DEFAULT, flagos),
+                OpImpl(
+                    "hy4_test",
+                    "test.vendor",
+                    BackendImplKind.VENDOR,
+                    vendor,
+                    vendor="cuda",
+                ),
+            ]
         )
+        implementation = runtime._resolve_registered_operator("hy4_test").fn
         with pytest.raises(error_type) as exc:
             implementation()
     assert exc.value is error
@@ -103,7 +133,10 @@ def native_prefill(monkeypatch):
             name in {"_C_cache_ops::concat_and_cache_mla", "_C_cache_ops::concat_mla_q"}
         ),
     )
-    return backend
+    from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+
+    with policy_context(SelectionPolicy.from_dict(prefer="vendor")):
+        yield backend
 
 
 @pytest.mark.parametrize("name", ["flash_attn_varlen_func", "concat_and_cache_mla"])
@@ -197,6 +230,7 @@ def test_native_topk_checks_only_reachable_branches(
         assert "_C::top_k_per_row_decode" not in seen
 
 
+@pytest.mark.usefixtures("prefer_native")
 def test_topk_128_resolves_native_without_any_flaggems_dependency(monkeypatch):
     import vllm.model_executor.layers.attention.mla_attention as mla
 
@@ -255,3 +289,32 @@ def test_missing_expert_helper_keeps_no_eplb_mapping(monkeypatch):
     model.n_redundant_experts = 1
     with pytest.raises(RuntimeError, match="EPLB loading requires"):
         hy_v4._make_hyv4_expert_params_mapping(model)
+
+
+@pytest.mark.parametrize("prefer,expected", [("flagos", 1), ("vendor", 2)])
+def test_registered_concat_compares_available_backends(monkeypatch, prefer, expected):
+    import flaggems_vllm
+    import torch
+
+    from vllm import _custom_ops
+
+    from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+
+    def flagos(a, b, out):
+        out.fill_(1)
+
+    def native(a, b, out):
+        out.fill_(2)
+
+    monkeypatch.setattr(flaggems_vllm, "concat_mla_q", flagos)
+    monkeypatch.setattr(_custom_ops, "concat_mla_q", native)
+    monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: True)
+    monkeypatch.setattr(runtime, "use_flaggems_op", lambda *a: True)
+    with policy_context(SelectionPolicy.from_dict(prefer=prefer)):
+        implementation = runtime._resolve_registered_operator("concat_mla_q")
+        assert implementation.impl_id == (
+            "default.flagos" if prefer == "flagos" else "vendor.cuda"
+        )
+        out = torch.zeros(1)
+        implementation.fn(out, out, out)
+        assert out.item() == expected

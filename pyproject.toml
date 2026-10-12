@@ -44,7 +44,7 @@ Homepage = "https://github.com/flagos-ai/vllm-plugin-FL"
 
 [project.optional-dependencies]
 hy4 = [
-    "flaggems-vllm @ git+https://github.com/CherryLemon/FlagGems-vllm.git@e24933fc80dcd6ba2d687f6b4fceeb87a94483fa",
+    "flaggems-vllm @ git+https://github.com/CherryLemon/FlagGems-vllm.git@afac804694b9c807b8de9c73873ceed46f84560f",
 ]
 test = [
     "pytest",

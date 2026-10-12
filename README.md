@@ -32,7 +32,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | Qwen3.5-35B-A3B | Supported | [example](./examples/qwen3_5_offline_inference.py)  |
 | BAAI/bge-m3 | Supported | [implementation](./vllm_fl/models/bge_m3.py) |
 | MiniMax-M2.7 | Supported | [implementation](./examples/minimax_m27_offline_inference.py) |
-| HY4 preview | Merging (NVIDIA) | [installation](#hy4-on-nvidia) |
+| HY4-Preview | Merging (NVIDIA) | [installation](#hy4-on-nvidia) |
 
 ### Supported Chips
 
@@ -197,7 +197,7 @@ pip install --no-build-isolation '.[hy4]'
 
 The extra pins the public MLA query concatenation API and TLE capability checks
 from [FlagGems-vllm #897](https://github.com/flagos-ai/FlagGems-vllm/pull/897) to
-commit `e24933fc80dcd6ba2d687f6b4fceeb87a94483fa`. Sparse indexer, cache and attention
+commit `afac804694b9c807b8de9c73873ceed46f84560f`. Sparse indexer, cache and attention
 replacements also use `flaggems_vllm`; query quantization uses general FlagGems.
 Runtime selection checks callable APIs, device kernels and the shared dispatch
 policy before allocating model weights. A selected operator's execution error
@@ -208,6 +208,10 @@ portable path requires BF16 KV (`auto` with a BF16 model, or `bfloat16`); FP8 KV
 requires the complete native sparse/cache/prefill path. Shared indexers require
 pipeline parallel size 1. The [checkpoint smoke configuration](./tests/models/hy4/fp8_tp16.yaml)
 requires 16 NVIDIA GPUs; the single-GPU dummy smoke checks model integration.
+HY4-Preview currently targets NVIDIA H100, vLLM 0.24.0, the MXFP8 preview
+checkpoint, BF16 activations and BF16 portable KV. Other chips, multimodal serving and portable FP8 KV
+are not validated. Sparse indexer providers use explicit entry points while
+preserving the real CUDA platform identity.
 
 ### Run a Task
 

@@ -42,6 +42,11 @@ def register_hy_v4_support() -> bool:
     if registered_loaders.get(_LOAD_FORMAT) is not HYV4SafetensorsLoader:
         model_loader.register_model_loader(_LOAD_FORMAT)(HYV4SafetensorsLoader)
 
+    # Register the public class path before an explicit CUSTOM prefill selection.
+    from vllm_fl.attention.mla_prefill import register_flaggems_mla_prefill
+
+    register_flaggems_mla_prefill()
+
     logger.info("Registered HY4 runtime components")
     return True
 

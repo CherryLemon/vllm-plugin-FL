@@ -10,9 +10,8 @@ in an already initialized worker.
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import wraps
 from threading import RLock
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 
 from vllm.logger import init_logger
 
@@ -26,21 +25,10 @@ _INSTALL_LOCK = RLock()
 _MISSING = object()
 
 
-def has_device_kernel(name: str, device_type: str) -> bool:
-    """A schema or a Meta kernel alone does not implement runtime execution."""
-    key = {"cuda": "CUDA", "cpu": "CPU", "xpu": "XPU"}.get(device_type, "PrivateUse1")
-    try:
-        return any(
-            torch._C._dispatch_has_kernel_for_dispatch_key(name, k)
-            for k in (
-                key,
-                "CompositeImplicitAutograd",
-                "CompositeExplicitAutograd",
-            )
-        )
-    except RuntimeError:
-        return False
-
+from vllm_fl.dispatch.backends.flaggems.impl.mla_ops import (
+    _flaggems_query_quantizer as _flaggems_query_quantizer,
+)
+from vllm_fl.dispatch.capabilities import has_device_kernel
 
 _FLAGGEMS_INDEXER_OPS = (
     "indexer_k_quant_and_cache",
@@ -53,83 +41,42 @@ _FLAGGEMS_INDEXER_OPS = (
 )
 
 
-def _resolve_runtime_operator(name, candidates):
-    """Resolve before execution; a launched operation is never retried."""
-    from vllm_fl.dispatch.manager import OpManager
-    from vllm_fl.dispatch.types import BackendImplKind, OpImpl
+def _resolve_registered_operator(name, *, native_available=True):
+    """Resolve once through the common registry; execution errors propagate."""
+    from vllm_fl.dispatch.manager import get_default_manager
+    from vllm_fl.dispatch.types import BackendImplKind
 
-    manager = OpManager()
-    manager.registry.register_many(
-        [
-            OpImpl(
-                name,
-                "hy4." + kind,
-                BackendImplKind(kind),
-                implementation,
-                vendor="cuda" if kind == "vendor" else None,
-            )
-            for kind, implementation in candidates
-        ]
+    manager = get_default_manager()
+    dependency = (
+        " (requires flash_attn_varlen_func)" if name == "mla_prefill_backend" else ""
     )
-    return manager.resolve(name)
+    try:
+        candidates = manager.resolve_candidates(name)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"HY4 {name} has no permitted implementation: {exc}"
+        ) from exc
+    for implementation in candidates:
+        if native_available or implementation.kind != BackendImplKind.VENDOR:
+            return implementation
+    raise RuntimeError(
+        f"HY4 {name}{dependency} has no permitted implementation for the model configuration"
+    )
 
 
 def _native_operator_allowed(name):
+    # Explicit user-selected native backends remain explicit, subject to policy.
     from vllm_fl.dispatch.policy import get_policy
     from vllm_fl.dispatch.types import BackendImplKind, OpImpl, match_token
 
     policy = get_policy()
-    if not policy.is_vendor_allowed("cuda"):
-        return False
     implementation = OpImpl(
-        name, "hy4.vendor", BackendImplKind.VENDOR, lambda: None, vendor="cuda"
+        name, "vendor.cuda", BackendImplKind.VENDOR, lambda: None, vendor="cuda"
     )
     order = policy.get_per_op_order(name) or policy.get_default_order()
-    return any(match_token(implementation, token) for token in order)
-
-
-def _load_flaggems_implementations(names: tuple[str, ...]) -> dict[str, Callable]:
-    """Validate only the FlagGems implementations selected by the resolver."""
-    denied = [name for name in names if not use_flaggems_op(name)]
-    if denied:
-        raise RuntimeError(
-            "HY4 empty-build provider requires FlagGems operators disabled by "
-            "the active backend/whitelist/blacklist policy: " + ", ".join(denied)
-        )
-
-    if not names:
-        return {}
-    try:
-        import flaggems_vllm
-    except ModuleNotFoundError as exc:
-        if exc.name != "flaggems_vllm":
-            raise
-        raise RuntimeError(
-            "HY4 portable operators require the pinned FlagGems-vllm dependency; "
-            "install vllm-plugin-fl[hy4] as described in README.md"
-        ) from exc
-
-    implementations = {
-        name: getattr(
-            flaggems_vllm,
-            name,
-            None,
-        )
-        for name in names
-    }
-    missing = [
-        name
-        for name, implementation in implementations.items()
-        if not callable(implementation)
-    ]
-    if missing:
-        raise RuntimeError(
-            "HY4 required FlagGems implementations unavailable: " + ", ".join(missing)
-        )
-    return {
-        name: _resolve_runtime_operator(name, [("flagos", implementation)])
-        for name, implementation in implementations.items()
-    }
+    return policy.is_vendor_allowed("cuda") and any(
+        match_token(implementation, token) for token in order
+    )
 
 
 @dataclass(frozen=True)
@@ -176,35 +123,8 @@ def select_hy4_prefill_backend(vllm_config, native_selector):
     return None
 
 
-def _flaggems_query_quantizer(implementation):
-    @wraps(implementation)
-    def quantize(x, group_size, *, use_ue8m0):
-        return implementation(x, group_size, scale_ue8m0=use_ue8m0)
-
-    return quantize
-
-
 def _resolve_query_quantizer():
-    candidates = []
-    if use_flaggems_op("per_token_group_quant_fp8"):
-        import flag_gems
-
-        implementation = getattr(flag_gems, "per_token_group_quant_fp8", None)
-        if callable(implementation):
-            candidates.append(("flagos", _flaggems_query_quantizer(implementation)))
-    if has_device_kernel("_C::per_token_group_fp8_quant", "cuda"):
-        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
-
-        if callable(per_token_group_quant_fp8):
-            candidates.append(("vendor", per_token_group_quant_fp8))
-    if candidates:
-        return _resolve_runtime_operator("per_token_group_quant_fp8", candidates)
-    raise RuntimeError(
-        "HY4 per_token_group_quant_fp8 has no permitted implementation: "
-        "FlagGems is disabled/unavailable and vLLM has no device/composite kernel"
-    )
+    return _resolve_registered_operator("per_token_group_quant_fp8").fn
 
 
 def prepare_hy4_runtime(vllm_config) -> HY4RuntimePlan:
@@ -224,6 +144,8 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     """Resolve reachable implementations before allocating model weights."""
     from vllm.platforms import current_platform
 
+    from vllm_fl.dispatch.types import BackendImplKind
+
     if not current_platform.is_cuda():
         raise ValueError("HY4 currently requires an NVIDIA CUDA runtime")
     cache_dtype = vllm_config.cache_config.cache_dtype
@@ -232,26 +154,44 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     import vllm.model_executor.layers.attention.mla_attention as mla_attention
 
     config = vllm_config.model_config.hf_text_config
-    native_indexer = native_hy4_available(config.index_topk) and all(
-        _native_operator_allowed(name) for name in _FLAGGEMS_INDEXER_OPS
+    native_sparse = native_hy4_available(config.index_topk)
+    selected = {
+        name: _resolve_registered_operator(name, native_available=native_sparse)
+        for name in _FLAGGEMS_INDEXER_OPS
+    }
+    native_indexer = all(
+        impl.kind == BackendImplKind.VENDOR for impl in selected.values()
     )
-    native_cache = has_device_kernel(
-        "_C_cache_ops::concat_and_cache_mla", "cuda"
-    ) and _native_operator_allowed("concat_and_cache_mla")
-    native_concat = has_device_kernel(
-        "_C_cache_ops::concat_mla_q", "cuda"
-    ) and _native_operator_allowed("concat_mla_q")
-    prefill_backend = select_hy4_prefill_backend(
+    cache = _resolve_registered_operator("concat_and_cache_mla")
+    concat = _resolve_registered_operator("concat_mla_q")
+    native_cache = cache.kind == BackendImplKind.VENDOR
+    native_concat = concat.kind == BackendImplKind.VENDOR
+    native_prefill = select_hy4_prefill_backend(
         vllm_config, mla_attention.get_mla_prefill_backend
     )
-    if prefill_backend is not None and not _native_operator_allowed(
-        "flash_attn_varlen_func"
-    ):
-        raise RuntimeError(
-            "Selected HY4 MLA prefill backend is disabled by dispatch policy"
+    explicit = vllm_config.attention_config.mla_prefill_backend is not None
+    if explicit:
+        flaggems_explicit = native_prefill.get_name() == "FLAGGEMS_MLA_PREFILL"
+        permitted = (
+            use_flaggems_op("mla_prefill_backend")
+            if flaggems_explicit
+            else _native_operator_allowed("mla_prefill_backend")
         )
+        if not permitted:
+            raise RuntimeError(
+                "Explicit HY4 MLA prefill backend is disabled by dispatch policy"
+            )
+        prefill_backend = native_prefill
+        flaggems_prefill = prefill_backend.get_name() == "FLAGGEMS_MLA_PREFILL"
+    else:
+        prefill = _resolve_registered_operator(
+            "mla_prefill_backend", native_available=native_prefill is not None
+        )
+        flaggems_prefill = prefill.kind != BackendImplKind.VENDOR
+        prefill_backend = native_prefill if not flaggems_prefill else None
+
     portable = not (
-        native_indexer and native_cache and native_concat and prefill_backend
+        native_indexer and native_cache and native_concat and not flaggems_prefill
     )
     if portable:
         if str(cache_dtype).startswith("fp8"):
@@ -261,29 +201,26 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
         if cache_dtype == "auto" and vllm_config.model_config.dtype != torch.bfloat16:
             raise ValueError("HY4 FlagGems auto KV requires bfloat16 model dtype")
 
-    required = () if native_indexer else _FLAGGEMS_INDEXER_OPS
+    implementations = (
+        {} if native_indexer else {name: impl.fn for name, impl in selected.items()}
+    )
     if not native_cache:
-        required += ("concat_and_cache_mla",)
+        implementations["concat_and_cache_mla"] = cache.fn
     if not native_concat:
-        required += ("concat_mla_q",)
-    if prefill_backend is None:
+        implementations["concat_mla_q"] = concat.fn
+    if flaggems_prefill:
         qk_width = config.qk_nope_head_dim + config.qk_rope_head_dim
         if not (0 < config.v_head_dim <= qk_width <= 256):
             raise ValueError(
                 "HY4 FlagGems MLA prefill requires 0 < v_head_dim <= "
                 f"qk_head_dim <= 256; got v={config.v_head_dim}, qk={qk_width}"
             )
-        required += ("flash_attn_varlen_func",)
-
-    implementations = _load_flaggems_implementations(required)
-    query_quantizer = _resolve_query_quantizer()
-    if prefill_backend is None:
-        prefill_backend = _make_hy4_flaggems_mla_prefill_backend(
-            implementations["flash_attn_varlen_func"]
-        )
+        implementation = _resolve_registered_operator("flash_attn_varlen_func").fn
+        implementations["flash_attn_varlen_func"] = implementation
+        prefill_backend = _make_hy4_flaggems_mla_prefill_backend(implementation)
     return HY4RuntimePlan(
         "native" if native_indexer else "flaggems",
-        query_quantizer,
+        _resolve_query_quantizer(),
         MappingProxyType(implementations),
         prefill_backend,
         ("auto", "bfloat16") if portable else ("auto", "bfloat16", "fp8", "fp8_e4m3"),
@@ -361,122 +298,11 @@ def install_hy4_flaggems_fallback(plan: HY4RuntimePlan) -> bool:
         return _install_fallback(tx, plan)
 
 
-def _make_hy4_flaggems_mla_prefill_backend(flash_attn_varlen_func) -> type:
-    """Build the MLA prefill adapter without importing FA extensions."""
-    from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+def _make_hy4_flaggems_mla_prefill_backend(implementation):
+    # Keep backend imports at model construction, after vLLM config initialization.
+    from vllm_fl.attention.mla_prefill import make_flaggems_mla_prefill_backend
 
-    class FlagGemsMLAPrefillBackend(MLAPrefillBackend):
-        @staticmethod
-        def get_name() -> str:
-            return "HYV4_FLAGGEMS_MLA_PREFILL"
-
-        @classmethod
-        def is_available(cls) -> bool:
-            return True
-
-        def _flash_attn_varlen(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            *,
-            cu_seqlens_q: torch.Tensor,
-            cu_seqlens_k: torch.Tensor,
-            max_seqlen_q: int,
-            max_seqlen_k: int,
-            causal: bool,
-            return_softmax_lse: bool,
-            out: torch.Tensor | None = None,
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            # Dense prefill uses the expanded attention heads (HY4: q/k=256,
-            # v=256), not the 576/512 compressed sparse-MLA representation.
-            # Pad a smaller value head to match q/k for the FlagGems API.
-            maybe_padded_v = v
-            if v.shape[-1] != q.shape[-1]:
-                maybe_padded_v = torch.nn.functional.pad(
-                    v, [0, q.shape[-1] - v.shape[-1]], value=0
-                )
-
-            result = flash_attn_varlen_func(
-                q=q,
-                k=k,
-                v=maybe_padded_v,
-                max_seqlen_q=max_seqlen_q,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_k=max_seqlen_k,
-                cu_seqlens_k=cu_seqlens_k,
-                softmax_scale=self.scale,
-                causal=causal,
-                return_softmax_lse=return_softmax_lse,
-                # ``out`` has the unpadded value width.  Let the Triton
-                # wrapper allocate when padding is needed, then copy below.
-                out=out if maybe_padded_v is v else None,
-            )
-            lse = None
-            if isinstance(result, tuple):
-                result, lse = result[0], result[1]
-            if maybe_padded_v is not v:
-                result = result[..., : v.shape[-1]]
-                if out is not None:
-                    out.copy_(result)
-                    result = out
-            if return_softmax_lse:
-                assert lse is not None
-                return result, lse
-            return result
-
-        def run_prefill_new_tokens(
-            self,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            return_softmax_lse: bool,
-            out: torch.Tensor | None = None,
-            output_scale: torch.Tensor | None = None,
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            if output_scale is not None:
-                raise NotImplementedError(
-                    "HY4 FlagGems MLA prefill does not support quantized output"
-                )
-            metadata = self._prefill_metadata
-            return self._flash_attn_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens_q=metadata.query_start_loc,
-                cu_seqlens_k=metadata.query_start_loc,
-                max_seqlen_q=metadata.max_query_len,
-                max_seqlen_k=metadata.max_query_len,
-                causal=True,
-                return_softmax_lse=return_softmax_lse,
-                out=out,
-            )
-
-        def run_prefill_context_chunk(
-            self,
-            chunk_idx: int,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            metadata = self._prefill_metadata
-            assert metadata.chunked_context is not None
-            chunked = metadata.chunked_context
-            result = self._flash_attn_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens_q=metadata.query_start_loc,
-                cu_seqlens_k=chunked.cu_seq_lens[chunk_idx],
-                max_seqlen_q=metadata.max_query_len,
-                max_seqlen_k=chunked.max_seq_lens[chunk_idx],
-                causal=False,
-                return_softmax_lse=True,
-            )
-            assert isinstance(result, tuple)
-            return result
-
-    return FlagGemsMLAPrefillBackend
+    return make_flaggems_mla_prefill_backend(implementation)
 
 
 def _install_fallback(tx, plan: HY4RuntimePlan) -> bool:
@@ -487,48 +313,7 @@ def _install_fallback(tx, plan: HY4RuntimePlan) -> bool:
         return bool(plan.operations)
     implementations = plan.operations
     if plan.provider == "flaggems":
-        cp_gather_indexer_k_quant_cache = implementations[
-            "cp_gather_indexer_k_quant_cache"
-        ]
         flash_mla_sparse_fwd = implementations["flash_mla_sparse_fwd"]
-        fp8_fp4_mqa_logits = implementations["fp8_fp4_mqa_logits"]
-        fp8_fp4_paged_mqa_logits = implementations["fp8_fp4_paged_mqa_logits"]
-        indexer_k_quant_and_cache = implementations["indexer_k_quant_and_cache"]
-        top_k_per_row_decode = implementations["top_k_per_row_decode"]
-        top_k_per_row_prefill = implementations["top_k_per_row_prefill"]
-        # ``sparse_attn_indexer`` captured these names when its custom op was
-        # registered.  Rebind the module globals so the already-registered op
-        # invokes FlagGems' Triton implementation at runtime.
-        tx.set(sparse_indexer, "fp8_fp4_mqa_logits", fp8_fp4_mqa_logits)
-        tx.set(sparse_indexer, "fp8_fp4_paged_mqa_logits", fp8_fp4_paged_mqa_logits)
-        tx.set(
-            sparse_indexer,
-            "ops",
-            SimpleNamespace(
-                indexer_k_quant_and_cache=indexer_k_quant_and_cache,
-                cp_gather_indexer_k_quant_cache=cp_gather_indexer_k_quant_cache,
-                top_k_per_row_prefill=top_k_per_row_prefill,
-                top_k_per_row_decode=top_k_per_row_decode,
-            ),
-        )
-
-        # vLLM's CUDA indexer selects persistent/cooperative top-k for the
-        # supported 512/1024/2048 sizes; the portable path uses generic top-k.
-        # Those are part of the omitted vLLM extension, so make only this module's
-        # platform view report a non-CUDA execution path for that branch.  The
-        # CustomOp dispatcher has already bound ``SparseAttnIndexer.forward_cuda``
-        # using its own platform object; this proxy therefore affects only the
-        # registered Python implementation and leaves the rest of vLLM unchanged.
-        native_sparse_indexer_platform = sparse_indexer.current_platform
-
-        class _HY4FlagGemsIndexerPlatform:
-            def is_cuda(self) -> bool:
-                return False
-
-            def __getattr__(self, name):
-                return getattr(native_sparse_indexer_platform, name)
-
-        tx.set(sparse_indexer, "current_platform", _HY4FlagGemsIndexerPlatform())
 
         # HY4's sink-capable backend imports these functions by value.  Rebind its
         # globals (and the base module for inherited helper paths) to avoid the

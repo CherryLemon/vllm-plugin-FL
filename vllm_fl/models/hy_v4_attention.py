@@ -209,8 +209,14 @@ class Indexer(nn.Module):
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
-        use_flaggems_indexer = self.runtime_plan.provider == "flaggems"
-        self.indexer_op = SparseAttnIndexer(
+        kwargs = {}
+        indexer_cls = SparseAttnIndexer
+        if self.runtime_plan.provider == "flaggems":
+            from vllm_fl.attention.sparse_indexer import PortableSparseAttnIndexer
+
+            indexer_cls = PortableSparseAttnIndexer
+            kwargs["operations"] = self.runtime_plan.operations
+        self.indexer_op = indexer_cls(
             self.k_cache,
             self.quant_block_size,
             self.scale_fmt,
@@ -219,15 +225,8 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            **kwargs,
         )
-        if use_flaggems_indexer:
-            # PlatformFL is an out-of-tree platform, so CustomOp dispatches
-            # to ``forward_oot``.  vLLM's default implementation delegates
-            # that method to ``forward_native`` and raises before reaching
-            # the Python/FlagGems sparse operator.  Bind only this HY4
-            # instance to the CUDA-shaped entry point; its implementation
-            # uses the module-local FlagGems replacements installed above.
-            self.indexer_op._forward_method = self.indexer_op.forward_cuda
 
     def forward(
         self,

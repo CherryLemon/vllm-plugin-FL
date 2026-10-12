@@ -367,3 +367,31 @@ def test_hy4_dense_mlp_sequence_parallel_disables_tp(monkeypatch):
         disable_tp=True,
     )
     assert linear_calls == [("column", True), ("row", True, False)]
+
+
+def test_hy4_hook_registers_public_prefill_before_model_construction(monkeypatch):
+    from vllm.v1.attention.backends.mla.prefill import registry
+
+    from vllm_fl.patches.hy_v4_registration import register_hy_v4_support
+
+    monkeypatch.setattr(registry, "_MLA_PREFILL_OVERRIDES", {})
+    assert register_hy_v4_support()
+    assert registry.MLAPrefillBackendEnum.CUSTOM.get_path() == (
+        "vllm_fl.attention.mla_prefill.FlagGemsMLAPrefillBackend"
+    )
+
+
+def test_public_prefill_registration_preserves_another_custom_owner(monkeypatch):
+    from vllm.v1.attention.backends.mla.prefill import registry
+
+    from vllm_fl.attention.mla_prefill import register_flaggems_mla_prefill
+
+    monkeypatch.setattr(
+        registry,
+        "_MLA_PREFILL_OVERRIDES",
+        {
+            registry.MLAPrefillBackendEnum.CUSTOM: "other.Owner",
+        },
+    )
+    register_flaggems_mla_prefill()
+    assert registry.MLAPrefillBackendEnum.CUSTOM.get_path() == "other.Owner"

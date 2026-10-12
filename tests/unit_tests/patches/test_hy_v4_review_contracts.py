@@ -142,6 +142,9 @@ def test_quantizer_respects_backend_policy(monkeypatch, env, value):
         is expected
     )
     monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: False)
+    from vllm_fl.dispatch.manager import get_default_manager
+
+    get_default_manager().bump_policy_epoch()
     with pytest.raises(RuntimeError, match="no permitted implementation"):
         runtime._resolve_query_quantizer()(torch.zeros(1, 32), 32, use_ue8m0=False)
 
@@ -405,6 +408,7 @@ def test_fallback_success_idempotence_and_prefill_selection(monkeypatch):
     assert not getattr(indexer, "_hy4_runtime_installed", False)
 
 
+@pytest.mark.usefixtures("prefer_native")
 @pytest.mark.parametrize("cache_dtype", ["auto", "fp8"])
 def test_native_core_without_prefill_is_not_a_complete_native_plan(
     monkeypatch, cache_dtype
@@ -416,6 +420,9 @@ def test_native_core_without_prefill_is_not_a_complete_native_plan(
     monkeypatch.setattr(
         platforms, "current_platform", SimpleNamespace(is_cuda=lambda *_: True)
     )
+    from vllm.utils import deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "has_deep_gemm", lambda: True)
     monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: True)
     monkeypatch.setattr(runtime, "has_device_kernel", lambda *a: True)
     monkeypatch.setattr(runtime, "use_flaggems_op", lambda name: True)
