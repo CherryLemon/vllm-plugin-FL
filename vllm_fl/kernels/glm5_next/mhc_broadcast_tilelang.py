@@ -8,6 +8,7 @@ import inspect
 from contextlib import suppress
 
 import torch
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .indexer_backend import INDEXER_BACKEND
 from .provider import use_nvidia_reference
@@ -85,12 +86,76 @@ def _native_broadcast(*args, **kwargs):
     return _IMPL(*args, **kwargs)
 
 
-def mhc_pre_broadcast_tilelang(*args, **kwargs):
+def preflight_mhc_broadcast():
     return INDEXER_BACKEND._call_flag(
         "mhc_pre_broadcast_tilelang",
         None,
         None,
-        *args,
         native=_native_broadcast,
-        **kwargs,
+        _preflight=True,
     )
+
+
+def _mhc_pre_broadcast(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    fn_broadcast: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return INDEXER_BACKEND._call_flag(
+        "mhc_pre_broadcast_tilelang",
+        None,
+        None,
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        native=_native_broadcast,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        fn_broadcast=fn_broadcast,
+    )
+
+
+def _mhc_pre_broadcast_fake(
+    residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+    hc_post_mult_value, sinkhorn_repeat, *, norm_weight, norm_eps, fn_broadcast,
+):
+    tokens, hidden = residual.shape
+    streams = fn.shape[1] // hidden
+    return (
+        residual.new_empty((tokens, streams, hidden)),
+        residual.new_empty((tokens, streams, 1), dtype=torch.float32),
+        residual.new_empty((tokens, streams, streams), dtype=torch.float32),
+        torch.empty_like(residual)
+        if tokens == 0
+        else residual.new_empty((tokens, hidden)),
+    )
+
+
+direct_register_custom_op(
+    op_name="glm5_mhc_pre_broadcast",
+    op_func=_mhc_pre_broadcast,
+    mutates_args=[],
+    fake_impl=_mhc_pre_broadcast_fake,
+)
+
+
+def mhc_pre_broadcast_tilelang(*args, **kwargs):
+    # Keep common-policy resolution and optional compiler host code outside
+    # Dynamo tracing, like vLLM's other mHC entry points.
+    return torch.ops.vllm.glm5_mhc_pre_broadcast(*args, **kwargs)

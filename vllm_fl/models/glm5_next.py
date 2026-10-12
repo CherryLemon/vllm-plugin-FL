@@ -1074,6 +1074,14 @@ class Glm5NextModel(nn.Module):
 
         layer = self.layers[self.start_layer]
         if isinstance(layer, Glm5NextDecoderLayer) and layer.layer_idx == 0:
+            if mhc_pre_broadcast_tilelang is not None:
+                from vllm_fl.kernels.glm5_next.mhc_broadcast_tilelang import (
+                    preflight_mhc_broadcast,
+                )
+
+                # Validate public policy before exposing the specialization
+                # and before profile/compile/capture can execute the operator.
+                preflight_mhc_broadcast()
             layer.hc_attn_fn_broadcast = (
                 layer.hc_attn_fn.detach()
                 .view(-1, layer.n, self.config.hidden_size)

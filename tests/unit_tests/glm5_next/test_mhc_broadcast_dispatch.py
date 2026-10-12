@@ -69,6 +69,11 @@ def load_adapter(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
     monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)
+    # These are policy/forwarding tests with object sentinels. The separate
+    # GPU suite exercises the real typed custom-op and its compiler boundary.
+    monkeypatch.setattr(
+        "vllm.utils.torch_utils.direct_register_custom_op", lambda **kwargs: None
+    )
     original = importlib.import_module
     imported = []
     backport_calls = []
@@ -117,8 +122,8 @@ def _invoke(adapter, *, preflight=False):
     args = tuple(object() for _ in range(4)) + (1e-5, 1e-6, 1e-6, 2.5, 20)
     kwargs = dict(norm_weight=object(), norm_eps=1e-5, fn_broadcast=object())
     if preflight:
-        kwargs["_preflight"] = True
-    return adapter.mhc_pre_broadcast_tilelang(*args, **kwargs), args, kwargs
+        return adapter.preflight_mhc_broadcast(), args, kwargs
+    return adapter._mhc_pre_broadcast(*args, **kwargs), args, kwargs
 
 
 def test_upstream_api_has_priority_and_preserves_forwarding(load_adapter):

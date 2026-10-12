@@ -189,3 +189,72 @@ def test_mhc_broadcast_empty_tokens() -> None:
         assert output.shape == shape
         assert output.dtype == dtype
         assert output.device == values["residual"].device
+
+
+def test_mhc_broadcast_fullgraph_compile_and_replay() -> None:
+    generic, broadcast = _require_cuda_broadcast_kernel()
+    values = _make_inputs(24)
+
+    def forward(residual):
+        return _broadcast_outputs(broadcast, dict(values, residual=residual))
+
+    compiled = torch.compile(forward, fullgraph=True, dynamic=True)
+    actual = compiled(values["residual"])
+    reference = _generic_outputs(generic, values)
+    torch.cuda.synchronize()
+    _assert_outputs_close(reference, actual)
+
+    # Warm compilation before capture, then change the input and poison all
+    # outputs so an empty graph or cached result cannot satisfy the check.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = compiled(values["residual"])
+    values["residual"].copy_(torch.randn_like(values["residual"]))
+    for output in graph_outputs:
+        output.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = tuple(output.clone() for output in graph_outputs)
+    reference = _generic_outputs(generic, values)
+    torch.cuda.synchronize()
+    _assert_outputs_close(reference, replayed)
+
+    # The same dynamic compiled entry must preserve fake metadata at zero
+    # and at a different nonempty token count.
+    for tokens in (0, 1, 257):
+        next_values = dict(
+            values,
+            residual=torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16),
+        )
+        result = compiled(next_values["residual"])
+        reference = _generic_outputs(generic, next_values)
+        torch.cuda.synchronize()
+        _assert_outputs_close(reference, result)
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 24])
+@pytest.mark.parametrize("strided", [False, True])
+def test_mhc_broadcast_fake_matches_actual_metadata(tokens, strided) -> None:
+    _, broadcast = _require_cuda_broadcast_kernel()
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    values = _make_inputs(tokens)
+    if strided:
+        storage = torch.empty(tokens, 8192, device="cuda", dtype=torch.bfloat16)
+        storage[:, ::2].copy_(values["residual"])
+        values["residual"] = storage[:, ::2]
+    actual = _broadcast_outputs(broadcast, values)
+    torch.cuda.synchronize()
+    with FakeTensorMode() as mode:
+        fake_values = {
+            key: mode.from_tensor(value) if isinstance(value, torch.Tensor) else value
+            for key, value in values.items()
+        }
+        fake = _broadcast_outputs(broadcast, fake_values)
+    for real, meta in zip(actual, fake):
+        assert (real.shape, real.dtype, real.device, real.stride()) == (
+            meta.shape,
+            meta.dtype,
+            meta.device,
+            meta.stride(),
+        )
