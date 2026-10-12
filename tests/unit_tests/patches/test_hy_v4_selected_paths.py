@@ -137,11 +137,42 @@ def test_explicit_flaggems_prefill_obeys_per_op_order(monkeypatch, order, allowe
 
 
 def test_portable_indexer_rejects_graph_mode_before_weight_loading(monkeypatch):
+    from vllm_fl.dispatch.backends.flaggems.impl import mla_ops
+
+    original = mla_ops.get_operator
+    monkeypatch.setattr(
+        mla_ops,
+        "get_operator",
+        lambda name: (
+            (lambda *a, **k: None)
+            if name == "fp8_fp4_paged_mqa_logits"
+            else original(name)
+        ),
+    )
     monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
     config = _prefill_config()
     config.model_config.enforce_eager = False
     with pytest.raises(ValueError, match="requires enforce_eager=True"):
         runtime.validate_hy4_runtime(config)
+
+
+def test_portable_indexer_accepts_public_graph_safe_provider(monkeypatch):
+    from vllm_fl.dispatch.backends.flaggems.impl import mla_ops
+
+    monkeypatch.setattr(runtime, "native_hy4_available", lambda *_: False)
+    original = mla_ops.get_operator
+    graph_fn = lambda *args, **kwargs: None
+    graph_fn.supports_cuda_graph = True
+    monkeypatch.setattr(
+        mla_ops,
+        "get_operator",
+        lambda name: graph_fn if name == "fp8_fp4_paged_mqa_logits" else original(name),
+    )
+    config = _prefill_config()
+    config.model_config.enforce_eager = False
+    plan = runtime.validate_hy4_runtime(config)
+    assert plan.provider == "flaggems"
+    assert plan.operations["fp8_fp4_paged_mqa_logits"]._supports_cuda_graph()
 
 
 @pytest.fixture

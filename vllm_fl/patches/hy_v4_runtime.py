@@ -175,13 +175,19 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     native_indexer = all(
         impl.kind == BackendImplKind.VENDOR for impl in selected.values()
     )
-    if not native_indexer and not getattr(
-        vllm_config.model_config, "enforce_eager", True
+    paged_logits = selected["fp8_fp4_paged_mqa_logits"]
+    graph_paged_logits = paged_logits.kind == BackendImplKind.VENDOR or (
+        getattr(paged_logits.fn, "_supports_cuda_graph", lambda: False)()
+    )
+    if (
+        not native_indexer
+        and not graph_paged_logits
+        and not getattr(vllm_config.model_config, "enforce_eager", True)
     ):
         raise ValueError(
             "HY4 portable sparse indexer currently requires enforce_eager=True: "
-            "the pinned paged MQA logits API synchronizes context lengths on CPU "
-            "and cannot be CUDA-graph captured"
+            "the selected paged MQA logits API has no graph-safe entry point; "
+            "upgrade the operator library or use enforce_eager=True"
         )
     cache = _resolve_registered_operator("concat_and_cache_mla")
     concat = _resolve_registered_operator("concat_mla_q")

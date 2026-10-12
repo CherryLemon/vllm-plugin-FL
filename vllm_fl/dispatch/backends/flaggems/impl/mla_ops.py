@@ -50,6 +50,10 @@ def get_operator(name):
         if exc.name != "flaggems_vllm":
             raise
         return None
+    if name == "fp8_fp4_paged_mqa_logits":
+        graph_fn = getattr(flaggems_vllm, "fp8_fp4_paged_mqa_logits_graph", None)
+        if callable(graph_fn):
+            return graph_fn
     return getattr(flaggems_vllm, name, None)
 
 
@@ -78,6 +82,9 @@ def register_mla_operators(registry, *, allow=None):
 
         call.__name__ = name
         call._is_available = lambda: is_available(name)
+        call._supports_cuda_graph = lambda: bool(
+            getattr(get_operator(name), "supports_cuda_graph", False)
+        )
         return call
 
     registry.register_many(
