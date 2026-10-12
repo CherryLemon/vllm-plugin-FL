@@ -256,10 +256,7 @@ class WorkerFL(WorkerBase):
         register_oot_ops()
 
         from vllm_fl.flaggems_policy import resolve_flag_gems_policy
-        from vllm_fl.patches.flaggems_aten_plan_cache import apply_flaggems_aten_plan_cache
 
-        if fl_envs.USE_FLAGGEMS:
-            apply_flaggems_aten_plan_cache()
         whitelist, blacklist = get_flag_gems_whitelist_blacklist()
         model_policy = resolve_flag_gems_policy(
             vllm_config, whitelist, blacklist,

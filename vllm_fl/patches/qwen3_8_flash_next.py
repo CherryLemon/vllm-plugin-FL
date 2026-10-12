@@ -9,7 +9,6 @@ without modifying either the checkpoint or the installed vLLM package.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Optional
 
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
@@ -298,16 +297,13 @@ def should_skip_generic_flaggems_aten(
     heuristics. Explicit fused/OOT QSA, HC and MoE kernels are registered by a
     separate path and remain enabled. Other accelerators keep FlagGems because
     their native PyTorch backends may not offer an equivalent fast path. An
-    explicit whitelist remains a user override. An explicitly requested ATen
-    plan-cache also retains generic FlagGems dispatch so it can cache plans.
+    explicit whitelist remains a user override.
     """
 
     return (
         vendor_name == "nvidia"
         and whitelist is None
         and needs_native_index_select(vllm_config)
-        and os.getenv("FLAGGEMS_ATEN_PLAN_CACHE", "0").strip().lower()
-        in {"0", "false", "off", "no"}
     )
 
 

@@ -1,10 +1,9 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 """Worker policy behavior; GPU producer/capture coverage lives in functional tests."""
 
-import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from vllm.config import CUDAGraphMode
 
@@ -43,7 +42,7 @@ class MetadataPolicyIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_plan_cache_request_retains_generic_flaggems(self):
+    def test_generic_flaggems_policy_respects_model_vendor_and_whitelist(self):
         skip = should_skip_generic_flaggems_aten
 
         def config(model_type):
@@ -55,19 +54,7 @@ class MetadataPolicyIntegrationTests(unittest.TestCase):
 
         qwen = config("qwen3_8_flash_next_text")
         other = config("llama")
-        for gems_value in ("0", "1", "false", "true"):
-            with (
-                self.subTest(gems=gems_value),
-                patch.dict(
-                    os.environ, {"FLAGGEMS_ATEN_PLAN_CACHE": gems_value}, clear=True
-                ),
-            ):
-                self.assertEqual(
-                    skip(qwen, vendor_name="nvidia", whitelist=None),
-                    gems_value in ("0", "false"),
-                )
-                self.assertFalse(skip(other, vendor_name="nvidia", whitelist=None))
-                self.assertFalse(skip(qwen, vendor_name="amd", whitelist=None))
-                self.assertFalse(
-                    skip(qwen, vendor_name="nvidia", whitelist=["sigmoid"])
-                )
+        self.assertTrue(skip(qwen, vendor_name="nvidia", whitelist=None))
+        self.assertFalse(skip(other, vendor_name="nvidia", whitelist=None))
+        self.assertFalse(skip(qwen, vendor_name="amd", whitelist=None))
+        self.assertFalse(skip(qwen, vendor_name="nvidia", whitelist=["sigmoid"]))
