@@ -344,13 +344,10 @@ class PlatformFL(Platform):
         if cls.vendor_name in ("gcu", "enflame"):
             parallel_config.disable_custom_all_reduce = True
 
-        # Final, model-scoped config validation on the resolved values (e.g. the
-        # late asynchronous-scheduling guard).  This never mutates dispatch
-        # state or touches CUDA.
-        from vllm_fl.runtime.model_policy import validate_model_config
+        # GLM guards run after vLLM resolves its final configuration.
+        from vllm_fl.patches.glm5_next_runtime import validate_glm5_config
 
-        validate_model_config(vllm_config)
-
+        validate_glm5_config(vllm_config)
 
     @classmethod
     def get_attn_backend_cls(
@@ -364,15 +361,6 @@ class PlatformFL(Platform):
 
         use_mla = attn_selector_config.use_mla
         use_sparse = attn_selector_config.use_sparse
-
-        # A runtime plan may carry a static backend path for models whose
-        # choice does not depend on the selector context.  ``None`` (the
-        # default) falls through to the activation plan / generic dispatch.
-        from vllm_fl.runtime.model_policy import get_active_runtime_plan
-
-        runtime_plan = get_active_runtime_plan()
-        if runtime_plan is not None and runtime_plan.attention_backend:
-            return runtime_plan.attention_backend
 
         # A model activation plan may override the attention backend (for
         # example GLM5's portable MLA path).  Only a plan activated for the

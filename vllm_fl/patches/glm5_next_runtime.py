@@ -18,17 +18,9 @@ from vllm_fl.activation import (
     MoEDispatchDefaults,
     PendingPatch,
     bind_patches,
-    merge_per_op_defaults,
     register_plan_provider,
 )
-from vllm_fl.dispatch.policy import SelectionPolicy
 from vllm_fl.kernels.glm5_next.provider import use_nvidia_reference
-from vllm_fl.runtime.model_policy import (
-    ModelPolicyError,
-    ModelPolicyFactory,
-    RuntimePlan,
-    register_model_policy_factory,
-)
 
 logger = init_logger(__name__)
 
@@ -365,27 +357,31 @@ def _is_glm5_model(vllm_config) -> bool:
     return any(arch in (_CAUSAL_ARCH, _CONDITIONAL_ARCH) for arch in architectures)
 
 
+class Glm5ConfigError(RuntimeError):
+    """The resolved GLM5 configuration requests an unsupported mode."""
+
+
 def validate_glm5_config(vllm_config) -> None:
     """Reject modes whose loading/state contracts are not implemented on 0.24.
 
     Run both before hybrid config adaptation and after vLLM resolves the final
     configuration. Constructors also use this guard for direct model callers.
     """
-    # Model selection has already matched GLM here; registration must never
-    # validate a model-specific environment variable.
+    if not _is_glm5_model(vllm_config):
+        return
     parallel = getattr(vllm_config, "parallel_config", None)
     if getattr(parallel, "pipeline_parallel_size", 1) != 1:
-        raise ModelPolicyError(
+        raise Glm5ConfigError(
             "GLM5-Next on vLLM 0.24 requires pipeline_parallel_size=1: "
             "mHC state transfer between pipeline stages is not implemented"
         )
     if getattr(vllm_config, "speculative_config", None) is not None:
-        raise ModelPolicyError(
+        raise Glm5ConfigError(
             "GLM5-Next on vLLM 0.24 does not support speculative decoding: "
             "KDA rollback and KPool verify grouping are not implemented"
         )
     if getattr(parallel, "enable_eplb", False):
-        raise ModelPolicyError(
+        raise Glm5ConfigError(
             "GLM5-Next on vLLM 0.24 does not support enable_eplb: "
             "model-level expert remapping is not implemented"
         )
@@ -399,7 +395,7 @@ def validate_glm5_config(vllm_config) -> None:
         or getattr(vllm_config, "quant_config", None) is not None
         or any(getattr(cfg, "quantization_config", None) for cfg in configs)
     ):
-        raise ModelPolicyError(
+        raise Glm5ConfigError(
             "GLM5-Next on vLLM 0.24 supports unquantized checkpoints only; "
             "FP8/mixed-precision attention projection loading is not implemented"
         )
@@ -528,45 +524,6 @@ def _glm5_plan_provider(vllm_config) -> ActivationPlan | None:
     )
 
 
-def _glm5_runtime_plan(vllm_config, device_caps, user_policy):
-    """Build GLM5's runtime selection (pure; see ``vllm_fl.runtime``)."""
-    if not _is_glm5_model(vllm_config):
-        return None
-
-    defaults = glm5_portable_moe_defaults()
-    base = user_policy if user_policy is not None else SelectionPolicy()
-    policy = base
-    if not defaults.is_empty():
-        merged = merge_per_op_defaults(defaults, base.per_op_order_dict or None)
-        policy = SelectionPolicy.from_dict(
-            prefer=base.prefer,
-            strict=base.strict,
-            per_op_order=merged or None,
-            deny_vendors=set(base.deny_vendors) or None,
-            allow_vendors=set(base.allow_vendors) if base.allow_vendors else None,
-        )
-
-    # Publish the provider's defaults in the same policy consumed by private
-    # indexer bindings. Explicit per-op user choices keep precedence.
-    from vllm_fl.kernels.glm5_next.provider import INDEXER_OPERATORS
-
-    order = policy.get_default_order()
-    merged = {name: list(order) for name in INDEXER_OPERATORS}
-    merged.update(policy.per_op_order_dict)
-    policy = SelectionPolicy.from_dict(
-        prefer=policy.prefer,
-        strict=policy.strict,
-        per_op_order=merged,
-        deny_vendors=set(policy.deny_vendors),
-        allow_vendors=set(policy.allow_vendors) if policy.allow_vendors else None,
-    )
-
-    # GLM5's attention backend depends on the per-layer selector context
-    # (``use_mla`` / ``use_sparse``), so it stays on the activation plan's lazy
-    # override; ``None`` here means "use the model-aware activation override".
-    return RuntimePlan(selection_policy=policy)
-
-
 def _register_glm5_next_registrations() -> None:
     """Idempotent config/model registration (safe at plugin import time)."""
     from vllm.model_executor.models import config as model_config
@@ -626,15 +583,6 @@ def register_glm5_next_support() -> bool:
 
     _register_glm5_next_registrations()
     register_plan_provider(_glm5_plan_provider)
-    register_model_policy_factory(
-        ModelPolicyFactory(
-            name="glm5_next",
-            architectures=(_CAUSAL_ARCH, _CONDITIONAL_ARCH),
-            model_types=("glm5_next", "glm5_next_text"),
-            build=_glm5_runtime_plan,
-            validate=validate_glm5_config,
-        )
-    )
 
     logger.info(
         "Registered GLM5-Next text/VLM runtime with bounded KDA "
@@ -648,4 +596,6 @@ __all__ = [
     "Glm5NextModelArchConfigConvertor",
     "register_glm5_next_support",
     "glm5_portable_moe_defaults",
+    "Glm5ConfigError",
+    "validate_glm5_config",
 ]

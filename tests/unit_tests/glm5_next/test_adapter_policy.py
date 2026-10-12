@@ -155,8 +155,8 @@ from vllm_fl.kernels.glm5_next import provider
 provider.current_platform.is_cuda = lambda: False
 import vllm_fl
 vllm_fl.register_model()
-from vllm_fl.runtime.model_policy import validate_model_config
-validate_model_config(SimpleNamespace(model_config=SimpleNamespace(
+from vllm_fl.patches.glm5_next_runtime import validate_glm5_config
+validate_glm5_config(SimpleNamespace(model_config=SimpleNamespace(
     hf_config=SimpleNamespace(model_type="llama", architectures=["LlamaForCausalLM"]),
     hf_text_config=SimpleNamespace(model_type="llama"))))
 from vllm_fl.activation import patch_inventory

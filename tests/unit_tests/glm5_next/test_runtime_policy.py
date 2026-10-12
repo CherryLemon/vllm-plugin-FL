@@ -1,28 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GLM5 model-policy registration tests (C3 runtime plan registry)."""
+"""GLM activation defaults use the same mutable public dispatch policy."""
 
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_fl.activation import reset_activation_for_tests
-from vllm_fl.dispatch.policy import SelectionPolicy
+from vllm_fl import activation
+from vllm_fl.dispatch.policy import PolicyManager, SelectionPolicy
 from vllm_fl.kernels.glm5_next import provider
 from vllm_fl.patches import glm5_next_runtime as glm_patch
-from vllm_fl.runtime.model_policy import (
-    build_model_runtime_plan,
-    reset_model_policy_for_tests,
-)
 
 
 @pytest.fixture(autouse=True)
-def _reset():
-    reset_activation_for_tests()
-    reset_model_policy_for_tests()
+def _reset(monkeypatch):
+    activation.reset_activation_for_tests()
+    monkeypatch.setattr(PolicyManager, "_instance", PolicyManager())
     provider._has_nvidia_reference_kernels.cache_clear()
     yield
-    reset_activation_for_tests()
-    reset_model_policy_for_tests()
+    activation.reset_activation_for_tests()
     provider._has_nvidia_reference_kernels.cache_clear()
 
 
@@ -42,51 +37,71 @@ def _other_config():
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
-                model_type="qwen3_8_flash_next", architectures=["Qwen3Model"]
+                model_type="llama", architectures=["LlamaForCausalLM"]
             ),
-            hf_text_config=SimpleNamespace(model_type="qwen3_8_flash_next"),
-            architectures=["Qwen3Model"],
+            hf_text_config=SimpleNamespace(model_type="llama"),
+            architectures=["LlamaForCausalLM"],
         )
     )
 
 
-def test_glm_registration_binds_runtime_policy_factory(monkeypatch):
-    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
-    provider._has_nvidia_reference_kernels.cache_clear()
-
+def _portable_registered_plan(monkeypatch):
+    monkeypatch.setattr(glm_patch, "use_nvidia_reference", lambda: False)
     assert glm_patch.register_glm5_next_support() is True
-
-    plan = build_model_runtime_plan(_glm_config(), None, SelectionPolicy())
-    assert plan.attention_backend is None
-    assert plan.native_aten_ops == frozenset()
-    assert plan.selection_policy.get_per_op_order("moe_align_block_size") == [
-        "flagos",
-        "reference",
-    ]
+    plan = activation.resolve_model_plan(_glm_config())
+    assert plan is not None
+    # Actual registration/defaults, with only the class-patching callback held
+    # at its boundary. Real patch ownership is covered by activation tests.
+    monkeypatch.setattr(glm_patch, "_apply_glm5_activation", lambda: None)
+    return activation.resolve_model_plan(_glm_config())
 
 
-def test_glm_runtime_plan_preserves_explicit_user_order(monkeypatch):
-    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
-    provider._has_nvidia_reference_kernels.cache_clear()
-    assert glm_patch.register_glm5_next_support() is True
+def test_glm_activation_adds_only_required_moe_defaults(monkeypatch):
+    _portable_registered_plan(monkeypatch)
+    manager = PolicyManager.get_instance()
+    user = SelectionPolicy.from_dict(prefer="vendor", deny_vendors={"cuda"})
+    manager.set_global_policy(user)
+    assert activation.activate_for_model(_glm_config()) is not None
+    policy = manager.get_policy()
+    for op in ("moe_align_block_size", "invoke_fused_moe_triton_kernel"):
+        assert policy.get_per_op_order(op) == ["flagos", "reference"]
+    assert policy.prefer == "vendor"
+    assert policy.deny_vendors == user.deny_vendors
+    # Indexer defaults are read through common dispatch, rather than frozen
+    # into an additional explicit per-op policy at startup.
+    assert policy.get_per_op_order("fp8_fp4_mqa_logits") is None
+    assert policy.get_default_order()[0] == "vendor"
 
-    user_policy = SelectionPolicy.from_dict(
-        prefer="flagos",
-        per_op_order={"moe_align_block_size": ["flagos"]},
+
+def test_active_glm_preserves_explicit_policy_and_later_preference(monkeypatch):
+    _portable_registered_plan(monkeypatch)
+    manager = PolicyManager.get_instance()
+    manager.set_global_policy(
+        SelectionPolicy.from_dict(
+            prefer="vendor", per_op_order={"moe_align_block_size": ["flagos"]}
+        )
     )
-    plan = build_model_runtime_plan(_glm_config(), None, user_policy)
-    assert plan.selection_policy.get_per_op_order("moe_align_block_size") == ["flagos"]
+    activation.activate_for_model(_glm_config())
+    assert manager.get_policy().get_per_op_order("moe_align_block_size") == ["flagos"]
+    manager.set_global_policy(
+        SelectionPolicy.from_dict(
+            prefer="reference", per_op_order={"moe_align_block_size": ["flagos"]}
+        )
+    )
+    policy = manager.get_policy()
+    assert policy.get_per_op_order("moe_align_block_size") == ["flagos"]
+    assert policy.get_per_op_order("fp8_fp4_mqa_logits") is None
+    assert policy.get_default_order()[0] == "reference"
 
 
-def test_glm_runtime_plan_ignores_other_models(monkeypatch):
-    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
-    provider._has_nvidia_reference_kernels.cache_clear()
-    assert glm_patch.register_glm5_next_support() is True
-
-    policy = SelectionPolicy.from_dict(prefer="reference")
-    plan = build_model_runtime_plan(_other_config(), None, policy)
-    assert plan.selection_policy is policy
-    assert plan.attention_backend is None
+def test_glm_provider_leaves_other_model_policy_unchanged(monkeypatch):
+    _portable_registered_plan(monkeypatch)
+    manager = PolicyManager.get_instance()
+    user = SelectionPolicy.from_dict(prefer="reference")
+    manager.set_global_policy(user)
+    assert activation.activate_for_model(_other_config()) is None
+    assert manager.get_policy() is user
+    assert manager.get_policy().get_per_op_order("moe_align_block_size") is None
 
 
 @pytest.mark.parametrize("sparse", [False, True])

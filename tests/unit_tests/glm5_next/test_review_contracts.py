@@ -11,7 +11,7 @@ import torch
 
 from vllm_fl.kernels.glm5_next.indexer_backend import Glm5NextIndexerBackend
 from vllm_fl.patches import glm5_next_runtime as patch
-from vllm_fl.runtime.model_policy import ModelPolicyError, validate_model_config
+from vllm_fl.patches.glm5_next_runtime import Glm5ConfigError, validate_glm5_config
 
 
 @pytest.mark.parametrize(
@@ -42,10 +42,29 @@ def test_unsupported_modes_rejected_at_early_and_final_config(arch, mode):
         config.quant_config = object()
     patch.register_glm5_next_support()
     # The early hook must fail before accessing any hybrid/cache settings.
-    with pytest.raises(ModelPolicyError):
+    with pytest.raises(Glm5ConfigError):
         patch.Glm5NextForCausalLMConfig.verify_and_update_config(config)
-    with pytest.raises(ModelPolicyError):
-        validate_model_config(config)
+    with pytest.raises(Glm5ConfigError):
+        validate_glm5_config(config)
+
+
+@pytest.mark.parametrize("arch", ["LlamaForCausalLM", "Qwen3ForCausalLM"])
+def test_glm_validator_preserves_other_models_supported_modes(arch):
+    # Every field would reject a GLM checkpoint. Model scoping must precede
+    # mode validation so the shared platform boundary remains generic.
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[arch], model_type="other"),
+            hf_text_config=SimpleNamespace(
+                model_type="other", quantization_config={"quant_method": "fp8"}
+            ),
+            quantization="fp8",
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2, enable_eplb=True),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        quant_config=object(),
+    )
+    validate_glm5_config(config)
 
 
 @pytest.mark.parametrize("tokens", [128, 512, 2051])

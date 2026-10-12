@@ -104,8 +104,13 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
     The `glm5` extra pins commit
     `ecbccc170a62d6b285ee6750ad8ef7032c77cbb3` and TileLang 0.1.9:
     ```sh
-    VLLM_VENDOR=cuda pip install --no-build-isolation '.[glm5]'
+    pip install --no-build-isolation '.[glm5]'
     ```
+    The GLM installation uses the plugin's default Python-only wheel with the
+    official vLLM 0.24.0 CUDA wheel, which supplies the native graph operators.
+    It does not require compiling the plugin's C++ extension. This combination
+    is the validated installation; empty builds and other GPU platforms need
+    separate GLM graph and model validation.
     Install FlagGems as described below; its public `bmm_out` API and vLLM's
     DeepGEMM APIs must be available for the GLM MHC/KDA paths. Missing optional
     capabilities are checked before execution. The paired operator PR remains
