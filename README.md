@@ -212,12 +212,26 @@ HY4-Preview currently targets NVIDIA H100, vLLM 0.24.0, the MXFP8 preview
 checkpoint, BF16 activations and BF16 portable KV. Other chips, multimodal serving and portable FP8 KV
 are not validated. Sparse indexer providers use explicit entry points while
 preserving the real CUDA platform identity.
-The portable sparse indexer currently requires `--enforce-eager`. The pinned
-paged MQA logits API reads context lengths on the CPU and cannot be captured
-in a CUDA Graph. The shared CachedOp prewarming from
+The portable sparse indexer checks the selected paged MQA logits provider's
+graph capability before loading weights. The legacy revision pinned by the
+`hy4` extra requires `--enforce-eager`: it reads context lengths on the CPU.
+A matching FlagGems-vllm build exposing `fp8_fp4_paged_mqa_logits_graph`
+supports static-grid CUDA Graph capture, reading lengths and page mappings
+on the GPU on every replay. The shared dispatch selects that public entry
+point when available.
+
+With the graph-safe operator build, use `FULL_DECODE_ONLY` with compilation
+mode `NONE`, for example:
+
+```bash
+--compilation-config '{"mode":"NONE","cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4],"max_cudagraph_capture_size":4}'
+```
+
+The shared CachedOp prewarming from
 [vllm-plugin-FL #552](https://github.com/flagos-ai/vllm-plugin-FL/pull/552) is
-used after model loading; it does not remove this operator restriction or
-make the current FlagGems `libentry` implementation Dynamo-traceable.
+used after model loading. Whole-model Dynamo compilation remains limited
+by the current FlagGems `libentry` implementation; CUDA Graph mode `NONE`
+and eager execution remain available with the legacy operator build.
 
 ### Run a Task
 
