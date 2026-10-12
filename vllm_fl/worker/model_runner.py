@@ -6675,9 +6675,19 @@ class ModelRunnerFL(
         profiling_pool = current_platform.graph_pool_handle()
         encoder_profiling_pool = current_platform.graph_pool_handle()
         original_pools: dict[int, Any] = {}
-        for instance in _decoder_graph_wrappers():
+        all_wrappers = list(GraphWrapper._all_instances) + list(
+            BreakableCUDAGraphWrapper._all_instances
+        )
+        private_breakable_graphs = any(
+            instance.graph_pool is None
+            for instance in BreakableCUDAGraphWrapper._all_instances
+        )
+        for instance in all_wrappers:
             original_pools[id(instance)] = instance.graph_pool
-            instance.graph_pool = profiling_pool
+            # None requests independent pools, including every breakable segment.
+            # Profiling must preserve the runtime allocation policy.
+            if instance.graph_pool is not None:
+                instance.graph_pool = profiling_pool
 
         # The common-attention metadata producer captures its own graphs before
         # the decoder wrapper is entered.  Keep those profiling graphs in the
@@ -6690,6 +6700,7 @@ class ModelRunnerFL(
 
         shared_memory_estimate = {}
         per_graph_estimate = {}
+        private_memory_estimate = 0
         encoder_memory_estimate = 0
         # Cleanup-only guard: CUDA graph capture errors should still propagate
         # because encoder graph capture is opt-in.
@@ -6700,7 +6711,15 @@ class ModelRunnerFL(
                 torch.accelerator.empty_cache()
 
                 for mode, descs in capture_descs:
-                    profile_descs = descs[:2]
+                    if not descs:
+                        continue
+                    # Native Breakable PIECEWISE also owns private pools when
+                    # no compiled runner exists. Measure every descriptor;
+                    # extrapolating a shared-pool sample can under-budget it.
+                    private_pools = private_breakable_graphs
+                    # Private pools cannot overlay allocations across sizes or
+                    # segments. Capture every descriptor and add its full cost.
+                    profile_descs = descs if private_pools else descs[:2]
                     mem_samples: list[int] = []
 
                     for i, desc in enumerate(profile_descs):
@@ -6720,6 +6739,17 @@ class ModelRunnerFL(
                         _accelerator_synchronize()
                         free_after = current_platform.torch_device_fn.mem_get_info()[0]
                         mem_samples.append(mem_before - free_after)
+
+                    if private_pools:
+                        private_memory_estimate += sum(
+                            max(sample, 1 << 20) for sample in mem_samples
+                        )
+                        logger.debug(
+                            "Measured private graph memory: %.2f MiB for %d graphs",
+                            private_memory_estimate / (1 << 20),
+                            len(descs),
+                        )
+                        continue
 
                     first_capture = mem_samples[0]
                     # Use at least 1 MiB per graph for driver overhead
@@ -6765,11 +6795,12 @@ class ModelRunnerFL(
             self.common_attention_metadata_graph.graph_pool = original_metadata_pool
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
-        # FULL and PIECEWISE graphs share the global pool at runtime and are
-        # never replayed concurrently, so the pool overlays their memory.
-        # Take the max to avoid double-counting the overlap.
-        decoder_estimate = max(shared_memory_estimate.values(), default=0) + sum(
-            per_graph_estimate.values()
+        # Overlay shared-pool modes, but add private Breakable pools: neither their
+        # sizes nor their breakable segments can share activation storage.
+        decoder_estimate = (
+            private_memory_estimate
+            + max(shared_memory_estimate.values(), default=0)
+            + sum(per_graph_estimate.values())
         )
         # Encoder graphs use a manager-local pool at runtime, separate from the
         # decoder pool, so add their estimate instead of overlaying it.
