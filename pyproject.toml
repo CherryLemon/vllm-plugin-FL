@@ -44,7 +44,7 @@ Homepage = "https://github.com/flagos-ai/vllm-plugin-FL"
 
 [project.optional-dependencies]
 glm5 = [
-    "flaggems_vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@ecbccc170a62d6b285ee6750ad8ef7032c77cbb3",
+    "flaggems_vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@484afae427ec3d161d553a7bf3e290e71e01e6de",
     "tilelang==0.1.9",
 ]
 test = [

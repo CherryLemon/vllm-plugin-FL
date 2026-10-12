@@ -102,7 +102,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
     GLM5.3-Flash also requires the paired public operators in
     [FlagGems-vllm PR #900](https://github.com/flagos-ai/FlagGems-vllm/pull/900).
     The `glm5` extra pins commit
-    `ecbccc170a62d6b285ee6750ad8ef7032c77cbb3` and TileLang 0.1.9:
+    `484afae427ec3d161d553a7bf3e290e71e01e6de` and TileLang 0.1.9:
     ```sh
     pip install --no-build-isolation '.[glm5]'
     ```
