@@ -34,13 +34,6 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | BAAI/bge-m3 | Supported | [implementation](./vllm_fl/models/bge_m3.py) |
 | MiniMax-M2.7 | Supported | [implementation](./examples/minimax_m27_offline_inference.py) |
 
-Qwen3.8-Flash-Next validation currently covers BF16 TP8 text serving on
-8 x NVIDIA H100 with vLLM 0.24.0, using compilation mode `NONE` and
-`FULL_DECODE_ONLY` CUDA Graphs. Compiled-mode performance and full-model
-accuracy equivalence, multimodal serving, quantized checkpoints and other
-chips remain unvalidated. Install the required operator dependency with
-`pip install --no-build-isolation -e '.[qwen3_8]'`.
-
 ### Supported Chips
 
 | Chip Vendor | Status | Reference |
