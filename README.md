@@ -111,7 +111,12 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
     capabilities are checked before execution. The paired operator PR remains
     draft while performance shortfalls and full-model validation are pending.
     The optional first-layer MHC broadcast path is a CUDA vendor implementation:
-    it reuses a compatible upstream vLLM API or the framework's bundled backport.
+    it reuses a compatible upstream vLLM API or the framework's bundled backport
+    from the official **vLLM v0.26.0** release
+    ([upstream #48137](https://github.com/vllm-project/vllm/pull/48137)).
+    The `_vendor` package contains Triton/TileLang operators backported from
+    official vLLM releases; each module records its source release and upstream
+    file URLs in its docstring.
     TileLang and DeepGEMM are required for this path.
 
 3. Install [FlagGems](https://flagos-ai.github.io/FlagGems/getting-started/install/)

@@ -2,7 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVIDIA first-layer mHC broadcast specialization for GLM5-Next.
 
-Backported from vLLM PR #48137 (commit 442c421e794317c37ab5e15feff1b05a035a5a18):
+Backported from the official vLLM v0.26.0 release:
+
+* Host API ``mhc_pre_broadcast_tilelang``:
+  https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/model_executor/kernels/mhc/tilelang.py
+* Kernel ``mhc_pre_big_fuse_broadcast_with_norm_tilelang``:
+  https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+
+First included in v0.26.0 via PR #48137
+(commit 442c421e794317c37ab5e15feff1b05a035a5a18):
 https://github.com/vllm-project/vllm/pull/48137
 
 The checkpoint stores the first mHC projection for four residual streams, but
