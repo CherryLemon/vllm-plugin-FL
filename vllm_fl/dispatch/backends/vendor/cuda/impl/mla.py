@@ -72,6 +72,7 @@ def register_mla_operators(registry):
         "flash_mla_sparse_fwd",
         "mla_prefill_backend",
     ]
+    implementations = []
     for name in names:
         # Capture before any model-specific compatibility installation.
         implementation = get_operator(name)
@@ -86,7 +87,7 @@ def register_mla_operators(registry):
             call._is_available = lambda: is_available(op_name, fn)
             return call
 
-        registry.register_impl(
+        implementations.append(
             OpImpl(
                 name,
                 "vendor.cuda",
@@ -96,3 +97,4 @@ def register_mla_operators(registry):
                 priority=BackendPriority.VENDOR,
             )
         )
+    registry.register_many(implementations)

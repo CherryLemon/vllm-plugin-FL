@@ -79,6 +79,19 @@ def _native_operator_allowed(name):
     )
 
 
+def _flaggems_operator_allowed(name):
+    from vllm_fl.dispatch.manager import get_default_manager
+    from vllm_fl.dispatch.types import BackendImplKind
+
+    if not use_flaggems_op(name):
+        return False
+    try:
+        candidates = get_default_manager().resolve_candidates(name)
+    except RuntimeError:
+        return False
+    return any(impl.kind == BackendImplKind.DEFAULT for impl in candidates)
+
+
 @dataclass(frozen=True)
 class HY4RuntimePlan:
     # Sparse indexer/MLA provider; query, cache and prefill are resolved separately.
@@ -173,7 +186,7 @@ def validate_hy4_runtime(vllm_config) -> HY4RuntimePlan:
     if explicit:
         flaggems_explicit = native_prefill.get_name() == "FLAGGEMS_MLA_PREFILL"
         permitted = (
-            use_flaggems_op("mla_prefill_backend")
+            _flaggems_operator_allowed("mla_prefill_backend")
             if flaggems_explicit
             else _native_operator_allowed("mla_prefill_backend")
         )

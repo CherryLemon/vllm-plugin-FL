@@ -158,4 +158,4 @@ def register_builtins(registry) -> None:
 
     from .impl.mla_ops import register_mla_operators
 
-    register_mla_operators(registry)
+    register_mla_operators(registry, allow=use_flaggems_op)

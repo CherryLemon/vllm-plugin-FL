@@ -114,6 +114,28 @@ def test_native_paths_obey_vendor_filter_and_per_op_order():
         assert not runtime._native_operator_allowed("concat_mla_q")
 
 
+@pytest.mark.parametrize("order,allowed", [(["flagos"], True), (["vendor"], False)])
+def test_explicit_flaggems_prefill_obeys_per_op_order(monkeypatch, order, allowed):
+    import vllm.model_executor.layers.attention.mla_attention as mla
+
+    from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
+
+    backend = SimpleNamespace(
+        is_available=lambda: True, get_name=lambda: "FLAGGEMS_MLA_PREFILL"
+    )
+    monkeypatch.setattr(mla, "get_mla_prefill_backend", lambda cfg: backend)
+    config = _prefill_config()
+    config.attention_config.mla_prefill_backend = "CUSTOM"
+    policy = SelectionPolicy.from_dict(per_op_order={"mla_prefill_backend": order})
+    with policy_context(policy):
+        if allowed:
+            plan = runtime.validate_hy4_runtime(config)
+            assert plan.prefill_backend.get_name() == "FLAGGEMS_MLA_PREFILL"
+        else:
+            with pytest.raises(RuntimeError, match="disabled by dispatch policy"):
+                runtime.validate_hy4_runtime(config)
+
+
 @pytest.fixture
 def native_prefill(monkeypatch):
     import vllm.model_executor.layers.attention.mla_attention as mla

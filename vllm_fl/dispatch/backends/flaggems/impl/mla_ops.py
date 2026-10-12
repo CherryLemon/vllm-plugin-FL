@@ -58,8 +58,11 @@ def is_available(name):
     return callable(get_operator(name))
 
 
-def register_mla_operators(registry):
+def register_mla_operators(registry, *, allow=None):
     from vllm_fl.dispatch.types import BackendImplKind, BackendPriority, OpImpl
+
+    if allow is None:
+        allow = use_flaggems_op
 
     def bind(name):
         def call(*args, **kwargs):
@@ -72,8 +75,8 @@ def register_mla_operators(registry):
         call._is_available = lambda: is_available(name)
         return call
 
-    for name in MLA_OPERATORS:
-        registry.register_impl(
+    registry.register_many(
+        [
             OpImpl(
                 name,
                 "default.flagos",
@@ -81,4 +84,7 @@ def register_mla_operators(registry):
                 bind(name),
                 priority=BackendPriority.DEFAULT,
             )
-        )
+            for name in MLA_OPERATORS
+            if allow(name)
+        ]
+    )
