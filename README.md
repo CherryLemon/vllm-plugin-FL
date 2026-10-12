@@ -26,7 +26,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 |-------|--------|-----------|
 | Qwen3.5-397B-A17B | Supported | [example](./examples/qwen3_5_offline_inference.py) |
 | Qwen3-Next-80B-A3B | Supported | [example](./examples/qwen3_next_offline_inference.py) |
-| Qwen3.8-Flash-Next / Qwen4Exp | Merging | [implementation](./vllm_fl/models/qwen3_8_flash_next/) |
+| Qwen3.8-Flash-Next / Qwen4Exp | Supported | [implementation](./vllm_fl/models/qwen3_8_flash_next/) |
 | Qwen3-4B | Supported | [example](./examples/offline_inference.py) |
 | MiniCPM-o 4.5 | Supported | [example](./examples/minicpm/) |
 | GLM-5 | Supported | [example](./examples/glm_5_offline_inference.py) |
