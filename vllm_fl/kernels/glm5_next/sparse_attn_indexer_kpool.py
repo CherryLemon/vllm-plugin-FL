@@ -287,8 +287,9 @@ def sparse_attn_indexer_kpool(
 
         # Sentinel allocation so the profiler's peak-memory measurement covers
         # the runtime logits tensor. The decode-path fp8_fp4_paged_mqa_logits
-        # output is [B*next_n, max_model_len] float32 -- sized by max_model_len,
-        # NOT bounded by the prefill chunk cap. This profiling branch returns
+        # output is float32 over the configured pool span, not bounded by the
+        # prefill chunk cap. Retain the token-span reservation as a conservative
+        # upper bound when index_kpool > 1. This profiling branch returns
         # the fake before ever calling that kernel, so its output tensor is
         # invisible unless we size this sentinel to the real worst-case decode
         # batch; otherwise large max_model_len / max_num_batched_tokens OOMs at
@@ -739,7 +740,9 @@ def sparse_attn_indexer_kpool(
             seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
+            # Decode lengths and block-table entries address completed pools;
+            # the model limit is still token-granular, including partial tails.
+            max_model_len=(max_model_len + index_kpool - 1) // index_kpool,
             clean_logits=False,
         )
         num_rows = logits.shape[0]
