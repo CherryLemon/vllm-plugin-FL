@@ -589,11 +589,16 @@ class WorkerFL(WorkerBase):
             # otherwise high-concurrency batches can leave no room for
             # runtime activations and fail with OOM.  The pool accounting
             # helper uses PyTorch's CUDA-shaped graph/memory API, which is also
-            # the supported interface on ROCm/HIP. Other OOT runtimes keep the
-            # estimate at zero until they expose a compatible graph profiler.
+            # the supported interface on ROCm/HIP and Kunlunxin. Other OOT
+            # runtimes keep the estimate at zero until they expose a compatible
+            # graph profiler.
             cudagraph_memory_estimate = 0
             if (
-                (current_platform.is_cuda() or current_platform.is_rocm())
+                (
+                    current_platform.is_cuda()
+                    or current_platform.is_rocm()
+                    or getattr(current_platform, "vendor_name", None) == "kunlunxin"
+                )
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
