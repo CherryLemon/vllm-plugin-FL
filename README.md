@@ -34,21 +34,11 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | BAAI/bge-m3 | Supported | [implementation](./vllm_fl/models/bge_m3.py) |
 | MiniMax-M2.7 | Supported | [implementation](./examples/minimax_m27_offline_inference.py) |
 
-Qwen3.8-Flash-Next text serving was validated on 8 x NVIDIA H100 with
-BF16 weights, TP8 and vLLM 0.24.0. The 2026-10-12 test used
-[PR #455](https://github.com/flagos-ai/vllm-plugin-FL/pull/455) at `349ded9` plus
-[PR #544](https://github.com/flagos-ai/vllm-plugin-FL/pull/544) at `8ac5d7a`,
-before and after adding [PR #552](https://github.com/flagos-ai/vllm-plugin-FL/pull/552)
-at `3db00de`, with operator revision `9f98a64`. With compilation `NONE`,
-`FULL_DECODE_ONLY` CUDA Graphs,
-concurrency 64 and fixed 1024 input/output tokens, same-node output throughput
-was 3093.69 tok/s before CachedOp prewarm and 3088.27 tok/s after (-0.17%).
-Four fixed prompts produced identical tokens and token logprobs.
-
-`VLLM_COMPILE` completed compilation, graph capture and c64 serving, but its
-throughput failed the 5% stability gate and full-model accuracy equivalence
-has not been established. Multimodal serving, quantized checkpoints and other
-chips have not been validated. Install the pinned operator dependency with
+Qwen3.8-Flash-Next validation currently covers BF16 TP8 text serving on
+8 x NVIDIA H100 with vLLM 0.24.0, using compilation mode `NONE` and
+`FULL_DECODE_ONLY` CUDA Graphs. Compiled-mode performance and full-model
+accuracy equivalence, multimodal serving, quantized checkpoints and other
+chips remain unvalidated. Install the required operator dependency with
 `pip install --no-build-isolation -e '.[qwen3_8]'`.
 
 ### Supported Chips
