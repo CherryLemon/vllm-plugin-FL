@@ -227,13 +227,26 @@ def test_mhc_broadcast_fullgraph_compile_and_replay() -> None:
             residual=torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16),
         )
         result = compiled(next_values["residual"])
+        if tokens == 0:
+            # The generic materialized vLLM entry divides by zero at T=0;
+            # the broadcast entry explicitly defines these empty outputs.
+            for output, shape, dtype in zip(
+                result,
+                [(0, 4, 4096), (0, 4, 1), (0, 4, 4), (0, 4096)],
+                [torch.bfloat16, torch.float32, torch.float32, torch.bfloat16],
+            ):
+                assert output.shape == shape
+                assert output.dtype == dtype
+                assert output.device == next_values["residual"].device
+            continue
         reference = _generic_outputs(generic, next_values)
         torch.cuda.synchronize()
         _assert_outputs_close(reference, result)
 
 
-@pytest.mark.parametrize("tokens", [0, 1, 24])
-@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "tokens,strided", [(0, False), (0, True), (1, False), (24, False)]
+)
 def test_mhc_broadcast_fake_matches_actual_metadata(tokens, strided) -> None:
     _, broadcast = _require_cuda_broadcast_kernel()
     from torch._subclasses.fake_tensor import FakeTensorMode

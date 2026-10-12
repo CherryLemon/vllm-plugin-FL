@@ -132,8 +132,19 @@ def _mhc_pre_broadcast(
 
 
 def _mhc_pre_broadcast_fake(
-    residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-    hc_post_mult_value, sinkhorn_repeat, *, norm_weight, norm_eps, fn_broadcast,
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    *,
+    norm_weight,
+    norm_eps,
+    fn_broadcast,
 ):
     tokens, hidden = residual.shape
     streams = fn.shape[1] // hidden
@@ -141,7 +152,12 @@ def _mhc_pre_broadcast_fake(
         residual.new_empty((tokens, streams, hidden)),
         residual.new_empty((tokens, streams, 1), dtype=torch.float32),
         residual.new_empty((tokens, streams, streams), dtype=torch.float32),
-        torch.empty_like(residual)
+        torch.empty_strided(
+            residual.shape,
+            residual.stride(),
+            dtype=residual.dtype,
+            device=residual.device,
+        )
         if tokens == 0
         else residual.new_empty((tokens, hidden)),
     )
