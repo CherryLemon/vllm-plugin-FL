@@ -1,5 +1,13 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
-"""Activate an available ATen plan cache using FlagGems' own setting."""
+"""Opt into FlagGems' process-local ATen routing and launch-plan cache.
+
+The library caches structural dispatch decisions and launch plans for repeated
+operator signatures, reducing Python setup overhead. It does not cache tensor
+results or KV state and is separate from Torch/Triton compilation caches.
+
+This bridge is disabled by default. FLAGGEMS_ATEN_PLAN_CACHE=1 requests the
+library enable API; an older wheel without that API retains normal routing.
+"""
 
 from __future__ import annotations
 

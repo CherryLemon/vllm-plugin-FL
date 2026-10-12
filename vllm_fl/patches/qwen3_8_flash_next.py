@@ -212,6 +212,10 @@ def apply_native_index_select_policy(
 ) -> tuple[Optional[list[str]], Optional[list[str]]]:
     """Merge model-scoped native-op exclusions.
 
+    Append to the existing FlagGems blacklist rather than changing platform
+    defaults for unrelated models. Explicit whitelists are validated separately
+    because FlagGems gives them precedence over the blacklist.
+
     The convolution and padding entries are included because the
     FlagGems 5.3/5.4 PLE profile-run path either overflows the padding launch
     grid or faults while autotuning Conv2d at c=64 with a 16K dummy token

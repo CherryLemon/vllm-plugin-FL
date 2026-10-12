@@ -36,9 +36,9 @@ logger = init_logger(__name__)
 
 def _get_current_platform():
     """Resolve PlatformFL after the OOT platform plugin has activated."""
-    from vllm.platforms import current_platform as runtime_platform
+    from vllm.platforms import current_platform
 
-    return runtime_platform
+    return current_platform
 
 
 def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBackend]:
