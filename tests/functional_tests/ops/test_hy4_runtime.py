@@ -88,3 +88,19 @@ def test_planned_query_quantizer_matches_torch(ue8m0):
     )
     torch.testing.assert_close(scales.cpu(), expected_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(quantized.cpu().float(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ue8m0", [False, True])
+def test_query_quantizer_fullgraph_matches_eager_with_refreshed_inputs(ue8m0):
+    import flag_gems
+
+    quantizer = runtime._flaggems_query_quantizer(flag_gems.per_token_group_quant_fp8)
+    compiled = torch.compile(quantizer, backend="eager", fullgraph=True)
+    for rows in (1, 7):
+        x = torch.randn(rows, 256, dtype=torch.bfloat16, device="cuda")
+        original = x.clone()
+        expected = quantizer(x.clone(), 128, use_ue8m0=ue8m0)
+        actual = compiled(x, 128, use_ue8m0=ue8m0)
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a.float(), b.float(), rtol=0, atol=0)
+        torch.testing.assert_close(x, original, rtol=0, atol=0)

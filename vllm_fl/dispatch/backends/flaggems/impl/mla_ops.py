@@ -3,6 +3,9 @@
 
 from functools import wraps
 
+import torch
+
+from .query_quant import flaggems_per_token_group_quant_fp8
 from vllm_fl.utils import use_flaggems_op
 
 MLA_OPERATORS = (
@@ -24,6 +27,8 @@ MLA_OPERATORS = (
 def _flaggems_query_quantizer(implementation):
     @wraps(implementation)
     def quantize(x, group_size, *, use_ue8m0):
+        if torch.compiler.is_compiling():
+            return flaggems_per_token_group_quant_fp8(x, group_size, use_ue8m0)
         return implementation(x, group_size, scale_ue8m0=use_ue8m0)
 
     return quantize
