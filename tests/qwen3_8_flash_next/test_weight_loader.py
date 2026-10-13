@@ -1,14 +1,17 @@
-"""Focused tests for capability-selected stacked and fused-expert loading."""
+"""Core Qwen3.8 framework contracts; numerical tests live in FlagGems-vllm."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
-
-pytest.importorskip("vllm")
-torch = pytest.importorskip("torch")
+import torch
 from torch import nn  # noqa: E402
-
 from vllm_fl.models.qwen3_8_flash_next.gpu import model as qwen_model  # noqa: E402
+from vllm_fl.models.qwen3_8_flash_next.gpu.ple_layer import (
+    Qwen3_8FlashNextNGramEmbedding,
+    validate_ple_embedding_weights,
+)
 
 
 def test_legacy_stacked_mapping_covers_attention_gdn_and_shared_expert():
@@ -125,3 +128,80 @@ def test_legacy_fused_experts_split_gate_up_and_load_every_expert():
         ("w2", 1),
     ]
     torch.testing.assert_close(loaded[-1][2], down[1])
+
+
+def make_loader(start=0, end=8, vocab_size=8, parts=2):
+    module = Qwen3_8FlashNextNGramEmbedding.__new__(Qwen3_8FlashNextNGramEmbedding)
+    torch.nn.Module.__init__(module)
+    module.split_ngram_parts = parts
+    for name in ("layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes"):
+        module.register_buffer(name, torch.zeros(2, dtype=torch.long))
+    embedding = torch.nn.Module()
+    embedding.org_vocab_size = vocab_size
+    embedding.embedding_dim = 2
+    embedding.shard_indices = SimpleNamespace(
+        org_vocab_start_index=start, org_vocab_end_index=end
+    )
+    embedding.weight = torch.nn.Parameter(
+        torch.full((end - start, 2), -999.0), requires_grad=False
+    )
+    module.ngram_embedding = embedding
+    return module
+
+
+def shards(vocab_size=8, parts=2):
+    weight = torch.arange(vocab_size * 2, dtype=torch.float32).reshape(-1, 2)
+    size = (vocab_size + parts - 1) // parts
+    return weight, [
+        (f"ngram_embedding.shard_{i}.weight", weight[i * size : (i + 1) * size])
+        for i in range(parts)
+    ]
+
+
+class FragmentedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = make_loader()
+        self.second = make_loader()
+
+    @validate_ple_embedding_weights
+    def load_weights(self, weights):
+        from vllm.model_executor.models.utils import AutoWeightsLoader
+
+        return AutoWeightsLoader(self).load_weights(weights)
+
+
+def fragmented_weights():
+    _, weights = shards()
+    return [
+        (f"{owner}.{name}", value)
+        for name, value in weights
+        for owner in ("first", "second")
+    ]
+
+
+def test_real_autoloader_accumulates_noncontiguous_module_fragments():
+    model = FragmentedModel()
+    assert model.load_weights(fragmented_weights()) == {
+        "first.ngram_embedding.weight",
+        "second.ngram_embedding.weight",
+    }
+    expected, _ = shards()
+    torch.testing.assert_close(model.first.ngram_embedding.weight, expected)
+    torch.testing.assert_close(model.second.ngram_embedding.weight, expected)
+    # A subsequent complete model reload starts a new transaction.
+    assert len(model.load_weights(fragmented_weights())) == 2
+
+
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "mixed"])
+def test_fragmented_load_still_rejects_incomplete_or_ambiguous_checkpoints(failure):
+    weights = fragmented_weights()
+    if failure == "missing":
+        weights.pop()
+    elif failure == "duplicate":
+        weights.append(weights[0])
+    else:
+        full, _ = shards()
+        weights.append(("first.ngram_embedding.weight", full))
+    with pytest.raises(ValueError, match="Missing|Duplicate|Mixed"):
+        FragmentedModel().load_weights(weights)

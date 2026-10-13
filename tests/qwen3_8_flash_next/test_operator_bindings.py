@@ -1,31 +1,28 @@
-"""The plugin delegates numerical work and preserves compiled fake contracts."""
+"""Core Qwen3.8 framework contracts; numerical tests live in FlagGems-vllm."""
 
 import flaggems_vllm
-import pytest
 import torch
-
 from vllm_fl.models.qwen3_8_flash_next.gpu.ops import (
     hyperconnection,
     ple_fusion,
-    ple_state,
     qsa,
 )
 
 
-@pytest.mark.parametrize(
-    "module,name",
-    [
-        (hyperconnection, "qwen4_hc_combine_norm"),
-        (hyperconnection, "qwen4_hc_gate_reduce"),
-        (ple_state, "ple_state_gather"),
-        (ple_state, "ple_state_scatter_"),
-        (qsa, "qsa_mqa_paged"),
-        (qsa, "qsa_compress_groups_with_ratio"),
-        (qsa, "qsa_compress_norm_mrope_store_groups"),
-    ],
-)
-def test_numerical_entry_is_owned_by_library(module, name):
-    assert getattr(module, name) is getattr(flaggems_vllm, name)
+def test_library_numerical_delegates():
+    for module, names in (
+        (hyperconnection, ("qwen4_hc_combine_norm", "qwen4_hc_gate_reduce")),
+        (
+            qsa,
+            (
+                "qsa_mqa_paged",
+                "qsa_compress_groups_with_ratio",
+                "qsa_compress_norm_mrope_store_groups",
+            ),
+        ),
+    ):
+        for name in names:
+            assert getattr(module, name) is getattr(flaggems_vllm, name)
 
 
 def test_hc_fake_output_shapes():

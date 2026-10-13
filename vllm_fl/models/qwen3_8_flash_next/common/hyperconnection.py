@@ -12,8 +12,8 @@ The two concrete variants are:
     (gated_residual_simple).
 
 Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
-(HC outer, HS inner — checkpoint-native layout). The local torch
-implementation consumes the hyper input viewed as ``[..., HC, HS]``.
+(HC outer, HS inner — checkpoint-native layout). The model adapter
+consumes the hyper input viewed as ``[..., HC, HS]``.
 
 Typical usage inside a transformer decoder layer::
 
@@ -37,17 +37,10 @@ from torch import nn
 
 try:
     # Importing the leaf module registers opaque custom ops before Dynamo sees
-    # the model.  The module itself is vendor-neutral Triton and keeps CPU or
-    # unsupported accelerator execution on the torch formula below.
-    from ..gpu.ops.hyperconnection import (
-        can_use_hc_combine_norm_triton,
-        can_use_hc_inject_triton,
-        can_use_hc_triton,
-    )
+    # the model. Numerical implementations belong to FlagGems-vllm.
+    from ..gpu.ops.hyperconnection import can_use_hc_combine_norm_triton
 except ImportError:  # common/config-only imports do not require a GPU runtime
     can_use_hc_combine_norm_triton = None
-    can_use_hc_inject_triton = None
-    can_use_hc_triton = None
 
 
 # ---------------------------------------------------------------------------
@@ -90,29 +83,12 @@ class GroupedGemmaRMSNorm(nn.Module):
             if self.group_size is not None
             else 1
         )
-        if can_use_hc_triton is not None and can_use_hc_triton(
-            hidden_states, self.weight
-        ):
-            return torch.ops.vllm.qwen4_grouped_gemma_rmsnorm(
-                hidden_states,
-                self.weight,
-                group_count,
-                self.variance_epsilon,
-            )
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        if self.group_size is None:
-            variance = hidden_states.square().mean(dim=-1, keepdim=True)
-            normalized = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        else:
-            grouped = hidden_states.unflatten(
-                -1, (hidden_states.shape[-1] // self.group_size, self.group_size)
-            )
-            variance = grouped.square().mean(dim=-1, keepdim=True)
-            normalized = (
-                grouped * torch.rsqrt(variance + self.variance_epsilon)
-            ).flatten(-2)
-        return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+        return torch.ops.vllm.qwen4_grouped_gemma_rmsnorm(
+            hidden_states,
+            self.weight,
+            group_count,
+            self.variance_epsilon,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +153,8 @@ class GatedResidualSimple(HyperConnectionBase):
     injects the block output back into each stream through a learned
     per-stream injection weight.
 
-    Accelerator paths may fuse the elementwise reductions with Triton;
-    portable PyTorch fallbacks and tensor-parallel collectives are supplied
-    independently.
+    Projections and model scheduling live here; normalization, reduction and
+    residual injection are provided by FlagGems-vllm.
     """
 
     def __init__(
@@ -332,27 +307,14 @@ class GatedResidualSimple(HyperConnectionBase):
             down = F.linear(hyper_input_normed, self.input_mix_weight_down.weight)
         gate = F.silu(down / self.hc_count)
         gate_logits = F.linear(gate, self.input_mix_weight_up.weight)
-        if can_use_hc_triton is not None and can_use_hc_triton(
-            gate_logits, hyper_input_normed
-        ):
-            mixed_input = torch.ops.vllm.qwen4_hc_gate_reduce(
-                gate_logits,
-                hyper_input_normed,
-                self.hc_count,
-            )
-        else:
-            gate = torch.sigmoid(gate_logits).unflatten(
-                -1, (self.hc_count, self.hidden_size)
-            )
-            mixed_input = (
-                gate
-                * hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
-            ).mean(dim=-2)
+        mixed_input = torch.ops.vllm.qwen4_hc_gate_reduce(
+            gate_logits,
+            hyper_input_normed,
+            self.hc_count,
+        )
         return mixed_input.to(hyper_input_normed.dtype), injection_logits
 
-    def mix(
-        self, hyper_input: torch.Tensor
-    ) -> tuple[
+    def mix(self, hyper_input: torch.Tensor) -> tuple[
         torch.Tensor,
         tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
     ]:
@@ -390,19 +352,12 @@ class GatedResidualSimple(HyperConnectionBase):
         assert hidden_states.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         assert injection_logits.shape[-1] == self.hc_count
-        if can_use_hc_inject_triton is not None and can_use_hc_inject_triton(
-            injection_logits, block_output, hidden_states
-        ):
-            return torch.ops.vllm.qwen4_hc_inject_combine(
-                injection_logits,
-                block_output,
-                hidden_states,
-                self.hc_count,
-            )
-        residual = hidden_states.unflatten(-1, (self.hc_count, self.hidden_size))
-        injection_weight = 2.0 * torch.sigmoid(injection_logits / self.hc_count)
-        output = residual + block_output.unsqueeze(-2) * injection_weight.unsqueeze(-1)
-        return output.flatten(-2).to(hidden_states.dtype)
+        return torch.ops.vllm.qwen4_hc_inject_combine(
+            injection_logits,
+            block_output,
+            hidden_states,
+            self.hc_count,
+        )
 
     def combine_and_mix(
         self,
@@ -415,12 +370,14 @@ class GatedResidualSimple(HyperConnectionBase):
         This is the small API bridge needed to move the self-developed layer
         from eager ``combine`` to the official delayed-combine schedule.  On
         supported CUDA/Triton shapes it uses the fused combine+grouped-norm
-        op; CPU, ROCm, and unusual layouts use the mathematically identical
-        combine followed by the existing grouped RMSNorm fallback.
+        op; other supported layouts call separate library combine and norm
+        entries.
         """
 
         if (prev_block_output is None) != (prev_injection is None):
-            raise ValueError("pending HC output and injection must be provided together")
+            raise ValueError(
+                "pending HC output and injection must be provided together"
+            )
 
         if prev_block_output is None:
             return self.mix_delayed(hidden_states)

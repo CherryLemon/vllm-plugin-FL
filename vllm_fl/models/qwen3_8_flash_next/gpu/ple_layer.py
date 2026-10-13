@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cross-vendor Qwen3.8-Flash-Next position-learning enhancement layers."""
 
-import math
-from functools import wraps
 from collections.abc import Iterable, Sequence
+from functools import wraps
 
 import torch
-import torch.nn.functional as F
+from flaggems_vllm import ple_short_conv_
 from torch import nn
-
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -19,27 +17,24 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+from ..common.hyperconnection import GroupedGemmaRMSNorm
+from ..common.ple import copy_ple_embedding_shard_
 from ..common.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
-from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
-from ..common.ple import copy_ple_embedding_shard_
 from ..config import Qwen3_8FlashNextTextConfig
 from .ops.ple_fusion import (
     PLE_FUSION_MIN_TOKENS,
-    can_use_ple_gate_norm_triton,
     ple_gate_norm,
     ple_prefill_short_conv_,
 )
-from .ops.ple_state import ple_state_gather, ple_state_scatter_
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -96,37 +91,10 @@ def _nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float,
-        group_size: int | None,
-        dtype: torch.dtype | None,
-    ) -> None:
-        super().__init__()
-        if group_size is not None and hidden_size % group_size:
-            raise ValueError(
-                f"hidden_size ({hidden_size}) must be divisible by "
-                f"group_size ({group_size})"
-            )
-        self.eps = eps
-        self.group_size = group_size
-        self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        if self.group_size is None:
-            variance = hidden_states.square().mean(dim=-1, keepdim=True)
-            normalized = hidden_states * torch.rsqrt(variance + self.eps)
-        else:
-            grouped = hidden_states.unflatten(
-                -1, (hidden_states.shape[-1] // self.group_size, self.group_size)
-            )
-            variance = grouped.square().mean(dim=-1, keepdim=True)
-            normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
-        return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+class Qwen3_8FlashNextPLEGroupedNorm(GroupedGemmaRMSNorm):
+    @property
+    def eps(self) -> float:
+        return self.variance_epsilon
 
 
 def validate_ple_embedding_weights(load_weights):
@@ -519,416 +487,123 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             conv_kernel=self.conv_state_len + self.num_spec_tokens + 1,
         )
 
-    def _apply_norm(
-        self, norm: Qwen3_8FlashNextPLEGroupedNorm, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        shape = hidden_states.shape
-        return norm(hidden_states.flatten(-2)).reshape(shape)
-
     def _short_conv_fallback(self, inputs: torch.Tensor) -> torch.Tensor:
-        # Profiling / CUDA graph capture only; conv state is not updated.
-        inputs_t = inputs.transpose(0, 1).unsqueeze(0)
-        output = self.conv1d(inputs_t)[..., : inputs_t.size(-1)]
-        return F.silu(output).squeeze(0).transpose(0, 1)
+        # Profiling has no cache metadata or persistent state updates.
+        output = torch.empty_like(inputs)
+        state = torch.empty(
+            (0, inputs.shape[1], self.conv_state_len),
+            dtype=inputs.dtype,
+            device=inputs.device,
+        )
+        ple_short_conv_(
+            inputs,
+            output,
+            state,
+            self.conv1d.weight.squeeze(1),
+            None,
+            dilation=self.short_conv_dilation,
+        )
+        return output
 
     def _short_conv_dilated_decode_batched(
         self,
-        x_d: torch.Tensor,
-        conv_state: torch.Tensor,
-        conv_weights: torch.Tensor,
-        state_indices_tensor_d: torch.Tensor,
-        has_initial_states_d: torch.Tensor | None,
+        x_d,
+        conv_state,
+        conv_weights,
+        state_indices_tensor_d,
+        has_initial_states_d,
     ) -> torch.Tensor:
-        state_indices = state_indices_tensor_d.to(
-            device=conv_state.device, dtype=torch.int64
-        )
-        # TODO: need double-check
-        # FULL cudagraph padded decode rows use NULL_BLOCK_ID. Remap them to
-        # slot 0 for a safe gather, then zero output and skip write-back.
-        valid_state = state_indices != NULL_BLOCK_ID
-        state_indices = torch.where(
-            valid_state, state_indices, torch.zeros_like(state_indices)
-        )
-        if has_initial_states_d is None:
-            has_initial_state = valid_state
-        else:
-            if has_initial_states_d.numel() < state_indices_tensor_d.numel():
-                raise ValueError(
-                    "has_initial_states_d size mismatch: "
-                    f"got {has_initial_states_d.numel()}, "
-                    f"need >= {state_indices_tensor_d.numel()}."
-                )
-            has_initial_state = has_initial_states_d[
-                : state_indices_tensor_d.numel()
-            ].to(device=conv_state.device, dtype=torch.bool)
-            has_initial_state = has_initial_state & valid_state
-
-        cached_state = ple_state_gather(
-            conv_state, state_indices, indices_are_safe=True
-        )
-        state = cached_state[..., : self.conv_state_len].to(x_d.dtype)
-        if self.conv_state_len > 0:
-            initial_state = torch.where(
-                has_initial_state.view(-1, 1, 1),
-                state,
-                torch.zeros_like(state),
-            )
-            history = torch.cat((initial_state, x_d.unsqueeze(-1)), dim=-1)
-        else:
-            history = x_d.unsqueeze(-1)
-
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
+        output = torch.empty_like(x_d)
+        ple_short_conv_(
+            x_d,
+            output,
+            conv_state,
+            conv_weights,
+            state_indices_tensor_d,
             dilation=self.short_conv_dilation,
-        ).squeeze(-1)
-        output = F.silu(conv_output)
-        output = output * valid_state.view(-1, 1).to(output.dtype)
-
-        if self.conv_state_len > 0:
-            next_state = history[..., -self.conv_state_len :]
-            # Padded rows are remapped to the reserved null slot. Preserve its
-            # existing value while writing the new states for valid rows.
-            existing_base_state = cached_state[..., : self.conv_state_len]
-            safe_next_state = torch.where(
-                valid_state.view(-1, 1, 1),
-                next_state.to(conv_state.dtype),
-                existing_base_state,
-            )
-            cached_state[..., : self.conv_state_len] = safe_next_state
-            ple_state_scatter_(
-                conv_state,
-                state_indices,
-                cached_state,
-                write_mask=valid_state,
-                indices_are_safe=True,
-            )
-
+            has_initial_state=has_initial_states_d,
+            null_block_id=NULL_BLOCK_ID,
+        )
         return output
 
     def _short_conv_dilated_prefill_batched(
         self,
-        x_p: torch.Tensor,
-        metadata: PleShortConvAttentionMetadata,
-        conv_state: torch.Tensor,
-        conv_weights: torch.Tensor,
-        state_indices_tensor_p: torch.Tensor,
-        num_prefills: int,
-        num_decode_tokens: int,
-        num_prefill_tokens: int,
-        output: torch.Tensor | None = None,
+        x_p,
+        metadata,
+        conv_state,
+        conv_weights,
+        state_indices_tensor_p,
+        num_prefills,
+        num_decode_tokens,
+        num_prefill_tokens,
+        output=None,
     ) -> torch.Tensor | None:
-        # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
-        # requests and equals ``query_start_loc`` when spec-decode is inactive.
-        non_spec_query_start_loc = metadata.non_spec_query_start_loc
-        if non_spec_query_start_loc is None:
-            raise ValueError("query_start_loc is required for prefill short-conv")
-        query_start_loc_p = non_spec_query_start_loc[-num_prefills - 1 :]
+        starts = metadata.non_spec_query_start_loc
+        if starts is None or metadata.has_initial_states_p is None:
+            raise ValueError(
+                "PLE prefill requires query offsets and initial-state flags"
+            )
+        starts = starts[-num_prefills - 1 :]
         if num_decode_tokens:
-            query_start_loc_p = query_start_loc_p - num_decode_tokens
-        # The metadata builder guarantees that the prefill query offsets start
-        # at 0 and end at num_prefill_tokens. Avoid reading those values here,
-        # since doing so would force a device-to-host synchronization.
-        has_initial_states_p = metadata.has_initial_states_p
-        if has_initial_states_p is None:
-            raise ValueError("has_initial_states_p is required for prefill short-conv")
-
-        q_starts = query_start_loc_p.to(torch.int64)
-        if state_indices_tensor_p.numel() < num_prefills:
-            raise ValueError(
-                "state_indices_tensor_p size mismatch: "
-                f"got {state_indices_tensor_p.numel()}, "
-                f"need >= {num_prefills}."
-            )
-        if has_initial_states_p.numel() < num_prefills:
-            raise ValueError(
-                "has_initial_states_p size mismatch: "
-                f"got {has_initial_states_p.numel()}, "
-                f"need >= {num_prefills}."
-            )
-        if num_prefills == 0 or x_p.numel() == 0:
-            return None if output is not None else torch.empty_like(x_p)
-        lengths = q_starts[1:] - q_starts[:-1]
-        # Use the CPU-computed packing width from the metadata builder instead
-        # of synchronizing on lengths.max().
-        max_len = metadata.max_prefill_query_len
-        if max_len <= 0:
-            return None if output is not None else torch.empty_like(x_p)
-
-        # Direct token-major path: it drops the pack/transpose/copy chain and
-        # the generic depthwise convolution, so the dense [num_prefills,
-        # max_len, hidden] workspace is never materialized.
-        fused_output = output if output is not None else torch.empty_like(x_p)
-        if ple_prefill_short_conv_(
+            starts = starts - num_decode_tokens
+        result = output if output is not None else torch.empty_like(x_p)
+        if not x_p.numel():
+            return None if output is not None else result
+        # Keep the existing measured large-prefill launch policy.
+        fused = ple_prefill_short_conv_(
             x_p,
-            fused_output,
+            result,
             conv_state,
             conv_weights,
-            query_start_loc_p,
+            starts,
             state_indices_tensor_p[:num_prefills],
-            has_initial_states_p[:num_prefills],
+            metadata.has_initial_states_p[:num_prefills],
             num_prefills=num_prefills,
-            max_len=max_len,
+            max_len=metadata.max_prefill_query_len,
             state_len=self.conv_state_len,
             kernel_width=self.conv_kernel_size,
             dilation=self.short_conv_dilation,
             null_block_id=NULL_BLOCK_ID,
             min_tokens=PLE_FUSION_MIN_TOKENS,
-        ):
-            # ``None`` tells the caller its preallocated buffer already holds
-            # the result, skipping its former full-tensor copy.
-            return None if output is not None else fused_output
-
-        fallback_output = output if output is not None else torch.empty_like(x_p)
-        hidden_size = x_p.shape[1]
-        positions = torch.arange(
-            num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
-        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
-        col_indices = positions - q_starts[req_indices]
-
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
-
-        state_indices = state_indices_tensor_p[:num_prefills].to(
-            device=conv_state.device, dtype=torch.int64
-        )
-        valid_state = state_indices != NULL_BLOCK_ID
-        state_indices = torch.where(
-            valid_state, state_indices, torch.zeros_like(state_indices)
-        )
-        has_initial = has_initial_states_p[:num_prefills].to(
-            device=conv_state.device, dtype=torch.bool
-        )
-        if self.conv_state_len > 0:
-            if conv_state.shape[0] == 0:
-                state = conv_state.new_zeros(
-                    (num_prefills, hidden_size, self.conv_state_len),
-                    dtype=x_p.dtype,
-                )
-            else:
-                state = ple_state_gather(
-                    conv_state, state_indices, indices_are_safe=True
-                )[..., : self.conv_state_len].to(x_p.dtype)
-            use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
-            initial_state = torch.where(
-                use_initial_mask,
-                state,
-                torch.zeros_like(state),
-            )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
-        else:
-            history = packed_tokens
-
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
-        )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        fallback_output.copy_(conv_output[req_indices, col_indices])
-
-        if self.conv_state_len > 0 and conv_state.shape[0] > 0:
-            state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
-                num_prefills, 1, 1
-            )
-            state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
-            next_state = history.gather(
-                dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
-            )
-            # Write back without a host synchronization. Valid, non-empty rows
-            # receive their new state; padding and zero-length rows keep the
-            # current cache value.
-            existing_state = ple_state_gather(
-                conv_state, state_indices, indices_are_safe=True
-            )
-            existing_base_state = existing_state[..., : self.conv_state_len]
-            update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
-            safe_next_state = torch.where(
-                update_mask.view(num_prefills, 1, 1),
-                next_state.to(conv_state.dtype),
-                existing_base_state,
-            )
-            existing_state[..., : self.conv_state_len] = safe_next_state
-            ple_state_scatter_(
+        if not fused:
+            ple_short_conv_(
+                x_p,
+                result,
                 conv_state,
-                state_indices,
-                existing_state,
-                write_mask=update_mask,
-                indices_are_safe=True,
+                conv_weights,
+                state_indices_tensor_p[:num_prefills],
+                dilation=self.short_conv_dilation,
+                query_start_loc=starts,
+                has_initial_state=metadata.has_initial_states_p[:num_prefills],
+                null_block_id=NULL_BLOCK_ID,
             )
-        return None if output is not None else fallback_output
+        return None if output is not None else result
 
     def _short_conv_dilated_spec_batched(
         self,
-        x_spec: torch.Tensor,
-        conv_state: torch.Tensor,
-        conv_weights: torch.Tensor,
-        spec_state_indices_tensor: torch.Tensor,
-        spec_query_start_loc: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        spec_query_len: int,
+        x_spec,
+        conv_state,
+        conv_weights,
+        spec_state_indices_tensor,
+        spec_query_start_loc,
+        num_accepted_tokens,
+        spec_query_len,
     ) -> torch.Tensor:
-        """Dilated short-conv for speculative-decode (MTP) requests.
-
-        Each spec request feeds multiple (draft + 1) query tokens. The conv
-        outputs are computed causally after rolling back the previous draft
-        state by ``num_accepted_tokens - 1``. The current candidate inputs stay
-        in the extended cache for the next forward, matching
-        ``causal_conv1d_update``.
-
-        ``spec_query_len`` (== num_speculative_tokens + 1) is the maximum query
-        length and is a Python int, so no host synchronization is needed; this
-        keeps the path safe for full CUDA-graph capture/replay where the buffers
-        are padded at the request level.
-        """
-        num_reqs = spec_state_indices_tensor.numel()
-        hidden_size = x_spec.size(-1)
-        # Use a fixed packing width instead of synchronizing on lengths.max().
-        max_len = spec_query_len
-        # Full CUDA graphs can pad these buffers. Only the first num_reqs
-        # accepted-token counts belong to actual speculative requests.
-        num_accepted_tokens = num_accepted_tokens[:num_reqs]
-        q_starts = spec_query_start_loc[: num_reqs + 1].to(torch.int64)
-        # Keep the number of real speculative tokens on the device.
-        total_real_tokens = q_starts[num_reqs]
-
-        state_indices = spec_state_indices_tensor.to(
-            device=conv_state.device, dtype=torch.int64
-        )
-        valid_state = state_indices != NULL_BLOCK_ID
-        state_indices = torch.where(
-            valid_state, state_indices, torch.zeros_like(state_indices)
-        )
-        positions = torch.arange(
-            x_spec.size(0), device=x_spec.device, dtype=torch.int64
-        )
-        # Route graph-padded token rows to the discarded dummy request so that
-        # they cannot overwrite real packed data.
-        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
-        valid_requests = (req_indices >= 0) & (req_indices < num_reqs)
-        safe_req_indices = torch.where(
-            valid_requests, req_indices, torch.zeros_like(req_indices)
-        )
-        col_indices = positions - q_starts[safe_req_indices]
-        valid_columns = (col_indices >= 0) & (col_indices < max_len)
-        valid_tokens = (positions < total_real_tokens) & valid_requests & valid_columns
-        safe_col_indices = torch.where(
-            valid_tokens, col_indices, torch.zeros_like(col_indices)
-        )
-        pack_req_indices = torch.where(
-            valid_tokens,
-            safe_req_indices,
-            torch.full_like(req_indices, num_reqs),
-        )
-        pack_col_indices = torch.where(
-            valid_tokens, safe_col_indices, torch.zeros_like(col_indices)
-        )
-
-        # The last request row is the dummy sink for graph padding.
-        packed = x_spec.new_zeros((num_reqs + 1, max_len, hidden_size))
-        packed[pack_req_indices, pack_col_indices] = x_spec
-        packed = packed.transpose(1, 2).contiguous()
-
-        if self.conv_state_len > 0:
-            cached_state = ple_state_gather(
-                conv_state, state_indices, indices_are_safe=True
-            )
-            rollback_offsets = num_accepted_tokens.to(
-                device=conv_state.device, dtype=torch.int64
-            ).sub(1)
-            valid_rollback = (
-                valid_state & (rollback_offsets >= 0) & (rollback_offsets < max_len)
-            )
-            safe_rollback_offsets = torch.where(
-                valid_rollback,
-                rollback_offsets,
-                torch.zeros_like(rollback_offsets),
-            )
-            rollback_offsets = torch.where(
-                valid_rollback,
-                safe_rollback_offsets,
-                torch.zeros_like(safe_rollback_offsets),
-            )
-            state_offsets = torch.arange(
-                self.conv_state_len, device=conv_state.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
-            rollback_indices = rollback_offsets.view(-1, 1, 1) + state_offsets
-            state = cached_state.gather(
-                2, rollback_indices.expand(-1, hidden_size, -1)
-            ).to(x_spec.dtype)
-            state = torch.where(
-                valid_rollback.view(num_reqs, 1, 1),
-                state,
-                torch.zeros_like(state),
-            )
-            # Append a zeroed dummy-row state to match the [num_reqs + 1] pack.
-            dummy_state = state.new_zeros((1, hidden_size, self.conv_state_len))
-            state_full = torch.cat((state, dummy_state), dim=0)
-            history = torch.cat((state_full, packed), dim=-1)
-        else:
-            history = packed
-
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
+        output = torch.empty_like(x_spec)
+        requests = spec_state_indices_tensor.numel()
+        ple_short_conv_(
+            x_spec,
+            output,
+            conv_state,
+            conv_weights,
+            spec_state_indices_tensor,
             dilation=self.short_conv_dilation,
+            query_start_loc=spec_query_start_loc[: requests + 1],
+            accepted_tokens=num_accepted_tokens[:requests],
+            max_query_len=spec_query_len,
+            null_block_id=NULL_BLOCK_ID,
         )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        output = conv_output[pack_req_indices, pack_col_indices]
-        output = output * valid_tokens.view(-1, 1).to(output.dtype)
-
-        # Keep all current candidate inputs in the extended state. On the next
-        # target forward, ``num_accepted_tokens - 1`` selects the rollback
-        # window before processing the newly scheduled tokens.
-        if self.conv_state_len > 0:
-            state_capacity = self.conv_state_len + max_len - 1
-            if conv_state.size(-1) < state_capacity:
-                raise RuntimeError(
-                    "PLE short-conv cache cannot retain speculative tokens: "
-                    f"got {conv_state.size(-1)}, need {state_capacity}."
-                )
-            candidate_state = history[:num_reqs, :, 1 : state_capacity + 1]
-            query_lengths = q_starts[1:] - q_starts[:-1]
-            state_positions = torch.arange(
-                state_capacity, device=history.device, dtype=torch.int64
-            ).view(1, 1, state_capacity)
-            update_lengths = (self.conv_state_len + query_lengths - 1).view(
-                num_reqs, 1, 1
-            )
-            update_mask = valid_state.view(num_reqs, 1, 1) & (
-                state_positions < update_lengths
-            )
-            existing_state = cached_state[..., :state_capacity]
-            next_state = torch.where(
-                update_mask,
-                candidate_state.to(conv_state.dtype),
-                existing_state,
-            )
-            cached_state[..., :state_capacity] = next_state
-            ple_state_scatter_(
-                conv_state,
-                state_indices,
-                cached_state,
-                write_mask=valid_state & (query_lengths > 0),
-                indices_are_safe=True,
-            )
-
         return output
 
     def _short_conv_dilated_dispatch(
@@ -1110,7 +785,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             inputs,
             layer_attn_metadata,
             conv_state,
-            conv_weights.to(dtype=inputs.dtype),
+            conv_weights,
             output=output,
         )
 
@@ -1134,7 +809,7 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
-        if can_use_ple_gate_norm_triton(
+        gated_value, normalized_grouped = ple_gate_norm(
             key,
             query,
             value,
@@ -1142,26 +817,9 @@ class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
             self.norm_query.weight,
             self.norm_conv.weight,
             self.hc_count,
-            min_tokens=PLE_FUSION_MIN_TOKENS,
-        ):
-            gated_value, normalized_grouped = ple_gate_norm(
-                key,
-                query,
-                value,
-                self.norm_key.weight,
-                self.norm_query.weight,
-                self.norm_conv.weight,
-                self.hc_count,
-                self.norm_conv.eps,
-            )
-            normalized = normalized_grouped.flatten(-2)
-        else:
-            key = self._apply_norm(self.norm_key, key)
-            query = self._apply_norm(self.norm_query, query)
-            gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
-            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-            gated_value = gate * value.unsqueeze(-2)
-            normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+            self.norm_conv.eps,
+        )
+        normalized = normalized_grouped.flatten(-2)
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen3_8_flash_next_ple_short_conv(
             normalized,

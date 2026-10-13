@@ -5,16 +5,13 @@
 import torch
 from flaggems_vllm import (
     qwen4_grouped_gemma_rmsnorm,
+    qwen4_hc_combine_norm,
     qwen4_hc_gate_reduce,
     qwen4_hc_inject_combine,
-    qwen4_hc_combine_norm,
 )
-from flaggems_vllm.ops.qwen4.hyperconnection import (
-    can_use_hc_triton,
-    can_use_hc_inject_triton,
-    can_use_hc_combine_norm_triton,
-)
+from flaggems_vllm.ops.qwen4.hyperconnection import can_use_hc_combine_norm_triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
 
 def qwen4_grouped_gemma_rmsnorm_fake(
     hidden_states: torch.Tensor,
@@ -24,7 +21,6 @@ def qwen4_grouped_gemma_rmsnorm_fake(
 ) -> torch.Tensor:
     del weight, hc_count, eps
     return torch.empty_like(hidden_states)
-
 
 
 def qwen4_hc_gate_reduce_fake(
@@ -40,7 +36,6 @@ def qwen4_hc_gate_reduce_fake(
     )
 
 
-
 def qwen4_hc_inject_combine_fake(
     injection_logits: torch.Tensor,
     block_output: torch.Tensor,
@@ -49,7 +44,6 @@ def qwen4_hc_inject_combine_fake(
 ) -> torch.Tensor:
     del injection_logits, block_output, hc_count
     return torch.empty_like(residual)
-
 
 
 def qwen4_hc_combine_norm_fake(
@@ -92,8 +86,6 @@ direct_register_custom_op(
 
 __all__ = [
     "can_use_hc_combine_norm_triton",
-    "can_use_hc_inject_triton",
-    "can_use_hc_triton",
     "qwen4_grouped_gemma_rmsnorm",
     "qwen4_hc_combine_norm",
     "qwen4_hc_gate_reduce",

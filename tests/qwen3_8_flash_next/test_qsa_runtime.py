@@ -1,4 +1,4 @@
-"""Exactness and graph-replay tests for fused QSA forward metadata."""
+"""Core Qwen3.8 framework contracts; numerical tests live in FlagGems-vllm."""
 
 from __future__ import annotations
 
@@ -7,8 +7,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm_fl.compat import kv_cache as kv_bind
+from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import QSAKeyStateCache
 
-from .reference import compressed_slot_mapping_reference
+
+def compressed_slot_mapping_reference(table, requests, positions, block_size, ratio):
+    compressed = positions // ratio
+    valid = (positions >= 0) & (requests >= 0) & (requests < table.shape[0])
+    blocks = compressed // block_size
+    valid &= blocks < table.shape[1]
+    pages = table[
+        requests.long().clamp(0, table.shape[0] - 1),
+        blocks.long().clamp(0, table.shape[1] - 1),
+    ]
+    valid &= (pages >= 0) & ((positions + 1) % ratio == 0)
+    return torch.where(valid, pages.long() * block_size + compressed % block_size, -1)
 
 
 def _load_qsa_ops():
@@ -64,44 +77,9 @@ def _reference(
     return token_to_req, logical, slots
 
 
-def test_forward_metadata_holds_common_metadata_by_reference():
-    from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import (
-        QSAForwardMetadata,
-    )
-
-    query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
-    common_slot_mapping = torch.tensor([7, 8], dtype=torch.int64)
-    common = SimpleNamespace(
-        block_table_tensor=torch.tensor([[0]], dtype=torch.int32),
-        slot_mapping=common_slot_mapping,
-        seq_lens=torch.tensor([2], dtype=torch.int32),
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc,
-        num_actual_tokens=2,
-    )
-    logical = torch.full((2,), -1, dtype=torch.int64)
-    metadata = QSAForwardMetadata(
-        common=common,
-        token_to_req=torch.zeros(2, dtype=torch.int32),
-        logical_positions=logical,
-        qsa_slot_mapping=common_slot_mapping,
-        storage_block_size=4,
-        compress_ratio=1,
-    )
-    assert metadata.block_table is common.block_table_tensor
-    assert metadata.slot_mapping is common.slot_mapping
-    assert metadata.seq_lens is common.seq_lens
-    assert metadata.query_start_loc is common.query_start_loc
-    assert metadata.num_actual_tokens == 2
-    metadata.prepare()
-    assert logical.tolist() == [0, 1]
-
-
 def test_sparse_attention_uses_compressed_metadata_request_map():
     from vllm_fl.models.qwen3_8_flash_next.gpu import model as _model  # noqa: F401
-    from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import (
-        _prepared_qsa_token_to_req,
-    )
+    from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import _prepared_qsa_token_to_req
 
     raw = torch.zeros(6, dtype=torch.int32)
     compressed = torch.tensor([0, 0, 1, 1, 99, 99], dtype=torch.int32)
@@ -122,54 +100,12 @@ def test_sparse_attention_uses_compressed_metadata_request_map():
     assert actual.tolist() == [0, 1, 2, 3]
 
 
-def test_sparse_attention_rejects_compressed_metadata_token_count_mismatch():
-    from vllm_fl.models.qwen3_8_flash_next.gpu import model as _model  # noqa: F401
-    from vllm_fl.models.qwen3_8_flash_next.gpu.qsa import (
-        _prepared_qsa_token_to_req,
-    )
-
-    metadata = {
-        "compressed": SimpleNamespace(
-            num_actual_tokens=3, token_to_req=torch.tensor([0, 0, 1])
-        ),
-    }
-    indexer = SimpleNamespace(compressed_key_cache=SimpleNamespace(prefix="compressed"))
-    with pytest.raises(RuntimeError, match="compressed metadata token counts"):
-        _prepared_qsa_token_to_req(metadata, indexer, 4)
-
-
-def test_metadata_defer_follows_global_full_graph_modes():
-    from vllm.config.compilation import CUDAGraphMode
-
-    from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import (
-        _global_full_cudagraph_enabled,
-    )
-
-    expected = {
-        CUDAGraphMode.NONE: False,
-        CUDAGraphMode.PIECEWISE: False,
-        CUDAGraphMode.FULL: True,
-        CUDAGraphMode.FULL_DECODE_ONLY: True,
-        CUDAGraphMode.FULL_AND_PIECEWISE: True,
-    }
-    for mode, enabled in expected.items():
-        config = SimpleNamespace(
-            compilation_config=SimpleNamespace(cudagraph_mode=mode)
-        )
-        assert _global_full_cudagraph_enabled(config) is enabled
-    unresolved = SimpleNamespace(
-        compilation_config=SimpleNamespace(cudagraph_mode=None)
-    )
-    assert _global_full_cudagraph_enabled(unresolved) is False
-
-
 @pytest.mark.parametrize("with_new_token_to_req_api", [False, True])
 def test_builder_fallback_does_not_require_common_token_to_request_api(
     with_new_token_to_req_api,
 ):
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
-
     from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import QSAMetadataBuilder
 
     config = SimpleNamespace(
@@ -220,111 +156,6 @@ def test_builder_fallback_does_not_require_common_token_to_request_api(
     torch.testing.assert_close(metadata.token_to_req, expected_token_to_req)
     torch.testing.assert_close(metadata.logical_positions, expected_logical)
     torch.testing.assert_close(metadata.qsa_slot_mapping, expected_slots)
-
-
-def test_common_token_to_req_cache_reuses_same_common_object(monkeypatch):
-    from vllm.v1.attention.backend import CommonAttentionMetadata
-
-    from vllm_fl.patches.qwen3_8_flash_next import (
-        _patch_common_attention_token_to_req_cache,
-    )
-
-    _patch_common_attention_token_to_req_cache()
-    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
-    common = CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc.clone(),
-        seq_lens=torch.tensor([2, 5], dtype=torch.int32),
-        num_reqs=2,
-        num_actual_tokens=8,
-        max_query_len=3,
-        max_seq_len=5,
-        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
-        slot_mapping=torch.arange(8, dtype=torch.int64),
-    )
-    first = torch.full((8,), -7, dtype=torch.int32)
-    second = torch.full((8,), -9, dtype=torch.int32)
-    original_repeat_interleave = torch.repeat_interleave
-    calls = 0
-
-    def counted_repeat_interleave(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original_repeat_interleave(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "repeat_interleave", counted_repeat_interleave)
-    first_result = common.token_to_req_indices(first)
-    second_result = common.token_to_req_indices(second)
-
-    assert calls == 1
-    assert first_result.data_ptr() == first.data_ptr()
-    assert second_result.data_ptr() == first.data_ptr()
-    assert first_result.tolist() == [0, 0, 1, 1, 1, 0, 0, 0]
-    assert second.tolist() == [-9] * 8
-
-    fresh_common = CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc.clone(),
-        seq_lens=torch.tensor([2, 5], dtype=torch.int32),
-        num_reqs=2,
-        num_actual_tokens=8,
-        max_query_len=3,
-        max_seq_len=5,
-        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
-        slot_mapping=torch.arange(8, dtype=torch.int64),
-    )
-    fresh_result = fresh_common.token_to_req_indices(second)
-    assert calls == 2
-    assert fresh_result.data_ptr() == second.data_ptr()
-    assert fresh_result.tolist() == first_result.tolist()
-
-
-@pytest.mark.gpu
-@pytest.mark.parametrize("num_reqs,rows", [(1, 8), (64, 64)])
-def test_kernel_matches_torch_for_boundaries_and_invalid_rows(num_reqs, rows):
-    ops = _load_qsa_ops()
-    device = torch.device("cuda")
-    if num_reqs == 1:
-        query_start_loc = torch.tensor([0, rows - 2], dtype=torch.int32)
-        seq_lens = torch.tensor([rows - 3], dtype=torch.int32)
-    else:
-        query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32)
-        query_start_loc[-4:] = num_reqs - 3
-        seq_lens = torch.arange(num_reqs, dtype=torch.int32) + 1
-        seq_lens[0] = 0
-    block_table = torch.arange(num_reqs * 8, dtype=torch.int32).reshape(num_reqs, 8)
-    block_table[0, -1] = -1
-    common_slots = torch.arange(rows, dtype=torch.int64)
-    common_slots[1::17] = -1
-    expected_token_to_req, expected_logical, expected_slots = _reference(
-        query_start_loc,
-        seq_lens,
-        block_table,
-        common_slots,
-        4,
-        4,
-        rows,
-    )
-    token_to_req = torch.full((rows,), -99, dtype=torch.int32, device=device)
-    logical = torch.empty(rows, dtype=torch.int64, device=device)
-    slots = torch.empty_like(logical)
-    assert ops.build_qsa_forward_metadata(
-        token_to_req,
-        query_start_loc.to(device),
-        seq_lens.to(device),
-        block_table.to(device),
-        common_slots.to(device),
-        logical,
-        slots,
-        4,
-        4,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(
-        token_to_req.cpu(), expected_token_to_req, rtol=0, atol=0
-    )
-    torch.testing.assert_close(logical.cpu(), expected_logical, rtol=0, atol=0)
-    torch.testing.assert_close(slots.cpu(), expected_slots, rtol=0, atol=0)
 
 
 @pytest.mark.gpu
@@ -406,25 +237,82 @@ def test_kernel_graph_replay_updates_contents_at_fixed_addresses():
     ) == output_addresses
 
 
-@pytest.mark.gpu
-def test_ratio_one_reuses_common_slot_mapping_without_fused_kernel():
-    ops = _load_qsa_ops()
-    device = torch.device("cuda")
-    logical = torch.full((1,), 101, dtype=torch.int64, device=device)
-    slots = torch.full((1,), 202, dtype=torch.int64, device=device)
-    token_to_req = torch.full((1,), 303, dtype=torch.int32, device=device)
-    used = ops.build_qsa_forward_metadata(
-        token_to_req,
-        torch.tensor([0, 1], dtype=torch.int32, device=device),
-        torch.ones(1, dtype=torch.int32, device=device),
-        torch.zeros((1, 1), dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int64, device=device),
-        logical,
-        slots,
-        4,
-        1,
+class _Owner:
+    def __init__(self):
+        self.bound = []
+
+    def bind_kv_cache(self, kv_cache):
+        self.bound.append(kv_cache)
+
+
+def _noop_upstream(monkeypatch, *, mutates=True):
+    calls = []
+
+    def fake(kv_caches, forward_context, runner_kv_caches, num_attn_module=1):
+        calls.append(list(kv_caches))
+        if mutates:
+            for layer_name, kv in kv_caches.items():
+                forward_context[layer_name].kv_cache = kv
+                runner_kv_caches.append(kv)
+
+    import vllm.v1.worker.utils as vllm_utils
+
+    monkeypatch.setattr(vllm_utils, "bind_kv_cache", fake)
+    monkeypatch.setattr(kv_bind, "upstream_binds_kv_cache_owners", lambda: False)
+    return calls
+
+
+def test_owner_hook_called_once_after_upstream(monkeypatch):
+    upstream_calls = _noop_upstream(monkeypatch)
+    owner = _Owner()
+    kv_caches = {"qsa": torch.zeros(2, 4, 1, 8)}
+    forward_context = {"qsa": owner}
+
+    kv_bind.bind_kv_cache(kv_caches, forward_context, [], 1)
+    assert len(upstream_calls) == 1
+    assert len(owner.bound) == 1
+    assert owner.bound[0] is kv_caches["qsa"]
+
+
+def test_validation_failure_leaves_no_mutation(monkeypatch):
+    _noop_upstream(monkeypatch)
+    owner = _Owner()
+    owner.validate_kv_cache = lambda kv: (_ for _ in ()).throw(ValueError("bad dtype"))
+    runner: list = []
+    kv_caches = {"qsa": torch.zeros(1)}
+    with pytest.raises(ValueError, match="bad dtype"):
+        kv_bind.bind_kv_cache(kv_caches, {"qsa": owner}, runner, 1)
+    assert runner == []
+    assert owner.bound == []
+
+
+def test_rebind_replaces_typed_views():
+    key_head_size = 512
+    obj = object.__new__(QSAKeyStateCache)
+    obj.head_size = ((key_head_size + 3) // 4) * 4 + 3 * 4
+    obj.key_head_size = key_head_size
+    obj.cache_rope_positions = True
+    obj.rope_position_offset = ((key_head_size + 3) // 4) * 4
+    obj.kv_cache = torch.tensor([])
+
+    first = torch.zeros(2, 4, 1, obj.head_size, dtype=torch.bfloat16)
+    obj.bind_kv_cache(first)
+    assert (
+        obj.key_cache.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
     )
-    assert used is False
-    assert token_to_req.item() == 303
-    assert logical.item() == 101
-    assert slots.item() == 202
+
+    second = torch.zeros(2, 4, 1, obj.head_size, dtype=torch.bfloat16)
+    obj.bind_kv_cache(second)
+    assert (
+        obj.key_cache.untyped_storage().data_ptr()
+        == second.untyped_storage().data_ptr()
+    )
+    assert (
+        obj.rope_position_cache.untyped_storage().data_ptr()
+        == second.untyped_storage().data_ptr()
+    )
+    assert obj.rope_position_cache.dtype == torch.int64
+    assert obj.rope_position_cache.storage_offset() == obj.rope_position_offset // 4
+
+
+kv_bind.register_kv_cache_owner(_Owner)
