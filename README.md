@@ -29,6 +29,7 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 | Qwen3-4B | Supported | [example](./examples/offline_inference.py) |
 | MiniCPM-o 4.5 | Supported | [example](./examples/minicpm/) |
 | GLM-5 | Supported | [example](./examples/glm_5_offline_inference.py) |
+| GLM-5.3 Flash | Supported | [implementation](./vllm_fl/models/glm5/model.py) |
 | Qwen3.5-35B-A3B | Supported | [example](./examples/qwen3_5_offline_inference.py)  |
 | BAAI/bge-m3 | Supported | [implementation](./vllm_fl/models/bge_m3.py) |
 | MiniMax-M2.7 | Supported | [implementation](./examples/minimax_m27_offline_inference.py) |
@@ -98,31 +99,6 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
 
     If `VLLM_VENDOR` is not set, vllm-plugin-FL is installed as a Python-only
     plugin and the native extension is skipped.
-
-    GLM5.3-Flash also requires the paired public operators in
-    [FlagGems-vllm PR #900](https://github.com/flagos-ai/FlagGems-vllm/pull/900).
-    The `glm5` extra pins commit
-    `484afae427ec3d161d553a7bf3e290e71e01e6de` and TileLang 0.1.9:
-    ```sh
-    pip install --no-build-isolation '.[glm5]'
-    ```
-    The GLM installation uses the plugin's default Python-only wheel with the
-    official vLLM 0.24.0 CUDA wheel, which supplies the native graph operators.
-    It does not require compiling the plugin's C++ extension. This combination
-    is the validated installation; empty builds and other GPU platforms need
-    separate GLM graph and model validation.
-    Install FlagGems as described below; its public `bmm_out` API and vLLM's
-    DeepGEMM APIs must be available for the GLM MHC/KDA paths. Missing optional
-    capabilities are checked before execution. The paired operator PR remains
-    draft while performance shortfalls and full-model validation are pending.
-    The optional first-layer MHC broadcast path is a CUDA vendor implementation:
-    it reuses a compatible upstream vLLM API or the framework's bundled backport
-    from the official **vLLM v0.26.0** release
-    ([upstream #48137](https://github.com/vllm-project/vllm/pull/48137)).
-    The `_vendor` package contains Triton/TileLang operators backported from
-    official vLLM releases; each module records its source release and upstream
-    file URLs in its docstring.
-    TileLang and DeepGEMM are required for this path.
 
 3. Install [FlagGems](https://flagos-ai.github.io/FlagGems/getting-started/install/)
 

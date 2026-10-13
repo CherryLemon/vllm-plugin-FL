@@ -250,7 +250,7 @@ class WorkerFL(WorkerBase):
 
         # GLM patches must precede CustomOp construction, including the VLM
         # vision tower. Other models keep the common startup path below.
-        from vllm_fl.patches.glm5_next_worker import initialize_glm5_worker
+        from vllm_fl.models.glm5.worker import initialize_glm5_worker
 
         if initialize_glm5_worker(self.vllm_config, rank=rank):
             return

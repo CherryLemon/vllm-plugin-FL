@@ -345,7 +345,7 @@ class PlatformFL(Platform):
             parallel_config.disable_custom_all_reduce = True
 
         # GLM guards run after vLLM resolves its final configuration.
-        from vllm_fl.patches.glm5_next_runtime import validate_glm5_config
+        from vllm_fl.models.glm5.runtime import validate_glm5_config
 
         validate_glm5_config(vllm_config)
 

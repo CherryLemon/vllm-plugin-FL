@@ -40,8 +40,8 @@ def _probe_state():
 
     from vllm_fl.activation import get_active_plan
     from vllm_fl.dispatch.policy import PolicyManager
-    from vllm_fl.models.glm5_next_kpool import Glm5NextIndexerAttentionBackend
-    from vllm_fl.patches import glm5_next_kpool as kpool
+    from vllm_fl.models.glm5 import cache as kpool
+    from vllm_fl.models.glm5.kpool import Glm5NextIndexerAttentionBackend
 
     active = get_active_plan()
     kpool_bound = all(
@@ -66,7 +66,7 @@ def _probe_state():
 def _child_spawn_activate(conn):
     try:
         # The actual capability check contributes portable MoE defaults.
-        from vllm_fl.kernels.glm5_next import provider
+        from vllm_fl.models.glm5 import provider
 
         provider._has_vllm_native_extension = lambda: False
         provider._has_nvidia_reference_kernels.cache_clear()
@@ -178,7 +178,7 @@ def _protect_real_activation_state(monkeypatch):
 
 def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
     _protect_real_activation_state(monkeypatch)
-    from vllm_fl.kernels.glm5_next import provider
+    from vllm_fl.models.glm5 import provider
 
     monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
     provider._has_nvidia_reference_kernels.cache_clear()

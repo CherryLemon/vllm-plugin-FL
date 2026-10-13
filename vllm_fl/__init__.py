@@ -224,7 +224,7 @@ def register_model():
     """Register FL-specific models not yet upstream."""
     # General plugins are loaded independently in spawned model-inspection and
     # worker processes, so all runtime compatibility hooks must be idempotent.
-    from vllm_fl.patches.glm5_next_runtime import (
+    from vllm_fl.models.glm5.runtime import (
         register_glm5_next_support,
     )
     from vllm_fl.patches.qwen3_5_text import apply_qwen3_5_text_patches
