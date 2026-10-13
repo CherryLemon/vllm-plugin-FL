@@ -255,24 +255,41 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        whitelist, blacklist = get_flag_gems_whitelist_blacklist(
-            vllm_config=vllm_config,
-            vendor_name=getattr(current_platform, "vendor_name", None),
-        )
-
         if fl_envs.USE_FLAGGEMS:
             import flag_gems
 
-            kwargs = dict(
-                record=rank == 0, once=True,
-                path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+            # Get whitelist and blacklist from environment variables
+            whitelist, blacklist = get_flag_gems_whitelist_blacklist(
+                vllm_config=vllm_config,
+                vendor_name=getattr(current_platform, "vendor_name", None),
             )
-            if whitelist is not None:
-                flag_gems.only_enable(include=whitelist, **kwargs)
+
+            # Only rank 0 records the oplist to avoid file truncation and
+            # interleaved writes when tensor-parallel-size > 1.
+            should_record = (rank == 0)
+
+            # Use whitelist if specified (takes precedence over blacklist)
+            if whitelist:
+                logger.info(f"[FlagGems] Enable only the following ops: {whitelist}")
+                flag_gems.only_enable(
+                    include=whitelist,
+                    record=should_record,
+                    once=True,
+                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                )
             elif blacklist:
-                flag_gems.enable(unused=blacklist, **kwargs)
+                logger.info(f"[FlagGems] Disable the following ops: {blacklist}")
+                flag_gems.enable(
+                    unused=blacklist,
+                    record=should_record,
+                    once=True,
+                    path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH,
+                )
             else:
-                flag_gems.enable(**kwargs)
+                logger.info("[FlagGems] Enable all ops")
+                flag_gems.enable(
+                    record=should_record, once=True, path=fl_envs.FLAGGEMS_ENABLE_OPLIST_PATH
+                )
 
     # def sleep(self, level: int = 1) -> None:
     #     TODO(lms): rewrite CuMemAllocator
