@@ -89,10 +89,7 @@ def portable_sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    if use_fp4_cache:
-        assert q_scale is not None, "use_fp4_cache=True requires q_scale"
-    else:
-        assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
+    assert q_scale is None, "q_scale must be None when use_fp4_cache=False"
     num_tokens = slot_mapping.shape[0]
     if k is not None:
         k = k[:num_tokens]
@@ -121,22 +118,10 @@ def portable_sparse_attn_indexer(
                     kv_cache, k_quant, k_scale, chunk.block_table, chunk.cu_seq_lens
                 )
             q_slice = q_quant[chunk.token_start : chunk.token_end]
-            q_scale_slice = (
-                q_scale[chunk.token_start : chunk.token_end]
-                if q_scale is not None
-                else None
-            )
-            if use_fp4_cache:
-                q_slice_cast = q_slice.view(torch.int8)
-                k_quant_cast = k_quant.view(torch.int8)
-                k_scale_cast = k_scale.view(torch.int32).squeeze(-1)
-            else:
-                q_slice_cast = q_slice
-                k_quant_cast = k_quant
-                k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
             logits = implementations["fp8_fp4_mqa_logits"](
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
+                (q_slice, None),
+                (k_quant, k_scale_cast),
                 weights[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
@@ -162,39 +147,19 @@ def portable_sparse_attn_indexer(
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
-            if q_scale is not None:
-                padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens, pad_value=0
-                )
-                padded_q_scale = pack_seq_triton(
-                    q_scale[:num_decode_tokens], decode_lens, pad_value=0
-                )
-            else:
-                padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens
-                )
-                padded_q_scale = None
+            padded_q_quant_decode_tokens = pack_seq_triton(
+                q_quant[:num_decode_tokens], decode_lens
+            )
         else:
             padded_q_quant_decode_tokens = q_quant[:num_decode_tokens].reshape(
                 decode_lens.shape[0], -1, *q_quant.shape[1:]
             )
-            if q_scale is not None:
-                padded_q_scale = q_scale[:num_decode_tokens].reshape(
-                    decode_lens.shape[0], -1, *q_scale.shape[1:]
-                )
-            else:
-                padded_q_scale = None
         batch_size = padded_q_quant_decode_tokens.shape[0]
         next_n = padded_q_quant_decode_tokens.shape[1]
         num_padded_tokens = batch_size * next_n
         seq_lens = decode_metadata.seq_lens[:batch_size]
-        padded_q_quant_cast = (
-            padded_q_quant_decode_tokens.view(torch.int8)
-            if use_fp4_cache
-            else padded_q_quant_decode_tokens
-        )
         logits = implementations["fp8_fp4_paged_mqa_logits"](
-            (padded_q_quant_cast, padded_q_scale),
+            (padded_q_quant_decode_tokens, None),
             kv_cache,
             weights[:num_padded_tokens],
             seq_lens,

@@ -8,6 +8,7 @@ import torch
 
 from vllm.platforms import current_platform
 
+from vllm_fl.dispatch.backends.flaggems.impl.mla_ops import _flaggems_query_quantizer
 from vllm_fl.models.hy4 import runtime
 
 pytestmark = [
@@ -72,7 +73,7 @@ def test_planned_query_quantizer_matches_torch(ue8m0):
 
     import flag_gems
 
-    quantizer = runtime._flaggems_query_quantizer(flag_gems.per_token_group_quant_fp8)
+    quantizer = _flaggems_query_quantizer(flag_gems.per_token_group_quant_fp8)
     torch.manual_seed(29)
     x = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     quantized, scales = quantizer(x, 128, use_ue8m0=ue8m0)
@@ -94,7 +95,7 @@ def test_planned_query_quantizer_matches_torch(ue8m0):
 def test_query_quantizer_fullgraph_matches_eager_with_refreshed_inputs(ue8m0):
     import flag_gems
 
-    quantizer = runtime._flaggems_query_quantizer(flag_gems.per_token_group_quant_fp8)
+    quantizer = _flaggems_query_quantizer(flag_gems.per_token_group_quant_fp8)
     compiled = torch.compile(quantizer, backend="eager", fullgraph=True)
     for rows in (1, 7):
         x = torch.randn(rows, 256, dtype=torch.bfloat16, device="cuda")

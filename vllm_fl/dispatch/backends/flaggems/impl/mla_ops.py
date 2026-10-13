@@ -6,6 +6,7 @@ from functools import wraps
 import torch
 
 from .query_quant import flaggems_per_token_group_quant_fp8
+from vllm_fl.dispatch.capabilities import get_flaggems_vllm_operator
 from vllm_fl.utils import use_flaggems_op
 
 MLA_OPERATORS = (
@@ -44,17 +45,11 @@ def get_operator(name):
         from vllm_fl.attention.mla_prefill import FlagGemsMLAPrefillBackend
 
         return lambda config: FlagGemsMLAPrefillBackend
-    try:
-        import flaggems_vllm
-    except ModuleNotFoundError as exc:
-        if exc.name != "flaggems_vllm":
-            raise
-        return None
     if name == "fp8_fp4_paged_mqa_logits":
-        graph_fn = getattr(flaggems_vllm, "fp8_fp4_paged_mqa_logits_graph", None)
+        graph_fn = get_flaggems_vllm_operator("fp8_fp4_paged_mqa_logits_graph")
         if callable(graph_fn):
             return graph_fn
-    return getattr(flaggems_vllm, name, None)
+    return get_flaggems_vllm_operator(name)
 
 
 def is_available(name):

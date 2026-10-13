@@ -1,7 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device-kernel availability checks shared by operator providers."""
+"""Runtime kernel and public operator capabilities shared by adapters/providers."""
 
 import torch
+
+
+def get_flaggems_vllm_operator(name: str):
+    """Look up a public operator without importing model/attention adapters."""
+    try:
+        import flaggems_vllm
+    except ModuleNotFoundError as exc:
+        if exc.name != "flaggems_vllm":
+            raise
+        return None
+    return getattr(flaggems_vllm, name, None)
 
 
 def has_device_kernel(name: str, device_type: str) -> bool:

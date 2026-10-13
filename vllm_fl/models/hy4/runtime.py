@@ -25,9 +25,6 @@ _INSTALL_LOCK = RLock()
 _MISSING = object()
 
 
-from vllm_fl.dispatch.backends.flaggems.impl.mla_ops import (
-    _flaggems_query_quantizer as _flaggems_query_quantizer,
-)
 from vllm_fl.dispatch.capabilities import has_device_kernel
 
 _FLAGGEMS_INDEXER_OPS = (
