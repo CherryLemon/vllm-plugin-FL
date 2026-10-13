@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn  # noqa: E402
+
 from vllm_fl.models.qwen3_8_flash_next.gpu import model as qwen_model  # noqa: E402
 from vllm_fl.models.qwen3_8_flash_next.gpu.ple_layer import (
     Qwen3_8FlashNextNGramEmbedding,

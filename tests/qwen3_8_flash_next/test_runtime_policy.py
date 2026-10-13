@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
 from vllm_fl.patches.qwen3_8_flash_next import (
     Qwen3_8FlashNextForCausalLMConfig,
     apply_native_index_select_policy,

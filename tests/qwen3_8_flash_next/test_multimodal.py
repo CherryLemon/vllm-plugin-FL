@@ -5,6 +5,7 @@ from __future__ import annotations
 import types
 
 import torch
+
 from vllm_fl.models.qwen3_8_flash_next.config import (  # noqa: E402
     Qwen3_8FlashNextConfig,
     Qwen3_8FlashNextTextConfig,

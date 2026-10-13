@@ -10,6 +10,7 @@ from flaggems_vllm import (
     qwen4_hc_inject_combine,
 )
 from flaggems_vllm.ops.qwen4.hyperconnection import can_use_hc_combine_norm_triton
+
 from vllm.utils.torch_utils import direct_register_custom_op
 
 

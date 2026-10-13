@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from vllm_fl.compat import kv_cache as kv_bind
 from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import QSAKeyStateCache
 
@@ -106,6 +107,7 @@ def test_builder_fallback_does_not_require_common_token_to_request_api(
 ):
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
     from vllm_fl.models.qwen3_8_flash_next.common.qsa_cache import QSAMetadataBuilder
 
     config = SimpleNamespace(

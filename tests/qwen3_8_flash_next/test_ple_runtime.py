@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+
 from vllm_fl.models.qwen3_8_flash_next.config import Qwen3_8FlashNextTextConfig
 from vllm_fl.models.qwen3_8_flash_next.gpu import ple_layer
 from vllm_fl.worker.ple_token_history import PLETokenHistory
@@ -151,7 +152,6 @@ def build(monkeypatch):
 
 
 def _reference(module, ids, qsl, context):
-
     count = int(qsl[-1])
     hashes = ple_hash_ids_reference(
         ids[:count],

@@ -314,7 +314,9 @@ class GatedResidualSimple(HyperConnectionBase):
         )
         return mixed_input.to(hyper_input_normed.dtype), injection_logits
 
-    def mix(self, hyper_input: torch.Tensor) -> tuple[
+    def mix(
+        self, hyper_input: torch.Tensor
+    ) -> tuple[
         torch.Tensor,
         tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
     ]:
