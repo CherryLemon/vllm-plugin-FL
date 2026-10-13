@@ -39,7 +39,7 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
 
-from vllm_fl.patches.hy_v4_runtime import HY4RuntimePlan
+from .runtime import HY4RuntimePlan
 
 logger = init_logger(__name__)
 
@@ -570,7 +570,7 @@ class HYV4MLAAttention(nn.Module):
         if selected_cls.supports_sink():
             return selected_cls
 
-        from .hy_v4_flashmla_sparse import HYV4FlashMLASparseBackend
+        from .flashmla_sparse import HYV4FlashMLASparseBackend
 
         # Mirror how the selector derives the configuration-dependent inputs so
         # this check accepts exactly what the backend would accept at runtime.

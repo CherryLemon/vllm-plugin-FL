@@ -25,9 +25,9 @@ def register_hy_v4_support() -> bool:
         model_arch_config_convertor,
     )
 
-    from vllm_fl.configs.hy_v4 import HYV4Config
-    from vllm_fl.configs.hy_v4_convertor import HYV4ModelArchConfigConvertor
-    from vllm_fl.model_loader.hy_v4_loader import HYV4SafetensorsLoader
+    from .config import HYV4Config
+    from .config_convertor import HYV4ModelArchConfigConvertor
+    from .loader import HYV4SafetensorsLoader
 
     transformers_config._CONFIG_REGISTRY.setdefault("hy_v4", HYV4Config)
     model_arch_config_convertor.MODEL_ARCH_CONFIG_CONVERTORS["hy_v4"] = (
@@ -35,7 +35,7 @@ def register_hy_v4_support() -> bool:
     )
     model_registry.ModelRegistry.register_model(
         _ARCHITECTURE,
-        "vllm_fl.models.hy_v4:HYV4ForCausalLM",
+        "vllm_fl.models.hy4.model:HYV4ForCausalLM",
     )
 
     registered_loaders = model_loader._LOAD_FORMAT_TO_MODEL_LOADER

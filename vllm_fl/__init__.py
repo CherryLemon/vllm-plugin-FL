@@ -239,7 +239,7 @@ def register_model():
         install_arm_cpu_packed_w4a8()
         return
 
-    from vllm_fl.patches.hy_v4_registration import register_hy_v4_support
+    from vllm_fl.models.hy4.registration import register_hy_v4_support
 
     register_hy_v4_support()
 

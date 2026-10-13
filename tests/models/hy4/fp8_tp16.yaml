@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# Real checkpoint smoke; requires 16 NVIDIA GPUs and this mounted checkpoint.
+# Manual checkpoint smoke; not included in the default CI matrix.
+# Requires 16 NVIDIA GPUs and this mounted checkpoint.
 # Distributed two-node acceptance uses the documented external MP launch.
 llm:
   model: /data/models/Hy4-preview-FP8-Testing

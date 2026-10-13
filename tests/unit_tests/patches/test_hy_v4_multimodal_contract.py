@@ -12,8 +12,8 @@ import pytest
 
 from vllm.model_executor.models.interfaces import supports_multimodal
 
-from vllm_fl.configs.hy_v4 import HYV4Config, _unsupported_multimodal_keys
-from vllm_fl.models.hy_v4 import HYV4ForCausalLM
+from vllm_fl.models.hy4.config import HYV4Config, _unsupported_multimodal_keys
+from vllm_fl.models.hy4.model import HYV4ForCausalLM
 
 # Keys of the official ``tencent/Hy4-preview`` config.json (vLLM 0.24 ABI).
 # Source: https://huggingface.co/tencent/Hy4-preview/raw/main/config.json

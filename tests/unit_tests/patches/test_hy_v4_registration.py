@@ -5,19 +5,21 @@ from torch import nn
 
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
-from vllm_fl.configs import hy_v4_convertor
-from vllm_fl.configs.hy_v4 import HYV4Config
-from vllm_fl.model_loader.hy_v4_loader import (
+from vllm_fl.models.hy4 import (
+    config_convertor as hy_v4_convertor,
+    model as hy_v4,
+    registration,
+)
+from vllm_fl.models.hy4.config import HYV4Config
+from vllm_fl.models.hy4.loader import (
     HYV4SafetensorsLoader,
     _contiguous_runs,
     _read_local_experts,
 )
-from vllm_fl.models import hy_v4
-from vllm_fl.models.hy_v4 import (
+from vllm_fl.models.hy4.model import (
     HYV4ForCausalLM,
     _hyv4_fp32_combine,
 )
-from vllm_fl.patches import hy_v4_registration as registration
 
 
 def test_hy4_convertor_uses_compressed_mla_dimensions():
@@ -144,7 +146,7 @@ def test_apply_registers_plugin_owned_hy4_components(monkeypatch):
         "hy_v4": hy_v4_convertor.HYV4ModelArchConfigConvertor
     } == model_arch_config_convertor.MODEL_ARCH_CONFIG_CONVERTORS
     assert registered_models == {
-        "HYV4ForCausalLM": "vllm_fl.models.hy_v4:HYV4ForCausalLM"
+        "HYV4ForCausalLM": "vllm_fl.models.hy4.model:HYV4ForCausalLM"
     }
     assert registered_loaders == {"hy4_safetensors": HYV4SafetensorsLoader}
 
@@ -372,7 +374,7 @@ def test_hy4_dense_mlp_sequence_parallel_disables_tp(monkeypatch):
 def test_hy4_hook_registers_public_prefill_before_model_construction(monkeypatch):
     from vllm.v1.attention.backends.mla.prefill import registry
 
-    from vllm_fl.patches.hy_v4_registration import register_hy_v4_support
+    from vllm_fl.models.hy4.registration import register_hy_v4_support
 
     monkeypatch.setattr(registry, "_MLA_PREFILL_OVERRIDES", {})
     assert register_hy_v4_support()

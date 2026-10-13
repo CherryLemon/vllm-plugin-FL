@@ -9,7 +9,8 @@ import torch
 
 from vllm.model_executor.models.utils import PPMissingLayer
 
-from vllm_fl.model_loader.hy_v4_indexer import (
+from vllm_fl.models.hy4 import model as hy_v4
+from vllm_fl.models.hy4.indexer import (
     FP8_FORMAT,
     MXFP8_FORMAT,
     IndexerWKLoader,
@@ -18,8 +19,7 @@ from vllm_fl.model_loader.hy_v4_indexer import (
     normalize_quant_format,
     quant_metadata_from_quant_config,
 )
-from vllm_fl.models import hy_v4
-from vllm_fl.models.hy_v4 import HYV4ForCausalLM
+from vllm_fl.models.hy4.model import HYV4ForCausalLM
 
 _FP8_BLOCK = 32
 _MXFP8_GROUP = 32

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_fl.models.hy_v4 import HYV4HyperConnection, HYV4HyperHead
+from vllm_fl.models.hy4.model import HYV4HyperConnection, HYV4HyperHead
 
 
 def _config(hidden=33):

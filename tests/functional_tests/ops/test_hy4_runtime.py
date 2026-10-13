@@ -8,7 +8,7 @@ import torch
 
 from vllm.platforms import current_platform
 
-from vllm_fl.patches import hy_v4_runtime as runtime
+from vllm_fl.models.hy4 import runtime
 
 pytestmark = [
     pytest.mark.gpu,

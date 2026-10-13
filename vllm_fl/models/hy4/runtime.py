@@ -347,7 +347,7 @@ def _install_fallback(tx, plan: HY4RuntimePlan) -> bool:
         # native FlashMLA/NV kernel when the wheel is empty.
         import vllm.v1.attention.backends.mla.flashmla_sparse as native_sparse
 
-        from vllm_fl.models import hy_v4_flashmla_sparse as hy4_sparse
+        from . import flashmla_sparse as hy4_sparse
 
         tx.set(native_sparse, "flash_mla_sparse_fwd", flash_mla_sparse_fwd)
         tx.set(hy4_sparse, "flash_mla_sparse_fwd", flash_mla_sparse_fwd)

@@ -13,7 +13,7 @@ def hy4_shared_registry_isolation(request, monkeypatch):
     from vllm_fl.dispatch.backends.flaggems.impl import mla_ops
     from vllm_fl.dispatch.backends.vendor.cuda.impl import mla
     from vllm_fl.dispatch.manager import reset_default_manager
-    from vllm_fl.patches import hy_v4_runtime as runtime
+    from vllm_fl.models.hy4 import runtime
 
     monkeypatch.setattr(
         builtin_ops, "_get_current_vendor_backend_dirs", lambda *_: "cuda"

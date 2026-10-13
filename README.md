@@ -206,7 +206,7 @@ propagates without retrying another implementation.
 Use `hy4_safetensors` to load the preview checkpoint with expert slicing. The
 portable path requires BF16 KV (`auto` with a BF16 model, or `bfloat16`); FP8 KV
 requires the complete native sparse/cache/prefill path. Shared indexers require
-pipeline parallel size 1. The [checkpoint smoke configuration](./tests/models/hy4/fp8_tp16.yaml)
+pipeline parallel size 1. The [manual checkpoint smoke configuration](./tests/models/hy4/fp8_tp16.yaml)
 requires 16 NVIDIA GPUs; the single-GPU dummy smoke checks model integration.
 HY4-Preview currently targets NVIDIA H100, vLLM 0.24.0, the MXFP8 preview
 checkpoint, BF16 activations and BF16 portable KV. Other chips, multimodal serving and portable FP8 KV

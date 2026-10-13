@@ -7,8 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from .test_hy_v4_review_contracts import _prefill_config
-from vllm_fl.models import hy_v4
-from vllm_fl.patches import hy_v4_runtime as runtime
+from vllm_fl.models.hy4 import model as hy_v4, runtime
 
 
 @pytest.mark.parametrize(

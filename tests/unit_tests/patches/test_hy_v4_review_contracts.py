@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_fl.configs import hy_v4_convertor
-from vllm_fl.models import hy_v4_attention as attention, hy_v4_flashmla_sparse as sparse
-from vllm_fl.patches import hy_v4_registration as registration, hy_v4_runtime as runtime
+from vllm_fl.models.hy4 import (
+    attention,
+    config_convertor as hy_v4_convertor,
+    flashmla_sparse as sparse,
+    registration,
+    runtime,
+)
 
 
 @pytest.mark.parametrize("kind", ["selection", "capability", "configuration"])

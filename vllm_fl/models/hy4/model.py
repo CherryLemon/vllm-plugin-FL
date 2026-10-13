@@ -9,8 +9,8 @@ from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from vllm.compilation.decorators import support_torch_compile
@@ -53,19 +53,19 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from vllm_fl.configs.hy_v4 import HYV4Config
-from vllm_fl.model_loader.hy_v4_coverage import HY4LoadCoverage
-from vllm_fl.model_loader.hy_v4_indexer import (
-    IndexerWKLoader,
-    quant_metadata_from_quant_config,
-)
-from vllm_fl.models.hy_v4_attention import (
+from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
     is_skip_topk_indexer_weight,
     validate_hy4_parallel_config,
 )
-from vllm_fl.patches.hy_v4_runtime import HY4RuntimePlan, prepare_hy4_runtime
+from .config import HYV4Config
+from .coverage import HY4LoadCoverage
+from .indexer import (
+    IndexerWKLoader,
+    quant_metadata_from_quant_config,
+)
+from .runtime import HY4RuntimePlan, prepare_hy4_runtime
 
 
 def _hyv4_fp32_combine(routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
