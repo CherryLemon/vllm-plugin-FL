@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinatorNoPrefixCache,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -179,6 +180,72 @@ def test_upstream_mamba_fallback_reproduces_tail_coordinator_failure(engine_hook
     assert sizes == (512, 512)
     with pytest.raises(AssertionError, match="block_size must be divisible"):
         _new_manager(cache, config, sizes=sizes)
+
+
+@pytest.mark.usefixtures("deterministic_hash_seed")
+def test_resolved_worker_alignment_keeps_short_prefill_in_one_chunk(engine_hooks):
+    config = _engine_config(engine_block=64)
+    cache = _tail_cache_config(config)
+    template = config.cache_config
+    template.mamba_block_size = 512
+    request = _request("video", list(range(189)), 4)
+    scheduler = SimpleNamespace(cache_config=template, block_size=512, use_eagle=False)
+    split = Scheduler._mamba_block_aligned_split
+
+    # EngineCore has reset the configured size after worker alignment. The
+    # real upstream splitter follows that stale field, despite block_size=512.
+    assert split(scheduler, request, 189) == 128
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(cache, config) == (512, 4)
+    scheduler.cache_config = config.cache_config
+    assert split(scheduler, request, 189) == 189
+    assert config.cache_config is not template
+    assert template.block_size == 64
+    assert config.cache_config.block_size == 512
+    assert config.cache_config.mamba_block_size == template.mamba_block_size
+    assert config.cache_config.hash_block_size is template.hash_block_size
+
+
+@pytest.mark.usefixtures("deterministic_hash_seed")
+def test_cold_and_cached_prefills_keep_identical_aligned_suffix_chunks(engine_hooks):
+    config = _engine_config(engine_block=64)
+    cache = _tail_cache_config(config)
+    scheduler = SimpleNamespace(
+        cache_config=config.cache_config, block_size=512, use_eagle=False
+    )
+    split = Scheduler._mamba_block_aligned_split
+
+    def chunks(*, cached=0, common_prefix=0):
+        request = _request("long", list(range(2813)), 4)
+        computed = cached
+        scheduled = split(
+            scheduler,
+            request,
+            min(request.num_tokens - computed, 2048),
+            num_new_local_computed_tokens=cached,
+            num_uncached_common_prefix_tokens=common_prefix,
+        )
+        result = [scheduled]
+        computed += scheduled
+        while computed < request.num_tokens:
+            request.num_computed_tokens = computed
+            scheduled = split(scheduler, request, request.num_tokens - computed)
+            assert scheduled > 0
+            result.append(scheduled)
+            computed += scheduled
+        return result
+
+    # Real cache admission sees another 512-token full-attention common block,
+    # whereas a running request follows the stale 64-token last-cache boundary.
+    assert chunks() == [2048, 704, 61]
+    assert chunks(cached=2048, common_prefix=512) == [512, 192, 61]
+    kv_cache_utils.resolve_kv_cache_block_sizes(cache, config)
+    scheduler.cache_config = config.cache_config
+    cold = chunks()
+    warm = chunks(cached=2048, common_prefix=512)
+    assert cold == [2048, 512, 253]
+    assert warm == cold[1:]
+    assert sum(cold[:-1]) == 2560
+    assert sum(cold[:-1]) % _mamba_spec().block_size == 0
 
 
 @pytest.mark.usefixtures("deterministic_hash_seed")
@@ -358,6 +425,7 @@ def test_other_cache_layouts_preserve_upstream_resolver_contract(
             )
         )
     cache = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)
+    template = config.cache_config
     try:
         expected = engine_hooks(cache, config)
     except ValueError as error:
@@ -366,6 +434,8 @@ def test_other_cache_layouts_preserve_upstream_resolver_contract(
         assert str(patched_error.value) == str(error)
     else:
         assert kv_cache_utils.resolve_kv_cache_block_sizes(cache, config) == expected
+    assert config.cache_config is template
+    assert config.cache_config.block_size == engine_block
 
 
 @pytest.mark.usefixtures("deterministic_hash_seed")

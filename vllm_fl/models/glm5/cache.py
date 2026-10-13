@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import sys
+from copy import copy
 from dataclasses import replace
 from functools import wraps
 
@@ -524,7 +525,18 @@ def install_glm5_next_kpool() -> None:
                     f"Invalid hash_block_size={hash_block_size}; GLM5-Next KV "
                     f"group block sizes={block_sizes} must be divisible by it"
                 )
-            return math.lcm(*block_sizes), hash_block_size
+            scheduler_block_size = math.lcm(*block_sizes)
+            # EngineCore replaces the worker-aligned block size with the
+            # smallest group (the request-owned tail) before this resolver.
+            # Its Mamba prefill splitter reads cache_config.block_size rather
+            # than the resolved scheduler size. Restore the actual alignment
+            # so admission and running requests save the same KDA checkpoints.
+            # Keep the caller's shared cache template and all other fields.
+            if vllm_config.cache_config.block_size != scheduler_block_size:
+                cache_config = copy(vllm_config.cache_config)
+                cache_config.block_size = scheduler_block_size
+                vllm_config.cache_config = cache_config
+            return scheduler_block_size, hash_block_size
 
         resolve_block_sizes._glm5_kpool = True
         stage(kv_cache_utils, "resolve_kv_cache_block_sizes", resolve_block_sizes)
