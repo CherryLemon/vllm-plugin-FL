@@ -484,3 +484,71 @@ def test_vision_activation_clamps_large_inputs(monkeypatch, merger):
     up = x[:, 4:].clamp(min=-2.0, max=2.0)
     expected = torch.nn.functional.silu(gate) * up
     torch.testing.assert_close(layer.act_fn.forward_native(x), expected)
+
+
+def test_vision_uses_trained_rms_epsilon_without_mutating_checkpoint(monkeypatch):
+    from contextlib import nullcontext
+
+    import torch
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    from vllm_fl.models.glm5 import multimodal as vision, runtime
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(),
+        vision_config=SimpleNamespace(
+            patch_size=2,
+            temporal_patch_size=2,
+            in_channels=3,
+            depth=1,
+            hidden_size=4,
+            num_heads=1,
+            spatial_merge_size=2,
+            out_hidden_size=4,
+            intermediate_size=8,
+            projection_intermediate_size=8,
+            swiglu_limit=10.0,
+            rms_norm_eps=1e-5,
+        ),
+    )
+    deployment = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=config,
+            multimodal_config=SimpleNamespace(
+                mm_encoder_tp_mode="data", is_multimodal_pruning_enabled=lambda: False
+            ),
+        )
+    )
+    # Construct the real model/tower/norms without unrelated weights or devices.
+    monkeypatch.setattr(runtime, "validate_glm5_config", lambda _: None)
+    monkeypatch.setattr(vision, "is_vit_use_data_parallel", lambda: True)
+    cls = vision.Glm5NextForConditionalGeneration
+    monkeypatch.setattr(cls, "_mark_tower_model", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(cls, "_mark_language_model", lambda *a, **kw: nullcontext())
+    for name in (
+        "MergedColumnParallelLinear",
+        "RowParallelLinear",
+        "ColumnParallelLinear",
+        "QKVParallelLinear",
+        "Conv2dLayer",
+        "Conv3dLayer",
+        "get_rope",
+        "Glm5VisionAttention",
+        "MMEncoderAttention",
+        "init_vllm_registered_model",
+    ):
+        monkeypatch.setattr(vision, name, lambda *a, **kw: torch.nn.Identity())
+    monkeypatch.setattr(vision, "get_vit_attn_backend", lambda **kw: None)
+    with set_current_vllm_config(VllmConfig()):
+        tower = cls(vllm_config=deployment).visual
+    x = torch.tensor([[0.001, -0.002, 0.003, -0.004]])
+    expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+    checkpoint_eps_output = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5)
+    assert not torch.allclose(expected, checkpoint_eps_output)
+    for norm in (tower.blocks[0].norm1, tower.blocks[0].norm2, tower.post_layernorm):
+        torch.testing.assert_close(norm.forward_native(x), expected)
+    for norm in (tower.blocks[0].attn.q_norm, tower.blocks[0].attn.k_norm):
+        torch.testing.assert_close(norm.forward_native(x), checkpoint_eps_output)
+    assert tower.merger.post_projection_norm.eps == 1e-5
+    assert config.vision_config.rms_norm_eps == 1e-5

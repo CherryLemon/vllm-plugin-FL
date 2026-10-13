@@ -6,12 +6,9 @@ from __future__ import annotations
 import importlib
 from functools import lru_cache
 
-from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 _VLLM_NATIVE_EXTENSIONS = ("vllm._C", "vllm._C_stable_libtorch")
-
-logger = init_logger(__name__)
 
 
 def _has_vllm_native_extension() -> bool:

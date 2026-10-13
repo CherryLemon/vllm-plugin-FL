@@ -4,7 +4,7 @@
 import os
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -704,6 +704,223 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         check(outputs)
         selected = patch._portable_binding(op_name).selected_impl
         assert selected == ("glm5.flaggems" if backend == "flagos" else "glm5.cuda")
+
+
+@pytest.mark.parametrize("rows", [0, 96])
+def test_fwht_fake_matches_public_api_without_policy(rows, monkeypatch):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_fl.models.glm5 import compile_ops, indexer_backend
+
+    def resolve(*args, **kwargs):
+        pytest.fail("Fake FWHT resolved policy or executed a kernel")
+
+    monkeypatch.setattr(
+        indexer_backend,
+        "INDEXER_BACKEND",
+        SimpleNamespace(fwht128_quant_fp8=resolve),
+    )
+    with FakeTensorMode():
+        q = torch.empty(rows, 128, dtype=torch.bfloat16)
+        values, scales = compile_ops.fwht128_quant_fp8(q)
+    assert values.shape == (rows, 128) and values.dtype == torch.float8_e4m3fn
+    assert scales.shape == (rows, 1) and scales.dtype == torch.float32
+    assert values.stride() == (128, 1) and scales.stride() == (1, 1)
+    assert values.device == scales.device == q.device
+
+
+def test_fwht_fullgraph_preserves_public_binding_and_mutable_policy(
+    backend, monkeypatch
+):
+    from vllm_fl.models.glm5 import compile_ops, indexer_backend
+
+    calls, graphs = [], []
+
+    def public(q):
+        calls.append(q.clone())
+        return q.to(torch.float8_e4m3fn), torch.full(
+            (q.shape[0], 1), 2.0, dtype=torch.float32, device=q.device
+        )
+
+    monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *a: public)
+    monkeypatch.setattr(indexer_backend, "INDEXER_BACKEND", backend)
+    monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
+
+    def compile_backend(graph, example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(
+        compile_ops.fwht128_quant_fp8,
+        backend=compile_backend,
+        fullgraph=True,
+        dynamic=True,
+    )
+    allowed = SelectionPolicy.from_dict(per_op_order={"fwht128_quant_fp8": ["flagos"]})
+    denied = SelectionPolicy.from_dict(
+        per_op_order={"fwht128_quant_fp8": ["reference"]}
+    )
+    q = torch.arange(384, dtype=torch.bfloat16).reshape(3, 128)
+    with policy_context(allowed):
+        first = compiled(q)
+        q.mul_(0.5)
+        second = compiled(q)
+    with (
+        policy_context(denied),
+        pytest.raises(RuntimeError, match="No implementation selected"),
+    ):
+        compiled(q)
+    with policy_context(allowed):
+        third = compiled(q)
+    assert len(graphs) == 1 and len(calls) == 3
+    for outputs, forwarded in zip((first, second, third), calls):
+        torch.testing.assert_close(
+            outputs[0].float(),
+            forwarded.to(torch.float8_e4m3fn).float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(outputs[1], torch.full((3, 1), 2.0))
+    assert not torch.equal(first[0].float(), second[0].float())
+    assert backend._bindings["fwht128_quant_fp8"].selected_impl == "glm5.flaggems"
+
+
+def test_kda_fullgraph_reads_current_layer_and_request_metadata(monkeypatch):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm.config.compilation import CompilationConfig, CompilationMode
+    from vllm.platforms import current_platform
+
+    if not torch.cuda.is_available():
+        # CPU contract checks have no device capability. Avoid CUDA discovery
+        # performed while importing upstream's optional attention backends.
+        monkeypatch.setattr(
+            type(current_platform),
+            "get_device_capability",
+            classmethod(lambda cls, *a, **k: None),
+        )
+    from vllm.model_executor.layers.mamba.gdn import kimi_gdn_linear_attn as kda
+
+    from vllm_fl.models.glm5.model import Glm5NextLinearAttention
+
+    class Projection(torch.nn.Module):
+        def __init__(self, width):
+            super().__init__()
+            self.width = width
+
+        def forward(self, value):
+            return value[..., : self.width], None
+
+    class OutputNorm(torch.nn.Module):
+        def forward(self, value, gate):
+            return value
+
+    layer = object.__new__(Glm5NextLinearAttention)
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "test.glm5.kda"
+    layer.local_num_heads, layer.head_dim = 2, 2
+    for name in (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "f_a_proj",
+        "f_b_proj",
+        "g_a_proj",
+        "g_b_proj",
+        "o_proj",
+    ):
+        setattr(layer, name, Projection(4))
+    layer.b_proj = Projection(2)
+    layer.o_norm = OutputNorm()
+    events, graphs = [], []
+    context = SimpleNamespace(
+        no_compile_layers={layer.prefix: layer},
+        attn_metadata=SimpleNamespace(state_index=5, num_prefills=1),
+    )
+
+    def host(
+        self, q_proj_states, k_proj_states, v_proj_states, g1, beta, core_attn_out
+    ):
+        metadata = kda.get_forward_context().attn_metadata
+        events.append((self.prefix, metadata.state_index, metadata.num_prefills))
+        core_attn_out.copy_(q_proj_states.view(1, -1, 2, 2) + metadata.state_index)
+
+    layer._forward = MethodType(host, layer)
+    monkeypatch.setattr(kda, "get_forward_context", lambda: context)
+    # Exercise the real registered host ABI on CPU without invoking GPU KDA
+    # kernels. This registration exists only for this contract test's lifetime.
+    cpu_lib = None
+    if not torch._C._dispatch_has_kernel_for_dispatch_key("vllm::kda_attention", "CPU"):
+        cpu_lib = torch.library.Library("vllm", "IMPL")
+        cpu_lib.impl("kda_attention", kda.kda_attention, "CPU")
+
+    def compile_backend(graph, example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compilation = CompilationConfig(mode=CompilationMode.VLLM_COMPILE)
+    compilation.set_splitting_ops_for_v1("naive")
+    assert "vllm::kda_attention" in compilation.splitting_ops
+    with FakeTensorMode():
+        fake_input = torch.empty(3, 4)
+        fake_output = layer(fake_input, torch.empty(3, dtype=torch.int64))
+        assert fake_output.shape == fake_input.shape
+    assert events == []
+    forward = torch.compile(
+        layer, backend=compile_backend, fullgraph=True, dynamic=True
+    )
+    value = torch.arange(12, dtype=torch.float32).view(3, 4)
+    positions = torch.arange(3)
+    first = forward(value, positions)
+    torch.testing.assert_close(first, value + 5)
+    context.attn_metadata = SimpleNamespace(state_index=9, num_prefills=0)
+    # The host must also resolve the current no_compile_layers entry, rather
+    # than a layer instance captured while Dynamo traced the first request.
+    replacement = SimpleNamespace(prefix="replacement.glm5.kda")
+    replacement._forward = MethodType(host, replacement)
+    context.no_compile_layers[layer.prefix] = replacement
+    value.add_(2)
+    second = forward(value, positions)
+    torch.testing.assert_close(second, value + 9)
+    assert events == [(layer.prefix, 5, 1), (replacement.prefix, 9, 0)]
+    assert len(graphs) == 1
+    del cpu_lib
+
+
+@pytest.mark.gpu
+def test_fwht_public_abi_survives_compile_and_graph_replay():
+    from flaggems_vllm import fwht128_quant_fp8 as public_fwht
+
+    from vllm_fl.models.glm5 import compile_ops
+
+    q = torch.randn(96, 128, device="cuda", dtype=torch.bfloat16)
+    original = q.clone()
+
+    def check(outputs):
+        for actual, expected in zip(outputs, public_fwht(q)):
+            assert actual.shape == expected.shape and actual.dtype == expected.dtype
+            assert actual.stride() == expected.stride()
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+
+    with policy_context(
+        SelectionPolicy.from_dict(per_op_order={"fwht128_quant_fp8": ["flagos"]})
+    ):
+        compiled = torch.compile(
+            compile_ops.fwht128_quant_fp8, fullgraph=True, dynamic=True
+        )
+        check(compiled(q))
+        for _ in range(3):
+            compiled(q)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = compiled(q)
+        torch.testing.assert_close(q, original, rtol=0, atol=0)
+        q.mul_(0.5)
+        outputs[0].view(torch.uint8).fill_(127)
+        outputs[1].fill_(torch.nan)
+        graph.replay()
+        check(outputs)
 
 
 @pytest.mark.parametrize("name", ["pack_seq", "unpack_seq"])

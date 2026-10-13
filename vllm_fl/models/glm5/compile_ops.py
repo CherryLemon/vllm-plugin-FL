@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opaque GLM mHC/activation boundaries around the common policy binding.
+"""Opaque GLM numerical boundaries around the common policy binding.
 
 The selected numerical APIs allocate fresh outputs. Fake implementations
 describe their dense GLM ABI without resolving policy or optional backends.
@@ -107,6 +107,12 @@ def _clamp(
     return _binding("silu_and_mul_with_clamp")(state, x)
 
 
+def _fwht128_quant_fp8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm_fl.models.glm5.indexer_backend import INDEXER_BACKEND
+
+    return INDEXER_BACKEND.fwht128_quant_fp8(q)
+
+
 def _pre_outputs(residual):
     outer = residual.shape[:-2]
     streams, hidden = residual.shape[-2:]
@@ -163,11 +169,19 @@ def _clamp_fake(x, swiglu_limit, alpha, beta):
     return x.new_empty((*x.shape[:-1], x.shape[-1] // 2))
 
 
+def _fwht128_quant_fp8_fake(q):
+    return (
+        q.new_empty(q.shape, dtype=torch.float8_e4m3fn),
+        q.new_empty((q.shape[0], 1), dtype=torch.float32),
+    )
+
+
 for _name, _host, _fake in (
     ("glm5_mhc_pre", _mhc_pre, _mhc_pre_fake),
     ("glm5_mhc_post", _mhc_post, _mhc_post_fake),
     ("glm5_mhc_fused_post_pre", _mhc_fused_post_pre, _mhc_fused_post_pre_fake),
     ("glm5_silu_and_mul_with_clamp", _clamp, _clamp_fake),
+    ("glm5_fwht128_quant_fp8", _fwht128_quant_fp8, _fwht128_quant_fp8_fake),
 ):
     direct_register_custom_op(
         op_name=_name,
@@ -194,3 +208,7 @@ def forward_clamp(self, x):
     return torch.ops.vllm.glm5_silu_and_mul_with_clamp(
         x, self.swiglu_limit, self.alpha, self.beta
     )
+
+
+def fwht128_quant_fp8(q):
+    return torch.ops.vllm.glm5_fwht128_quant_fp8(q)

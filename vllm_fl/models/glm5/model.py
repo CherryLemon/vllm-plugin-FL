@@ -88,6 +88,7 @@ else:
     mhc_pre_broadcast_tilelang = None
 
 from vllm_fl.models.glm5 import causal_conv as conv_ops
+from vllm_fl.models.glm5.compile_ops import fwht128_quant_fp8
 from vllm_fl.models.glm5.safe_kda import (
     chunk_kda_with_safe_gate,
     fused_recurrent_kda,
@@ -348,16 +349,11 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        # Keep the metadata-dependent KDA body visible to the breakable-CG
-        # decorator. Routing through torch.ops.vllm.kda_attention makes the
-        # custom op opaque and can freeze capture-time state indices/branches.
-        self._forward(
-            q_proj_states=q,
-            k_proj_states=k,
-            v_proj_states=v,
-            g1=g1,
-            beta=beta,
-            core_attn_out=core_attn_out,
+        # vLLM's existing KDA op reads current request metadata at its eager
+        # attention boundary. Keep that body and common policy outside Dynamo;
+        # PIECEWISE compilation already splits at vllm::kda_attention.
+        torch.ops.vllm.kda_attention(
+            q, k, v, g1, beta, core_attn_out, self.prefix
         )
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
@@ -575,7 +571,7 @@ def _indexer_forward_nope(
     assert self.head_dim == 128 and self.quant_block_size == 128
     assert self.scale_fmt == "ue8m0"
     q = q.view(-1, self.head_dim)
-    q_fp8, q_scale = INDEXER_BACKEND.fwht128_quant_fp8(q)
+    q_fp8, q_scale = fwht128_quant_fp8(q)
     q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
     q_scale = q_scale.view(-1, self.n_head, 1)
     weights = (

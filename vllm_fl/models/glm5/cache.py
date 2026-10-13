@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import inspect
-import logging
 import math
 import sys
 from copy import copy
@@ -19,8 +18,6 @@ from vllm_fl.models.glm5.kpool import (
     KpoolTailSpec,
     glm5_indexer_page_alignment,
 )
-
-logger = logging.getLogger(__name__)
 
 # Worker-side kpool patches.  These run when the model runner builds attention
 # metadata and the KV-block zeroer, i.e. after model construction, so they are

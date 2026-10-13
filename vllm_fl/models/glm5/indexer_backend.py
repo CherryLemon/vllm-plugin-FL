@@ -62,6 +62,8 @@ class Glm5NextIndexerBackend:
                     if callable(candidate):
                         fn = candidate
                 except (ImportError, AttributeError, OSError):
+                    # Optional ABI discovery precedes execution; leave the
+                    # missing candidate unset for common-policy preflight.
                     pass
             self._native_ops[key] = fn
         return self._native_ops[key]

@@ -65,9 +65,13 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_fl.models.glm5.model import SiluAndMulWithClamp
 from vllm_fl.models.glm5.provider import use_nvidia_reference
 from vllm_fl.models.glm5.vision_attention import Glm5VisionAttention
-from vllm_fl.models.glm5.model import SiluAndMulWithClamp
+
+_VISION_RMS_NORM_EPS = 1e-6
+# GLM-5.3-Flash was trained with 1e-6 despite its checkpoint declaring 1e-5.
+# Match the block/post norms in vLLM v0.31.0's GLM5Next vision config.
 
 
 class Glm5NextVisionPatchEmbed(nn.Module):
@@ -374,7 +378,7 @@ class Glm5NextVisionTransformer(nn.Module):
         # uses vision_config.projection_intermediate_size for the merger, not
         # text_config.intermediate_size like GLM-OCR does.)
         vision_config,
-        norm_eps: float = 1e-6,
+        norm_eps: float = _VISION_RMS_NORM_EPS,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -451,9 +455,7 @@ class Glm5NextVisionTransformer(nn.Module):
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
         )
-        self.post_layernorm = RMSNorm(
-            vision_config.hidden_size, eps=vision_config.rms_norm_eps
-        )
+        self.post_layernorm = RMSNorm(vision_config.hidden_size, eps=norm_eps)
 
         self.attn_backend = (
             get_vit_attn_backend(head_size=head_dim, dtype=torch.get_default_dtype())
@@ -1063,7 +1065,7 @@ class Glm5NextForConditionalGeneration(
             self.visual = Glm5NextVisionTransformer(
                 config.text_config,
                 config.vision_config,
-                norm_eps=config.vision_config.rms_norm_eps,
+                norm_eps=_VISION_RMS_NORM_EPS,
                 # The vision checkpoint is BF16 even when the language model
                 # comes from the separately published FP8 directory.
                 quant_config=None,
