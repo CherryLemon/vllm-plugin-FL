@@ -12,9 +12,8 @@ from vllm.platforms import current_platform
 
 @pytest.mark.skipif(
     not current_platform.is_cuda()
-    and not current_platform.is_rocm()
     and getattr(current_platform, "vendor_name", None) != "kunlunxin",
-    reason="Graph memory profiling is enabled only on CUDA, ROCm and Kunlunxin",
+    reason="Graph memory profiling is enabled only on CUDA and Kunlunxin",
 )
 @pytest.mark.parametrize("private", [False, True])
 @pytest.mark.parametrize("fail_capture", [False, True])
@@ -120,9 +119,6 @@ def test_graph_memory_preserves_pool_policy_and_cleans_up(
         ("kunlunxin", CUDAGraphMode.FULL_AND_PIECEWISE, False, 0, True),
         ("kunlunxin", CUDAGraphMode.FULL_AND_PIECEWISE, True, 123, False),
         ("nvidia", CUDAGraphMode.FULL_AND_PIECEWISE, True, 0, True),
-        ("rocm", CUDAGraphMode.FULL_AND_PIECEWISE, True, 0, True),
-        ("rocm", CUDAGraphMode.NONE, True, 0, False),
-        ("rocm", CUDAGraphMode.FULL_DECODE_ONLY, True, 123, False),
         ("musa", CUDAGraphMode.FULL_AND_PIECEWISE, True, 0, False),
     ],
 )
@@ -135,7 +131,6 @@ def test_worker_reserves_graph_budget(
         vendor_name=vendor,
         device_type="cuda" if vendor != "musa" else "musa",
         is_cuda=lambda: vendor == "nvidia",
-        is_rocm=lambda: vendor == "rocm",
         empty_cache=lambda: None,
         torch_device_fn=SimpleNamespace(
             reset_peak_memory_stats=lambda: None,

@@ -273,7 +273,6 @@ from vllm.v1.worker.utils import (
 )
 
 # FL-specific imports
-from vllm_fl.worker.ple_token_history import PLETokenHistory
 from vllm_fl.compat.kv_cache import bind_kv_cache
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch import prewarm_cached_ops
@@ -285,10 +284,10 @@ from vllm_fl.dispatch.io_dumper import (
 )
 from vllm_fl.worker.common_attention_metadata import (
     CommonAttentionMetadataGraphRunner,
-    PreparedMetadata,
+    common_attention_metadata_enabled,
     compute_common_attention_metadata,
-    resolve_metadata_policy,
 )
+from vllm_fl.worker.model_state import ModelRunnerState
 
 GraphWrapper = GraphWrapper
 
@@ -491,10 +490,6 @@ class ExecuteModelState(NamedTuple):
 class ModelRunnerFL(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
-    # PLE history is updated from resolved GPU input_ids, including async
-    # sampled tokens, rather than InputBatch's CPU output placeholders.
-    ple_ngram_context_source = "gpu"
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -558,25 +553,7 @@ class ModelRunnerFL(
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
-
-        # Qwen3.8-Flash-Next PLE consumes the raw token history preceding each
-        # scheduled chunk. Keep this in the plugin-owned v0.24 runner so the
-        # installed vLLM tree remains unmodified.
-        ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
-        self.uses_ngram_embedding = bool(ple_layer_ids)
-        if self.uses_ngram_embedding:
-            self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
-            self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)
-        else:
-            self.ngram_context_len = 0
-            self.ngram_eos_token_id = 0
-        if self.uses_ngram_embedding and self.ngram_context_len <= 0:
-            raise ValueError("N-gram embedding requires context length >= 1.")
-        if self.uses_ngram_embedding and len(get_pp_group().ranks) > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1."
-            )
+        self.model_state = ModelRunnerState(self)
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
@@ -819,19 +796,9 @@ class ModelRunnerFL(
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
-        self.common_metadata_policy = resolve_metadata_policy(
-            use_ubatching=self.parallel_config.use_ubatching,
-            async_spec_decode=self.use_async_spec_decode,
-        )
-        logger.info(
-            "Common metadata: requested=%s mode=%s reason=%s",
-            self.common_metadata_policy.requested,
-            self.common_metadata_policy.mode,
-            self.common_metadata_policy.reason,
-        )
         self.common_attention_metadata_graph = (
             CommonAttentionMetadataGraphRunner()
-            if self.common_metadata_policy.mode != "stock"
+            if common_attention_metadata_enabled()
             else None
         )
         self.seq_lens = torch.zeros(
@@ -864,21 +831,6 @@ class ModelRunnerFL(
         self.inputs_embeds = self._make_buffer(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
-        if self.uses_ngram_embedding:
-            self.ngram_context = self._make_buffer(
-                self.max_num_reqs,
-                self.ngram_context_len,
-                dtype=torch.int32,
-            )
-            self.ple_token_history = PLETokenHistory(
-                self.max_num_reqs,
-                self.max_model_len,
-                self.max_num_tokens,
-                self.ngram_context_len,
-                self.ngram_eos_token_id,
-                self.device,
-                self.pin_memory,
-            )
         self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
         self.discard_request_mask = self._make_buffer(
             self.max_num_reqs, dtype=torch.bool
@@ -1260,9 +1212,7 @@ class ModelRunnerFL(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Invalidate even when a finished id is re-submitted in this step.
-        if self.uses_ngram_embedding:
-            self.ple_token_history.forget(scheduler_output.finished_req_ids)
+        self.model_state.remove_requests(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1567,10 +1517,7 @@ class ModelRunnerFL(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
-            if self.uses_ngram_embedding:
-                # Resumes and streaming prompt replacements have authoritative
-                # CPU history restored above, and may reuse the same request id.
-                self.ple_token_history.forget((request.req_id,))
+            self.model_state.remove_requests((request.req_id,))
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -2364,7 +2311,7 @@ class ModelRunnerFL(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-        prepared_metadata: PreparedMetadata | None = None,
+        block_table_rows_are_current: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2376,11 +2323,6 @@ class ModelRunnerFL(
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
-
-        if prepared_metadata is not None:
-            prepared_metadata.validate(
-                self.input_batch.block_table, num_reqs_padded, num_tokens_padded
-            )
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -2409,7 +2351,7 @@ class ModelRunnerFL(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
 
-            if prepared_metadata is None:
+            if not block_table_rows_are_current:
                 # Fill unused block table entries with NULL_BLOCK_ID (null
                 # block) for graph padding. Block 0 is reserved for padding.
                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
@@ -2486,8 +2428,7 @@ class ModelRunnerFL(
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             _num_computed_tokens_cache=(
                 self.num_computed_tokens[:num_reqs_padded]
-                if prepared_metadata is not None
-                else None
+                if self.common_attention_metadata_graph is not None else None
             ),
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_reqs=num_reqs_padded,
@@ -3591,67 +3532,6 @@ class ModelRunnerFL(
         inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
         return input_ids, inputs_embeds
 
-    def _prepare_ngram_context(
-        self,
-        num_reqs: int,
-        num_reqs_padded: int,
-    ) -> torch.Tensor:
-        """Build the left context for every real or CUDA-graph padding row."""
-        if not self.uses_ngram_embedding:
-            raise RuntimeError("N-gram context requested for non-ngram model.")
-        num_tokens = int(self.query_start_loc.np[num_reqs])
-        return self.ple_token_history.prepare(
-            req_ids=self.input_batch.req_ids[:num_reqs],
-            num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
-            num_scheduled_tokens=self.num_scheduled_tokens.np[:num_reqs],
-            token_ids_cpu=self.input_batch.token_ids_cpu_tensor,
-            is_token_ids=(
-                self.input_batch.is_token_ids if self.enable_prompt_embeds else None
-            ),
-            req_indices=self.req_indices.np[:num_tokens],
-            query_positions=self.query_pos.np[:num_tokens],
-            input_ids=self.input_ids.gpu[:num_tokens],
-            context=self.ngram_context.gpu[:num_reqs_padded],
-        )
-
-    def _maybe_add_ngram_kwargs(
-        self,
-        model_kwargs: dict[str, Any],
-        *,
-        num_reqs: int,
-        num_reqs_padded: int,
-        is_first_rank: bool,
-        is_encoder_decoder: bool,
-        use_dummy_context: bool,
-        query_start_loc: torch.Tensor | None = None,
-        num_scheduled_tokens: np.ndarray | None = None,
-    ) -> None:
-        if not self.uses_ngram_embedding or not is_first_rank or is_encoder_decoder:
-            return
-
-        eos_token_id = int(self.ngram_eos_token_id)
-        if query_start_loc is None:
-            if num_scheduled_tokens is None:
-                raise RuntimeError("query_start_loc is required for N-gram input.")
-            cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=np.int32)
-            last = int(cu_num_tokens[-1]) if num_reqs > 0 else 0
-            self.query_start_loc.np[0] = 0
-            if num_reqs > 0:
-                self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
-            self.query_start_loc.np[num_reqs + 1 :].fill(last)
-            self.query_start_loc.copy_to_gpu()
-            query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
-        model_kwargs["query_start_loc"] = query_start_loc
-
-        if use_dummy_context:
-            self.ngram_context.np[:num_reqs_padded].fill(eos_token_id)
-            self.ngram_context.copy_to_gpu(num_reqs_padded)
-            model_kwargs["ngram_context"] = self.ngram_context.gpu[:num_reqs_padded]
-        else:
-            model_kwargs["ngram_context"] = self._prepare_ngram_context(
-                num_reqs, num_reqs_padded
-            )
-
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3762,24 +3642,8 @@ class ModelRunnerFL(
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
 
-        if (
-            self.uses_ngram_embedding
-            and is_first_rank
-            and not is_encoder_decoder
-            and input_ids is None
-        ):
-            raise RuntimeError(
-                "N-gram PLE requires token ids on the first pipeline rank; "
-                "inputs_embeds-only batches are not supported."
-            )
-        self._maybe_add_ngram_kwargs(
-            model_kwargs,
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            is_first_rank=is_first_rank,
-            is_encoder_decoder=is_encoder_decoder,
-            use_dummy_context=False,
-            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+        model_kwargs.update(
+            self.model_state.prepare_inputs(num_reqs, num_reqs_padded, input_ids)
         )
 
         if self.uses_mrope:
@@ -4213,9 +4077,9 @@ class ModelRunnerFL(
         cudagraph_mode: CUDAGraphMode,
         *,
         capture: bool = False,
-    ) -> PreparedMetadata | None:
+    ) -> bool:
         if self.common_attention_metadata_graph is None:
-            return None
+            return False
         # PIECEWISE descriptors pad tokens, not requests. A fixed request
         # extent covers mixed batches whose request counts never occur in the
         # token-size capture list. query_start_loc/seq_lens have padded tails.
@@ -4225,8 +4089,7 @@ class ModelRunnerFL(
         # graph also benefits piecewise execution; ubatching retains eager
         # generation because its metadata is sliced per microbatch.
         use_graph = (
-            self.common_metadata_policy.mode == "graph"
-            and cudagraph_mode != CUDAGraphMode.NONE
+            cudagraph_mode != CUDAGraphMode.NONE
             and not self.parallel_config.use_ubatching
         )
         return self.common_attention_metadata_graph.run(
@@ -4247,7 +4110,7 @@ class ModelRunnerFL(
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
-        prepared_metadata: PreparedMetadata | None = None,
+        slot_mapping_is_current: bool = False,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -4273,11 +4136,6 @@ class ModelRunnerFL(
         ):
             return None, None
 
-        if prepared_metadata is not None:
-            prepared_metadata.validate(
-                self.input_batch.block_table, num_reqs_padded, num_tokens_padded
-            )
-
         def _get_slot_mapping(kv_cache_gid: int):
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = self.kv_cache_config.kv_cache_groups[
@@ -4293,7 +4151,7 @@ class ModelRunnerFL(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
 
-            if prepared_metadata is None:
+            if not slot_mapping_is_current:
                 # Fill unused with -1. Needed for reshape_and_cache in full
                 # graph mode. `blk_table_tensor` -1 matches mamba PAD_SLOT_ID.
                 slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
@@ -4532,9 +4390,7 @@ class ModelRunnerFL(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            prepared_metadata = self._run_common_attention_metadata(
-                num_reqs_padded, cudagraph_mode
-            )
+            self._run_common_attention_metadata(num_reqs_padded, cudagraph_mode)
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -4544,7 +4400,7 @@ class ModelRunnerFL(
                 ),
                 num_tokens_unpadded=num_tokens_unpadded,
                 ubatch_slices=ubatch_slices_padded,
-                prepared_metadata=prepared_metadata,
+                slot_mapping_is_current=self.common_attention_metadata_graph is not None,
             )
 
             attn_metadata, spec_decode_common_attn_metadata = (
@@ -4560,7 +4416,7 @@ class ModelRunnerFL(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
-                    prepared_metadata=prepared_metadata,
+                    block_table_rows_are_current=self.common_attention_metadata_graph is not None,
                 )
             )
 
@@ -5469,6 +5325,9 @@ class ModelRunnerFL(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                get_state_cls = getattr(self.model, "get_legacy_model_state_cls", None)
+                if get_state_cls is not None:
+                    self.model_state = get_state_cls()(self)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -6131,12 +5990,19 @@ class ModelRunnerFL(
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
+        slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            num_tokens_unpadded=num_tokens_unpadded,
+            ubatch_slices=ubatch_slices_padded,
+            slot_mapping_is_current=self.common_attention_metadata_graph is not None,
+        )
+
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
         # etc.) with execute_model.  It must participate in the same event
         # protocol so that back-to-back dummy/real steps don't overwrite
         # pinned memory while a prior non_blocking H2D DMA is still reading.
         with self.synchronize_input_prep():
-            prepared_metadata = None
             build_attention = (
                 force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
             )
@@ -6174,19 +6040,11 @@ class ModelRunnerFL(
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
-                prepared_metadata = self._run_common_attention_metadata(
+                self._run_common_attention_metadata(
                     num_reqs_padded,
                     cudagraph_runtime_mode,
                     capture=is_graph_capturing,
                 )
-
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded,
-                num_reqs_padded=num_reqs_padded,
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
-                prepared_metadata=prepared_metadata,
-            )
 
             if build_attention:
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -6199,7 +6057,7 @@ class ModelRunnerFL(
                     for_cudagraph_capture=is_graph_capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
-                    prepared_metadata=prepared_metadata,
+                    block_table_rows_are_current=self.common_attention_metadata_graph is not None,
                 )
 
             # Dummy forwards must not update real KV-cache slots. Capture the
@@ -6235,14 +6093,10 @@ class ModelRunnerFL(
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
-            self._maybe_add_ngram_kwargs(
-                model_kwargs,
-                num_reqs=num_reqs,
-                num_reqs_padded=num_reqs_padded,
-                is_first_rank=get_pp_group().is_first_rank,
-                is_encoder_decoder=self.model_config.is_encoder_decoder,
-                use_dummy_context=True,
-                num_scheduled_tokens=num_scheduled_tokens,
+            model_kwargs.update(
+                self.model_state.prepare_dummy_inputs(
+                    num_reqs, num_reqs_padded, num_scheduled_tokens
+                )
             )
 
             if self.uses_mrope:
@@ -7362,17 +7216,6 @@ class ModelRunnerFL(
             is_profiling=is_profiling,
         )
 
-        if (
-            self.common_metadata_policy.mode != "stock"
-            and cudagraph_mode == CUDAGraphMode.FULL
-        ):
-            logger.warning_once(
-                "Common metadata with mixed FULL model graphs is experimental: "
-                "request-reuse numerical acceptance has not passed. "
-                "Validated modes are FULL_DECODE_ONLY and PIECEWISE. "
-                "Stock metadata does not repair the mixed FULL model-graph issue."
-            )
-
         # Trigger cudagraph dispatching keys initialization after
         # resolved cudagraph mode.
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
@@ -7450,12 +7293,8 @@ class ModelRunnerFL(
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
         ):
-            # Retire metadata graphs before replacing their input buffers.
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
-            _accelerator_synchronize()
-            if self.common_attention_metadata_graph is not None:
-                self.common_attention_metadata_graph.clear()
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -7722,7 +7561,6 @@ class ModelRunnerFL(
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        # Bind owner views only when the upstream helper omits that hook.
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )

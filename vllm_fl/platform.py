@@ -140,7 +140,7 @@ class PlatformFL(Platform):
         return self.vendor_name in ("amd", "hygon")
 
     def is_cuda(self) -> bool:
-        """Return whether this is the NVIDIA CUDA platform."""
+        """Stateless version of [torch.cuda.is_available][]."""
         return self.device_type == "cuda" and self.vendor_name == "nvidia"
 
     @classmethod

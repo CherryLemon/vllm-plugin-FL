@@ -9,7 +9,7 @@ without modifying either the checkpoint or the installed vLLM package.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
 
@@ -19,21 +19,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def ple_ngram_context_uses_cpu_history() -> bool:
-    """Whether the runner selected for this plugin builds PLE history on CPU.
-
-    The restriction is tied to the runner that is actually selected rather
-    than to the presence of ``gpu/model_state.py``: only a runner that
-    declares GPU token history can serve the n-gram embedding with
-    asynchronous scheduling.
-    """
-
-    from vllm_fl.worker.model_runner import ModelRunnerFL
-
-    return getattr(ModelRunnerFL, "ple_ngram_context_source", "cpu") == "cpu"
-
-
-def _strip_mrope(model_config: "ModelConfig") -> None:
+def _strip_mrope(model_config: ModelConfig) -> None:
     configs = {
         id(config): config
         for config in (
@@ -55,7 +41,30 @@ class Qwen3_8FlashNextForConditionalGenerationConfig(
     """Apply the hybrid-cache and unsupported-feature contract."""
 
     @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+    def get_flag_gems_blacklist(*, vendor_name: str | None) -> list[str]:
+        if vendor_name != "nvidia":
+            return []
+        # Keep history gather and QSA selection native. The generic
+        # repeat-interleave path synchronizes to infer output_size; dense
+        # GEMM and stable sorting also regress on the measured H100 workload.
+        return [
+            "index_select",
+            "repeat_interleave_tensor",
+            "repeat_interleave_self_tensor",
+            "linear",
+            "mm",
+            "mm_out",
+            "addmm",
+            "addmm_out",
+            "addmm_",
+            "addmm_dtype",
+            "addmm_dtype_out",
+            "sort",
+            "sort_stable",
+        ]
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: VllmConfig) -> None:
         Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
         text_config = vllm_config.model_config.hf_text_config
         cache_config = vllm_config.cache_config
@@ -91,30 +100,14 @@ class Qwen3_8FlashNextForConditionalGenerationConfig(
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or "
                 "microbatching in the Day0 path"
             )
-        if bool(text_config.ple_layer_ids) and parallel_config.pipeline_parallel_size > 1:
+        if (
+            bool(text_config.ple_layer_ids)
+            and parallel_config.pipeline_parallel_size > 1
+        ):
             raise NotImplementedError(
                 "Qwen4Exp PLE requires pipeline_parallel_size=1 because raw "
                 "token n-gram context is not broadcast between PP stages"
             )
-
-        if bool(text_config.ple_layer_ids) and ple_ngram_context_uses_cpu_history():
-            scheduler_config = vllm_config.scheduler_config
-            async_scheduling = scheduler_config.async_scheduling
-            if async_scheduling is None:
-                # vLLM resolves ``None`` later than this hook, so the default
-                # must be pinned here; otherwise an auto-enabled asynchronous
-                # scheduler would read a stale CPU token history.
-                scheduler_config.async_scheduling = False
-                logger.info(
-                    "Qwen4Exp PLE builds its n-gram token history on the CPU; "
-                    "asynchronous scheduling is disabled for this run."
-                )
-            elif async_scheduling:
-                raise NotImplementedError(
-                    "Qwen4Exp PLE requires a synchronous token history for its "
-                    "n-gram embedding; start the server with "
-                    "--no-async-scheduling."
-                )
 
         multimodal_config = vllm_config.model_config.multimodal_config
         if multimodal_config is not None and multimodal_config.language_model_only:
@@ -128,11 +121,9 @@ class Qwen3_8FlashNextForConditionalGenerationConfig(
             )
 
 
-class Qwen3_8FlashNextForCausalLMConfig(
-    Qwen3_8FlashNextForConditionalGenerationConfig
-):
+class Qwen3_8FlashNextForCausalLMConfig(Qwen3_8FlashNextForConditionalGenerationConfig):
     @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+    def verify_and_update_config(vllm_config: VllmConfig) -> None:
         Qwen3_8FlashNextForConditionalGenerationConfig.verify_and_update_config(
             vllm_config
         )
@@ -162,192 +153,11 @@ _ARCHITECTURES = {
     ),
 }
 
-# vLLM 0.24 may expose either the nested text config or the outer multimodal
-# config through ``hf_text_config`` while the platform policy is installed.
-_TEXT_MODEL_TYPES = {
-    "qwen3_8_flash_next",
-    "qwen3_8_flash_next_text",
-    "qwen4_exp",
-    "qwen4_exp_text",
-}
-_MODEL_ARCHITECTURES = {
-    "Qwen3_8FlashNextForCausalLM",
-    "Qwen3_8FlashNextForConditionalGeneration",
-    "Qwen4ExpForCausalLM",
-    "Qwen4ExpForConditionalGeneration",
-}
-
-
-def needs_native_index_select(vllm_config: "VllmConfig") -> bool:
-    """Return whether FlagGems PLE state row I/O must be disabled.
-
-    FlagGems 5.3/5.4 materializes a contiguous copy of non-contiguous inputs.
-    Qwen3.8-Flash-Next exposes its multi-gigabyte PLE state cache as a
-    transposed view.  FlagGems index_select is slower than native ATen and can
-    OOM.  This check is deliberately model-scoped.
-    """
-
-    model_config = vllm_config.model_config
-    text_config = model_config.hf_text_config
-    if getattr(text_config, "model_type", None) in _TEXT_MODEL_TYPES:
-        return True
-    hf_config = getattr(model_config, "hf_config", None)
-    if getattr(hf_config, "model_type", None) in _TEXT_MODEL_TYPES:
-        return True
-    architectures = (
-        getattr(model_config, "architectures", None)
-        or getattr(hf_config, "architectures", None)
-        or ()
-    )
-    return any(name in _MODEL_ARCHITECTURES for name in architectures)
-
-
-def apply_native_index_select_policy(
-    vllm_config: "VllmConfig",
-    whitelist: Optional[list[str]],
-    blacklist: Optional[list[str]],
-    *,
-    vendor_name: Optional[str] = None,
-) -> tuple[Optional[list[str]], Optional[list[str]]]:
-    """Merge model-scoped native-op exclusions.
-
-    Append to the existing FlagGems blacklist rather than changing platform
-    defaults for unrelated models. Explicit whitelists are validated separately
-    because FlagGems gives them precedence over the blacklist.
-
-    The convolution and padding entries are included because the
-    FlagGems 5.3/5.4 PLE profile-run path either overflows the padding launch
-    grid or faults while autotuning Conv2d at c=64 with a 16K dummy token
-    batch. Each accelerator's PyTorch backend supplies the safe fallback.
-
-    On NVIDIA only, keep decode ``repeat_interleave`` and dense ``linear`` on
-    native ATen.  The generic FlagGems repeat-interleave implementation drops
-    vLLM's host-known ``output_size`` and performs ``cumsum[-1].item()``, which
-    introduces one stream synchronization per GDN layer.  Matched H100 nsys
-    also shows the generic FlagGems linear path at roughly 3x the native dense
-    GEMM time.  Keep the two stable QSA selection sorts native as well: the
-    measured FlagGems radix-sort path launches 68 kernels per QSA layer and
-    consumes about 5.44 ms per H100 decode step across the 12 QSA layers.
-    Native sorting preserves score ties and canonical logical-index order.
-    Other accelerator vendors retain their FlagGems paths until they have
-    vendor-specific measurements; this is a performance policy, not a CUDA-only
-    model requirement.
-    """
-
-    if not needs_native_index_select(vllm_config):
-        return whitelist, blacklist
-    required_native_ops = [
-        "index_select",
-        "conv1d",
-        "_conv_depthwise2d",
-        "conv2d",
-        "pad",
-        "constant_pad_nd",
-    ]
-    if vendor_name == "nvidia":
-        # FlagGems ``unused`` entries are implementation function names, not
-        # ATen overload names (for example, not repeat_interleave.self_Tensor).
-        required_native_ops.extend(
-            (
-                "repeat_interleave_tensor",
-                "repeat_interleave_self_tensor",
-                # aten::linear is CompositeImplicitAutograd.  Once its direct
-                # FlagGems implementation is disabled it decomposes to mm or
-                # addmm, so those leaf implementations must stay native too.
-                "linear",
-                "mm",
-                "mm_out",
-                "addmm",
-                "addmm_out",
-                "addmm_",
-                "addmm_dtype",
-                "addmm_dtype_out",
-                # Implementation names for aten::sort and aten::sort.stable.
-                # Do not replace stable selection with unordered top-k.
-                "sort",
-                "sort_stable",
-            )
-        )
-    if whitelist:
-        conflicts = [op_name for op_name in required_native_ops if op_name in whitelist]
-        if conflicts:
-            raise ValueError(
-                "Qwen3.8-Flash-Next requires native PLE runtime primitives; "
-                "remove these operators from the FlagGems whitelist: "
-                + ", ".join(conflicts)
-            )
-        return whitelist, blacklist
-    merged = list(blacklist or [])
-    for op_name in required_native_ops:
-        if op_name not in merged:
-            merged.append(op_name)
-    return whitelist, merged
-
-
-def should_skip_generic_flaggems_aten(
-    vllm_config: "VllmConfig",
-    *,
-    vendor_name: Optional[str],
-    whitelist: Optional[list[str]],
-) -> bool:
-    """Keep generic NVIDIA ATen native while retaining explicit FlagOS ops.
-
-    Matched H100 c=64 profiling found that QSA metadata preparation spent 47%
-    of rank-0 GIL samples in FlagGems Python pointwise dispatch and shape
-    heuristics. Explicit fused/OOT QSA, HC and MoE kernels are registered by a
-    separate path and remain enabled. Other accelerators keep FlagGems because
-    their native PyTorch backends may not offer an equivalent fast path. An
-    explicit whitelist remains a user override.
-    """
-
-    return (
-        vendor_name == "nvidia"
-        and whitelist is None
-        and needs_native_index_select(vllm_config)
-    )
-
-
-def _qwen3_8_flash_next_flag_gems_policy(
-    vllm_config: "VllmConfig",
-    whitelist: Optional[list[str]],
-    blacklist: Optional[list[str]],
-    *,
-    vendor_name: Optional[str] = None,
-):
-    """Generic-factory adapter for the model-scoped Qwen FlagGems policy.
-
-    Registered with :mod:`vllm_fl.flaggems_policy` so the worker never imports
-    this module directly.  Returns ``None`` for any other model.
-    """
-    from vllm_fl.flaggems_policy import FlagGemsModelPolicy
-
-    if not needs_native_index_select(vllm_config):
-        return None
-    whitelist, blacklist = apply_native_index_select_policy(
-        vllm_config, whitelist, blacklist, vendor_name=vendor_name
-    )
-    skip_generic_aten = should_skip_generic_flaggems_aten(
-        vllm_config, vendor_name=vendor_name, whitelist=whitelist
-    )
-    messages: list[str] = []
-    if not whitelist:
-        messages.append("[Qwen3.8-Flash-Next] Using native PLE runtime primitives")
-    if skip_generic_aten:
-        messages.append(
-            "[Qwen3.8-Flash-Next] NVIDIA keeps native ATen for generic "
-            "tensor operations; explicit FlagOS/OOT kernels remain enabled"
-        )
-    return FlagGemsModelPolicy(
-        whitelist=whitelist,
-        blacklist=blacklist,
-        skip_generic_aten=skip_generic_aten,
-        log_messages=tuple(messages),
-    )
-
 
 def _patch_common_attention_token_to_req_cache() -> None:
     """Backport vLLM's shared per-token request-index cache to v0.24."""
     import torch
+
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     if hasattr(CommonAttentionMetadata, "token_to_req_indices"):
@@ -366,9 +176,7 @@ def _patch_common_attention_token_to_req_cache() -> None:
         query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
         assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
         mapping = torch.repeat_interleave(
-            torch.arange(
-                query_lens.shape[0], dtype=torch.int32, device=buffer.device
-            ),
+            torch.arange(query_lens.shape[0], dtype=torch.int32, device=buffer.device),
             query_lens,
             output_size=num_mapped_tokens,
         )
@@ -379,7 +187,7 @@ def _patch_common_attention_token_to_req_cache() -> None:
         self._token_to_req_indices_cache = cached
         return cached[:num_tokens]
 
-    setattr(CommonAttentionMetadata, "token_to_req_indices", token_to_req_indices)
+    CommonAttentionMetadata.token_to_req_indices = token_to_req_indices
 
 
 def _patch_ple_metadata_bridge() -> None:
@@ -423,8 +231,10 @@ def _register_compilation_boundaries() -> None:
 
 def apply_qwen3_8_flash_next_patches() -> bool:
     """Install idempotent config, model and v0.24 metadata registrations."""
-    from vllm.model_executor.models import config as model_config
-    from vllm.model_executor.models import registry as model_registry
+    from vllm.model_executor.models import (
+        config as model_config,
+        registry as model_registry,
+    )
     from vllm.transformers_utils import config as transformers_config
 
     from vllm_fl.models.qwen3_8_flash_next.config import (
@@ -457,10 +267,6 @@ def apply_qwen3_8_flash_next_patches() -> bool:
             architecture, f"{module}:{class_name}"
         )
 
-    from vllm_fl.flaggems_policy import register_flag_gems_policy_provider
-
-    register_flag_gems_policy_provider(_qwen3_8_flash_next_flag_gems_policy)
-
     _patch_common_attention_token_to_req_cache()
     _patch_ple_metadata_bridge()
     _register_compilation_boundaries()
@@ -471,8 +277,5 @@ def apply_qwen3_8_flash_next_patches() -> bool:
 __all__ = [
     "Qwen3_8FlashNextForCausalLMConfig",
     "Qwen3_8FlashNextForConditionalGenerationConfig",
-    "apply_native_index_select_policy",
     "apply_qwen3_8_flash_next_patches",
-    "needs_native_index_select",
-    "should_skip_generic_flaggems_aten",
 ]

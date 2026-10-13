@@ -255,18 +255,12 @@ class WorkerFL(WorkerBase):
 
         register_oot_ops()
 
-        from vllm_fl.flaggems_policy import resolve_flag_gems_policy
-
-        whitelist, blacklist = get_flag_gems_whitelist_blacklist()
-        model_policy = resolve_flag_gems_policy(
-            vllm_config, whitelist, blacklist,
+        whitelist, blacklist = get_flag_gems_whitelist_blacklist(
+            vllm_config=vllm_config,
             vendor_name=getattr(current_platform, "vendor_name", None),
         )
-        whitelist, blacklist = model_policy.whitelist, model_policy.blacklist
-        for message in model_policy.log_messages:
-            logger.info(message)
 
-        if fl_envs.USE_FLAGGEMS and not model_policy.skip_generic_aten:
+        if fl_envs.USE_FLAGGEMS:
             import flag_gems
 
             kwargs = dict(

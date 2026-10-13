@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 from vllm_fl.models.qwen3_8_flash_next.config import Qwen3_8FlashNextTextConfig
 from vllm_fl.models.qwen3_8_flash_next.gpu import ple_layer
-from vllm_fl.worker.ple_token_history import PLETokenHistory
+from vllm_fl.models.qwen3_8_flash_next.gpu.legacy_model_state import (
+    Qwen3_8FlashNextLegacyModelState,
+)
+from vllm_fl.models.qwen3_8_flash_next.gpu.ple_token_history import PLETokenHistory
 
 
 @pytest.fixture(params=["cpu", "cuda"])
@@ -55,6 +60,76 @@ class Harness:
         # The runner's synchronize_input_prep event protects pinned buffers
         # from CPU mutation; this harness waits when observing each output.
         return self.context.cpu().clone()
+
+
+def test_legacy_model_state_prepares_inputs_and_keeps_dummy_history_clean(
+    device, monkeypatch
+):
+    monkeypatch.setattr(
+        "vllm_fl.models.qwen3_8_flash_next.gpu.legacy_model_state.get_pp_group",
+        lambda: SimpleNamespace(ranks=[0], is_first_rank=True),
+    )
+
+    def buffer(*shape, dtype):
+        cpu = torch.zeros(shape, dtype=dtype)
+        gpu = torch.zeros(shape, dtype=dtype, device=device)
+        return SimpleNamespace(
+            gpu=gpu,
+            np=cpu.numpy(),
+            copy_to_gpu=lambda n=None: gpu.copy_(cpu),
+        )
+
+    ids = torch.tensor([7, 8], dtype=torch.int32, device=device)
+    batch = SimpleNamespace(
+        req_ids=["a"],
+        num_computed_tokens_cpu=np.array([0]),
+        token_ids_cpu_tensor=torch.full((4, 32), -1, dtype=torch.int32),
+    )
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                ple_layer_ids=[1], ngram_size=3, eos_token_id=0
+            ),
+            is_encoder_decoder=False,
+        ),
+        max_num_reqs=4,
+        max_model_len=32,
+        max_num_tokens=32,
+        device=device,
+        pin_memory=False,
+        _make_buffer=buffer,
+        input_batch=batch,
+        enable_prompt_embeds=False,
+        query_start_loc=buffer(5, dtype=torch.int32),
+        num_scheduled_tokens=SimpleNamespace(np=np.array([2])),
+        req_indices=SimpleNamespace(np=np.array([0, 0])),
+        query_pos=SimpleNamespace(np=np.array([0, 1])),
+        input_ids=SimpleNamespace(gpu=ids),
+    )
+    state = Qwen3_8FlashNextLegacyModelState(runner)
+    dummy = state.prepare_dummy_inputs(1, 4, np.array([2]))
+    assert dummy["query_start_loc"].cpu().tolist() == [0, 2, 2, 2, 2]
+    assert dummy["ngram_context"].count_nonzero().item() == 0
+    assert state.ple_token_history._slots == {}
+    state.prepare_inputs(1, 4, ids)
+    batch.num_computed_tokens_cpu[:] = 2
+    runner.num_scheduled_tokens.np[:] = 1
+    runner.query_start_loc.np[:] = [0, 1, 1, 1, 1]
+    runner.query_start_loc.copy_to_gpu()
+    runner.input_ids.gpu = torch.tensor([9], dtype=torch.int32, device=device)
+    state.prepare_dummy_inputs(1, 4, np.array([1]))
+    real = state.prepare_inputs(1, 4, runner.input_ids.gpu)
+    assert real["ngram_context"].cpu().tolist() == [[7, 8], [0, 0], [0, 0], [0, 0]]
+    with pytest.raises(RuntimeError, match="token ids"):
+        state.prepare_inputs(1, 4, None)
+    state.remove_requests(["a"])
+    batch.num_computed_tokens_cpu[:] = 0
+    assert (
+        state.prepare_inputs(1, 4, runner.input_ids.gpu)["ngram_context"]
+        .count_nonzero()
+        .item()
+        == 0
+    )
 
 
 @pytest.mark.parametrize("context_len", [2])

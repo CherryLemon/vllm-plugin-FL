@@ -955,6 +955,12 @@ class Qwen3_8FlashNextForCausalLM(
             QwenNextMixtureOfExperts.set_moe_parameters(self)
 
     @staticmethod
+    def get_legacy_model_state_cls():
+        from .legacy_model_state import Qwen3_8FlashNextLegacyModelState
+
+        return Qwen3_8FlashNextLegacyModelState
+
+    @staticmethod
     def get_model_state_cls():
         from .model_state import Qwen3_8FlashNextModelState
 
@@ -968,8 +974,7 @@ class Qwen3_8FlashNextForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
-        # path (query_start_loc / ngram_context) reaches Qwen3_8FlashNextModel.
+        # Preserve model-state inputs (query_start_loc / ngram_context).
         return self.model(
             input_ids,
             positions,
@@ -1208,6 +1213,12 @@ class Qwen3_8FlashNextForConditionalGeneration(
     supports_multimodal_pruning = False
 
     packed_modules_mapping = Qwen3_5ForConditionalGeneration.packed_modules_mapping
+
+    @staticmethod
+    def get_legacy_model_state_cls():
+        from .legacy_model_state import Qwen3_8FlashNextLegacyModelState
+
+        return Qwen3_8FlashNextLegacyModelState
 
     @staticmethod
     def get_model_state_cls():
