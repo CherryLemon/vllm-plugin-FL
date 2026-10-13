@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Register and activate the plugin-owned GLM5-Next runtime components."""
 
-from functools import lru_cache, wraps
+from functools import cache, lru_cache, wraps
 from importlib.metadata import PackageNotFoundError, version
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import torch
+
 from vllm.logger import init_logger
 from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
 from vllm.platforms import current_platform
@@ -179,8 +180,8 @@ def _silu_and_mul_with_clamp_oot(op, self, x):
     return op(x[..., :dim], x[..., dim:], self.swiglu_limit)
 
 
-def _bind_portable_forward(owner, name, flag, normalize=None):
-    """Use the existing policy binding for portable custom-op dispatch."""
+def _make_portable_binding(owner, name, flag):
+    """Use the existing policy binding inside the opaque GLM Torch ops."""
     from vllm_fl.dispatch.binding import OperatorBinding
     from vllm_fl.dispatch.manager import OpManager
     from vllm_fl.dispatch.types import BackendImplKind, OpImpl
@@ -194,6 +195,17 @@ def _bind_portable_forward(owner, name, flag, normalize=None):
         )
 
     def native(*args, **kwargs):
+        if name == "silu_and_mul_with_clamp":
+            state, x = args
+            # The upstream clamp method reads its CUDA handle from self.op.
+            # Resolve it only after this native candidate has been selected.
+            state = SimpleNamespace(
+                alpha=state.alpha,
+                beta=state.beta,
+                swiglu_limit=state.swiglu_limit,
+                op=torch.ops._C.silu_and_mul_with_clamp,
+            )
+            return owner.forward_cuda(state, x, **kwargs)
         return owner.forward_cuda(*args, **kwargs)
 
     native._is_available = use_nvidia_reference
@@ -208,15 +220,41 @@ def _bind_portable_forward(owner, name, flag, normalize=None):
     manager.registry.register_impl(
         OpImpl(name, "glm5.torch", BackendImplKind.REFERENCE, reference)
     )
-    binding = OperatorBinding(manager, name)
+    return OperatorBinding(manager, name)
 
-    @wraps(owner.forward_native)
-    def forward(self, *args, **kwargs):
-        if normalize is not None:
-            return normalize(binding, self, *args, **kwargs)
-        return binding(self, *args, **kwargs)
 
-    return forward
+@cache
+def _portable_binding(name):
+    """Cache stable capabilities, while OperatorBinding reads current policy.
+
+    Creating another activation plan must not replace the host used by an
+    already active wrapper. No selected implementation or policy is frozen
+    here, and constructing the binding never executes a numerical operator.
+    """
+    from functools import partial
+
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+    from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
+
+    from vllm_fl.models.glm5.indexer_backend import _load_flaggems_op
+
+    owner, api = {
+        "mhc_pre": (MHCPreOp, "mhc_pre_with_norm"),
+        "mhc_post": (MHCPostOp, "mhc_post"),
+        "mhc_fused_post_pre": (MHCFusedPostPreOp, "mhc_fused_post_pre_with_norm"),
+        "silu_and_mul_with_clamp": (SiluAndMulWithClamp, "silu_and_mul_with_clamp"),
+    }[name]
+    op = _load_flaggems_op(api, api)
+    if op is None:
+        flag = None
+    elif name == "silu_and_mul_with_clamp":
+        flag = partial(_silu_and_mul_with_clamp_oot, op)
+    else:
+
+        def flag(self, *args, **kwargs):
+            return op(*args, **kwargs)
+
+    return _make_portable_binding(owner, name, flag)
 
 
 class Glm5NextModelArchConfigConvertor(ModelArchConfigConvertorBase):
@@ -439,37 +477,17 @@ def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:
 
 
 def _mhc_patches(fingerprint: str) -> list[PendingPatch]:
-    from functools import partial
-
     from vllm.model_executor.layers.activation import SiluAndMulWithClamp
     from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
 
-    from vllm_fl.models.glm5.indexer_backend import _load_flaggems_op
+    from vllm_fl.models.glm5 import compile_ops
 
-    def bind_library(op):
-        def call(self, *args, **kwargs):
-            return op(*args, **kwargs)
-
-        return call
-
-    specs = []
-    for owner, name, api in (
-        (MHCPreOp, "mhc_pre", "mhc_pre_with_norm"),
-        (MHCPostOp, "mhc_post", "mhc_post"),
-        (MHCFusedPostPreOp, "mhc_fused_post_pre", "mhc_fused_post_pre_with_norm"),
-        (SiluAndMulWithClamp, "silu_and_mul_with_clamp", "silu_and_mul_with_clamp"),
-    ):
-        op = _load_flaggems_op(api, api)
-        flag = (
-            None
-            if op is None
-            else (
-                partial(_silu_and_mul_with_clamp_oot, op)
-                if name == "silu_and_mul_with_clamp"
-                else bind_library(op)
-            )
-        )
-        specs.append((owner, _bind_portable_forward(owner, name, flag)))
+    specs = (
+        (MHCPreOp, compile_ops.forward_mhc_pre),
+        (MHCPostOp, compile_ops.forward_mhc_post),
+        (MHCFusedPostPreOp, compile_ops.forward_mhc_fused_post_pre),
+        (SiluAndMulWithClamp, compile_ops.forward_clamp),
+    )
     return [
         _pending_attr(owner, "forward_oot", value, fingerprint, ("self",))
         for owner, value in specs
@@ -526,17 +544,21 @@ def _glm5_plan_provider(vllm_config) -> ActivationPlan | None:
 
 def _register_glm5_next_registrations() -> None:
     """Idempotent config/model registration (safe at plugin import time)."""
-    from vllm.model_executor.models import config as model_config
-    from vllm.model_executor.models import registry as model_registry
-    from vllm.transformers_utils import config as transformers_config
-    from vllm.transformers_utils import model_arch_config_convertor
+    from vllm.model_executor.models import (
+        config as model_config,
+        registry as model_registry,
+    )
+    from vllm.transformers_utils import (
+        config as transformers_config,
+        model_arch_config_convertor,
+    )
 
+    from vllm_fl.models.glm5.cache import install_glm5_next_kpool
     from vllm_fl.models.glm5.config import (
         Glm5NextConfig,
         Glm5NextTextConfig,
         Glm5NextVisionConfig,
     )
-    from vllm_fl.models.glm5.cache import install_glm5_next_kpool
 
     install_glm5_next_kpool()
 

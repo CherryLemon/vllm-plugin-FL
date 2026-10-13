@@ -15,6 +15,15 @@ from vllm_fl.models.glm5.indexer_backend import Glm5NextIndexerBackend
 from vllm_fl.models.glm5.runtime import Glm5ConfigError, validate_glm5_config
 
 
+@pytest.fixture(autouse=True)
+def _reset_portable_bindings():
+    # Tests replace capabilities/public host APIs; production bindings retain
+    # stable capabilities across activation and resolve policy on every call.
+    patch._portable_binding.cache_clear()
+    yield
+    patch._portable_binding.cache_clear()
+
+
 @pytest.fixture
 def backend(monkeypatch):
     from vllm_fl.models.glm5 import provider
@@ -225,8 +234,10 @@ def test_portable_custom_ops_propagate_execution_failure(
     from vllm_fl.models.glm5 import indexer_backend, runtime as hooks
 
     error = error_type("execution failed")
+    calls = []
 
     def fail(*args, **kwargs):
+        calls.append("flag")
         raise error
 
     monkeypatch.setattr(hooks, "use_nvidia_reference", lambda: False)
@@ -248,6 +259,7 @@ def test_portable_custom_ops_propagate_execution_failure(
     with policy_context(SelectionPolicy()), pytest.raises(error_type) as caught:
         patch.replacement(op, *args)
     assert caught.value is error
+    assert calls == ["flag"]
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -363,7 +375,11 @@ def test_portable_mhc_forwards_norm_and_propagates_execution_error(monkeypatch, 
     from vllm_fl.models.glm5 import indexer_backend, runtime as hooks
 
     calls = []
-    expected = (object(), object(), torch.tensor([[3.0, 4.0]]))
+    expected = (
+        torch.ones(1, 4, 1),
+        torch.ones(1, 4, 4),
+        torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16),
+    )
     weight = torch.tensor([2.0, 3.0])
     fail = [False]
 
@@ -385,19 +401,309 @@ def test_portable_mhc_forwards_norm_and_propagates_execution_error(monkeypatch, 
     )
     args = (torch.ones(1, 4),) * 4 + (1e-5, 1e-5, 1e-5, 1.0, 2)
     with policy_context(SelectionPolicy(strict=strict)):
-        assert (
-            forward(SimpleNamespace(), *args, norm_weight=weight, norm_eps=0.1)
-            is expected
-        )
+        actual = forward(SimpleNamespace(), *args, norm_weight=weight, norm_eps=0.1)
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
         fail[0] = True
         with pytest.raises(NotImplementedError, match="unsupported shape"):
             forward(SimpleNamespace(), *args, norm_weight=weight, norm_eps=0.1)
     assert len(calls) == 2
     assert all(call[0] == args for call in calls)
     assert all(
-        call[1]["norm_weight"] is weight and call[1]["norm_eps"] == 0.1
+        call[1]["norm_weight"] is weight
+        and call[1]["norm_eps"] == 0.1
+        and call[1]["n_splits"] == 1
         for call in calls
     )
+
+
+def test_opaque_clamp_fullgraph_preserves_mutable_policy_and_native_state(monkeypatch):
+    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+
+    from vllm_fl.models.glm5 import compile_ops, indexer_backend
+
+    calls = []
+    state = SimpleNamespace(swiglu_limit=2.5, alpha=1.0, beta=0.0)
+    native_handle = object()
+
+    def public(gate, up, limit):
+        calls.append(("flag", limit))
+        return torch.full_like(gate, 7)
+
+    def native(self, x):
+        assert self.op is native_handle
+        calls.append(("native", self.swiglu_limit, self.alpha, self.beta))
+        return torch.full((*x.shape[:-1], x.shape[-1] // 2), 11, dtype=x.dtype)
+
+    monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *a: public)
+    monkeypatch.setattr(patch, "use_nvidia_reference", lambda: True)
+    monkeypatch.setattr(SiluAndMulWithClamp, "forward_cuda", native)
+    monkeypatch.setattr(
+        torch.ops._C, "silu_and_mul_with_clamp", native_handle, raising=False
+    )
+    monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
+    monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)
+    forward = torch.compile(
+        lambda x: compile_ops.forward_clamp(state, x),
+        backend="eager",
+        fullgraph=True,
+        dynamic=True,
+    )
+    x = torch.ones(3, 8)
+    vendor = SelectionPolicy.from_dict(
+        per_op_order={"silu_and_mul_with_clamp": ["vendor:cuda"]}
+    )
+    flag = SelectionPolicy.from_dict(
+        per_op_order={"silu_and_mul_with_clamp": ["flagos"]}
+    )
+    with policy_context(vendor):
+        torch.testing.assert_close(forward(x), torch.full((3, 4), 11.0))
+    binding = patch._portable_binding("silu_and_mul_with_clamp")
+    # Assembling a later activation plan cannot replace the active host.
+    patch._mhc_patches("subsequent-plan")
+    assert patch._portable_binding("silu_and_mul_with_clamp") is binding
+    with policy_context(flag):
+        torch.testing.assert_close(forward(x[:2]), torch.full((2, 4), 7.0))
+    denied = SelectionPolicy.from_dict(
+        per_op_order={"silu_and_mul_with_clamp": ["vendor:cuda"]},
+        deny_vendors={"cuda"},
+    )
+    with (
+        policy_context(denied),
+        pytest.raises(RuntimeError, match="silu_and_mul_with_clamp"),
+    ):
+        forward(x)
+    assert calls == [("native", 2.5, 1.0, 0.0), ("flag", 2.5)]
+    # Nondefault native scalar semantics remain supported; the FlagGems-only
+    # guard must reject before the public API executes, with no native retry.
+    state.alpha, state.beta = 1.7, 0.2
+    with policy_context(vendor):
+        forward(x)
+    with policy_context(flag), pytest.raises(NotImplementedError, match="alpha=1"):
+        forward(x)
+    assert calls[-1] == ("native", 2.5, 1.7, 0.2)
+    assert len(calls) == 3
+    monkeypatch.setattr(patch, "current_platform", SimpleNamespace(device_type="cpu"))
+    reference = SelectionPolicy.from_dict(
+        per_op_order={"silu_and_mul_with_clamp": ["reference"]}
+    )
+    with policy_context(reference):
+        gate, up = x[..., :4].clamp(max=2.5), x[..., 4:].clamp(-2.5, 2.5)
+        expected = gate * torch.sigmoid(1.7 * gate) * (up + 0.2)
+        torch.testing.assert_close(forward(x), expected, rtol=0, atol=0)
+    assert binding.selected_impl == "glm5.torch"
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("tokens", [0, 3])
+def test_opaque_mhc_fake_metadata_does_not_resolve_policy(tokens, monkeypatch):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_fl.models.glm5 import compile_ops
+
+    monkeypatch.setattr(
+        compile_ops, "_binding", lambda *a: pytest.fail("fake resolved dispatch")
+    )
+    with FakeTensorMode():
+        residual = torch.empty(tokens, 4, 128, dtype=torch.bfloat16)
+        x = torch.empty(tokens, 128, dtype=torch.bfloat16)
+        fn = torch.empty(24, 512)
+        scale, base = torch.empty(3), torch.empty(24)
+        post, comb = torch.empty(tokens, 4, 1), torch.empty(tokens, 4, 4)
+        norm = torch.empty(128, dtype=torch.bfloat16)
+        scalars = (1e-6, 1e-6, 1e-6, 1.0, 5)
+        pre = compile_ops.forward_mhc_pre(None, residual, fn, scale, base, *scalars)
+        fused = compile_ops.forward_mhc_fused_post_pre(
+            None,
+            x,
+            residual,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            *scalars,
+            n_splits=2,
+            tile_n=1,
+            norm_weight=norm,
+            norm_eps=1e-6,
+        )
+        output_post = compile_ops.forward_mhc_post(None, x, residual, post, comb)
+        clamp = compile_ops.forward_clamp(
+            SimpleNamespace(swiglu_limit=2.0, alpha=1.7, beta=0.2),
+            torch.empty(tokens, 256, dtype=torch.bfloat16),
+        )
+    for outputs in (pre, fused[1:]):
+        assert [t.shape for t in outputs] == [
+            (tokens, 4, 1),
+            (tokens, 4, 4),
+            (tokens, 128),
+        ]
+        assert [t.dtype for t in outputs] == [
+            torch.float32,
+            torch.float32,
+            torch.bfloat16,
+        ]
+    for output in (output_post, fused[0]):
+        assert output.shape == residual.shape
+        assert output.stride() == residual.stride()
+        assert output.dtype == torch.bfloat16
+    assert clamp.shape == (tokens, 128) and clamp.dtype == torch.bfloat16
+    assert all(t.is_contiguous() for t in (*pre, *fused, output_post, clamp))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre", "clamp"])
+@pytest.mark.parametrize("backend", ["flagos", "vendor:cuda"])
+def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
+    from vllm_fl.models.glm5 import compile_ops
+
+    torch.manual_seed(731)
+    tokens, streams = 3, 4
+    # The upstream small-token fused kernel processes 256 values per thread
+    # block and eight splits. Exercise its real GLM hidden size; keep the
+    # independently supported small FlagGems case and fake metadata checks.
+    hidden = 4096 if backend == "vendor:cuda" and name == "mhc_fused_post_pre" else 128
+    mix_count = streams * (2 + streams)
+    residual = torch.randn(tokens, streams, hidden, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    fn = torch.randn(mix_count, streams * hidden, device="cuda") * 0.003
+    scale = torch.tensor([0.1, 0.3, 0.2], device="cuda")
+    base = torch.randn(mix_count, device="cuda") * 0.1
+    post = torch.randn(tokens, streams, 1, device="cuda") * 0.3
+    comb = torch.randn(tokens, streams, streams, device="cuda") * 0.2
+    norm = torch.randn(hidden, device="cuda", dtype=torch.bfloat16) * 0.3 + 1
+    limit, alpha, beta = (2.0, 1.0, 0.0) if backend == "flagos" else (2.0, 1.7, 0.2)
+    state = SimpleNamespace(swiglu_limit=limit, alpha=alpha, beta=beta)
+    scalars = (1e-6, 1e-6, 1e-6, 1.0, 5)
+
+    def pre_reference(r, projection_residual=None):
+        flat = r.flatten(-2)
+        projected_input = (
+            flat.float()
+            if projection_residual is None
+            else projection_residual.flatten(-2)
+        )
+        # Preserve each existing backend's projection/materialization ABI.
+        projection = (
+            (flat @ fn.bfloat16().t()).bfloat16().float()
+            if backend == "flagos"
+            else projected_input @ fn.t()
+        )
+        mix = projection * torch.rsqrt(
+            projected_input.square().mean(-1, keepdim=True) + 1e-6
+        )
+        weights = torch.cat(
+            (scale[0].expand(4), scale[1].expand(4), scale[2].expand(16))
+        )
+        mix = mix * weights + base
+        pre_mix = mix[:, :4].sigmoid().unsqueeze(-1) + 1e-6
+        post_mix = mix[:, 4:8].sigmoid().unsqueeze(-1)
+        comb_mix = mix[:, 8:].reshape(tokens, 4, 4).softmax(-1) + 1e-6
+        comb_mix = comb_mix / (comb_mix.sum(-2, keepdim=True) + 1e-6)
+        for _ in range(4):
+            comb_mix = comb_mix / (comb_mix.sum(-1, keepdim=True) + 1e-6)
+            comb_mix = comb_mix / (comb_mix.sum(-2, keepdim=True) + 1e-6)
+        weighted = (r.float() * pre_mix).sum(-2)
+        value = weighted.bfloat16().float()
+        norm_input = value if backend == "flagos" else weighted
+        value = (
+            value
+            * torch.rsqrt(norm_input.square().mean(-1, keepdim=True) + 1e-6)
+            * norm.float()
+        ).bfloat16()
+        return post_mix, comb_mix, value
+
+    def post_reference(materialize=True):
+        result = torch.einsum(
+            "tij,tih->tjh", comb.float(), residual.float()
+        ) + post.float() * x.float().unsqueeze(-2)
+        return result.bfloat16() if materialize else result
+
+    def reference():
+        if name == "mhc_pre":
+            return pre_reference(residual)
+        if name == "mhc_post":
+            return (post_reference(),)
+        if name == "mhc_fused_post_pre":
+            r = post_reference()
+            # The native small-token FMA kernel accumulates projection/RMS
+            # from the FP32 post value, before materializing residual_cur in
+            # BF16. Weighted layer input still consumes that BF16 residual.
+            projected = post_reference(False) if backend == "vendor:cuda" else None
+            return (r, *pre_reference(r, projected))
+        gate = x[:, : hidden // 2].float().clamp(max=limit)
+        up = x[:, hidden // 2 :].float().clamp(min=-limit, max=limit)
+        return ((gate * torch.sigmoid(alpha * gate) * (up + beta)).bfloat16(),)
+
+    def call(r, value, weight, scaling, bias, post_mix, comb_mix, norm_weight):
+        if name == "mhc_pre":
+            return compile_ops.forward_mhc_pre(
+                None,
+                r,
+                weight,
+                scaling,
+                bias,
+                *scalars,
+                norm_weight=norm_weight,
+                norm_eps=1e-6,
+            )
+        if name == "mhc_post":
+            return (compile_ops.forward_mhc_post(None, value, r, post_mix, comb_mix),)
+        if name == "mhc_fused_post_pre":
+            return compile_ops.forward_mhc_fused_post_pre(
+                None,
+                value,
+                r,
+                post_mix,
+                comb_mix,
+                weight,
+                scaling,
+                bias,
+                *scalars,
+                norm_weight=norm_weight,
+                norm_eps=1e-6,
+            )
+        return (compile_ops.forward_clamp(state, value),)
+
+    def check(actual):
+        for output, expected in zip(actual, reference()):
+            assert output.shape == expected.shape and output.dtype == expected.dtype
+            assert output.stride() == expected.stride()
+            # Retain the existing library mHC norm tolerances. FP32 mixing
+            # outputs use the independent reference's existing 2e-5 bound.
+            tolerance = 2e-5 if output.dtype == torch.float32 else 0.01
+            torch.testing.assert_close(output, expected, rtol=tolerance, atol=tolerance)
+
+    op_name = "silu_and_mul_with_clamp" if name == "clamp" else name
+    policy = SelectionPolicy.from_dict(per_op_order={op_name: [backend]})
+    inputs = (residual, x, fn, scale, base, post, comb, norm)
+    before = [t.clone() for t in inputs]
+    with policy_context(policy):
+        check(call(*inputs))
+        compiled = torch.compile(call, fullgraph=True, dynamic=True)
+        check(compiled(*inputs))
+        for _ in range(3):
+            compiled(*inputs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = compiled(*inputs)
+        for actual, original in zip(inputs, before):
+            torch.testing.assert_close(actual, original, rtol=0, atol=0)
+        # An empty graph or retained result must fail after inputs change and
+        # every returned output is poisoned before replay.
+        residual.mul_(0.5)
+        x.add_(0.125)
+        post.mul_(0.75)
+        comb.mul_(0.75)
+        norm.add_(0.125)
+        for output in outputs:
+            output.fill_(torch.nan)
+        graph.replay()
+        check(outputs)
+        selected = patch._portable_binding(op_name).selected_impl
+        assert selected == ("glm5.flaggems" if backend == "flagos" else "glm5.cuda")
 
 
 @pytest.mark.parametrize("name", ["pack_seq", "unpack_seq"])
