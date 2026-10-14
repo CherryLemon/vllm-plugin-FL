@@ -486,7 +486,10 @@ def test_vision_activation_clamps_large_inputs(monkeypatch, merger):
     torch.testing.assert_close(layer.act_fn.forward_native(x), expected)
 
 
-def test_vision_uses_trained_rms_epsilon_without_mutating_checkpoint(monkeypatch):
+@pytest.mark.parametrize("epsilon", [1e-5, 2e-4])
+def test_vision_uses_configured_rms_epsilon_without_mutating_checkpoint(
+    monkeypatch, epsilon
+):
     from contextlib import nullcontext
 
     import torch
@@ -509,7 +512,7 @@ def test_vision_uses_trained_rms_epsilon_without_mutating_checkpoint(monkeypatch
             intermediate_size=8,
             projection_intermediate_size=8,
             swiglu_limit=10.0,
-            rms_norm_eps=1e-5,
+            rms_norm_eps=epsilon,
         ),
     )
     deployment = SimpleNamespace(
@@ -533,7 +536,6 @@ def test_vision_uses_trained_rms_epsilon_without_mutating_checkpoint(monkeypatch
         "QKVParallelLinear",
         "Conv2dLayer",
         "Conv3dLayer",
-        "get_rope",
         "Glm5VisionAttention",
         "MMEncoderAttention",
         "init_vllm_registered_model",
@@ -543,12 +545,51 @@ def test_vision_uses_trained_rms_epsilon_without_mutating_checkpoint(monkeypatch
     with set_current_vllm_config(VllmConfig()):
         tower = cls(vllm_config=deployment).visual
     x = torch.tensor([[0.001, -0.002, 0.003, -0.004]])
-    expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
-    checkpoint_eps_output = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5)
-    assert not torch.allclose(expected, checkpoint_eps_output)
+    expected = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + epsilon)
+    cos, sin = tower.rotary_pos_emb.get_cos_sin(2)
+    assert cos.dtype == sin.dtype == torch.float32
     for norm in (tower.blocks[0].norm1, tower.blocks[0].norm2, tower.post_layernorm):
         torch.testing.assert_close(norm.forward_native(x), expected)
     for norm in (tower.blocks[0].attn.q_norm, tower.blocks[0].attn.k_norm):
-        torch.testing.assert_close(norm.forward_native(x), checkpoint_eps_output)
+        torch.testing.assert_close(norm.forward_native(x), expected)
     assert tower.merger.post_projection_norm.eps == 1e-5
-    assert config.vision_config.rms_norm_eps == 1e-5
+    assert config.vision_config.rms_norm_eps == epsilon
+
+
+def test_vision_block_rounds_attention_residual_before_normalization(monkeypatch):
+    import torch
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    from vllm_fl.models.glm5.multimodal import Glm5NextVisionBlock
+
+    block = Glm5NextVisionBlock.__new__(Glm5NextVisionBlock)
+    torch.nn.Module.__init__(block)
+    block.norm1 = torch.nn.Identity()
+    with set_current_vllm_config(VllmConfig()):
+        block.norm2 = RMSNorm(4, eps=1e-5).to(dtype=torch.bfloat16)
+    # Execute the actual CPU norm while isolating the residual ordering.
+    monkeypatch.setattr(block.norm2, "_forward_method", block.norm2.forward_native)
+    block.mlp = torch.nn.Identity()
+    x = torch.tensor([[1.0, 2.0, -1.0, -2.0]], dtype=torch.bfloat16)
+    attention = torch.tensor(
+        [[0.00921630859375, 0.005340576171875, 0.01068115234375, 0.0162353515625]],
+        dtype=torch.bfloat16,
+    )
+
+    class FixedAttention(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return attention
+
+    block.attn = FixedAttention()
+    residual = x + attention
+    normalized = residual.float() * torch.rsqrt(
+        residual.float().square().mean(-1, keepdim=True) + 1e-5
+    )
+    expected = residual + normalized.to(x.dtype)
+    unrounded = x.float() + attention.float()
+    fused = unrounded * torch.rsqrt(unrounded.square().mean(-1, keepdim=True) + 1e-5)
+    assert not torch.equal(expected, residual + fused.to(x.dtype))
+    actual = block(x, None, None, None)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

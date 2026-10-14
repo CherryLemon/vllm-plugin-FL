@@ -69,11 +69,6 @@ from vllm_fl.models.glm5.model import SiluAndMulWithClamp
 from vllm_fl.models.glm5.provider import use_nvidia_reference
 from vllm_fl.models.glm5.vision_attention import Glm5VisionAttention
 
-_VISION_RMS_NORM_EPS = 1e-6
-# GLM-5.3-Flash was trained with 1e-6 despite its checkpoint declaring 1e-5.
-# Match the block/post norms in vLLM v0.31.0's GLM5Next vision config.
-
-
 class Glm5NextVisionPatchEmbed(nn.Module):
     def __init__(
         self,
@@ -151,6 +146,7 @@ class Glm5NextVisionAttention(nn.Module):
         projection_size: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         use_data_parallel = is_vit_use_data_parallel()
@@ -169,9 +165,8 @@ class Glm5NextVisionAttention(nn.Module):
 
         self.head_dim = embed_dim // num_heads
 
-        # q/k norm eps hard-coded 1e-5 — distinct from block/post norm eps.
-        self.q_norm = RMSNorm(self.head_dim, eps=1e-5)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-5)
+        self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
 
         self.qkv = QKVParallelLinear(
             hidden_size=embed_dim,
@@ -276,6 +271,7 @@ class Glm5NextVisionBlock(nn.Module):
         norm_layer: partial[nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        norm_eps: float = 1e-5,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -288,6 +284,7 @@ class Glm5NextVisionBlock(nn.Module):
             projection_size=dim,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            norm_eps=norm_eps,
         )
         self.mlp = Glm5NextVisionMLP(
             dim,
@@ -313,8 +310,9 @@ class Glm5NextVisionBlock(nn.Module):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
         )
-        x_fused_norm, residual = self.norm2(x, residual=x_attn)
-        x = residual + self.mlp(x_fused_norm)
+        # Preserve the checkpoint's hidden-state rounding before the next norm.
+        residual = x + x_attn
+        x = residual + self.mlp(self.norm2(residual))
         return x
 
 
@@ -378,7 +376,7 @@ class Glm5NextVisionTransformer(nn.Module):
         # uses vision_config.projection_intermediate_size for the merger, not
         # text_config.intermediate_size like GLM-OCR does.)
         vision_config,
-        norm_eps: float = _VISION_RMS_NORM_EPS,
+        norm_eps: float | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -387,6 +385,9 @@ class Glm5NextVisionTransformer(nn.Module):
         self.tp_size = (
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
+
+        if norm_eps is None:
+            norm_eps = vision_config.rms_norm_eps
 
         patch_size = vision_config.patch_size
         temporal_patch_size = vision_config.temporal_patch_size
@@ -424,6 +425,7 @@ class Glm5NextVisionTransformer(nn.Module):
             max_position=8192,
             is_neox_style=True,
             rope_parameters={"partial_rotary_factor": 0.5},
+            dtype=torch.float32,
         )
         self.blocks = nn.ModuleList(
             [
@@ -433,6 +435,7 @@ class Glm5NextVisionTransformer(nn.Module):
                     mlp_hidden_dim=vision_config.intermediate_size,
                     swiglu_limit=swiglu_limit,
                     norm_layer=norm_layer,
+                    norm_eps=norm_eps,
                     quant_config=quant_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
                 )
@@ -1065,7 +1068,6 @@ class Glm5NextForConditionalGeneration(
             self.visual = Glm5NextVisionTransformer(
                 config.text_config,
                 config.vision_config,
-                norm_eps=_VISION_RMS_NORM_EPS,
                 # The vision checkpoint is BF16 even when the language model
                 # comes from the separately published FP8 directory.
                 quant_config=None,
