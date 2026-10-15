@@ -491,7 +491,9 @@ def test_opaque_clamp_fullgraph_preserves_mutable_policy_and_native_state(monkey
         gate, up = x[..., :4].clamp(max=2.5), x[..., 4:].clamp(-2.5, 2.5)
         expected = gate * torch.sigmoid(1.7 * gate) * (up + 0.2)
         torch.testing.assert_close(forward(x), expected, rtol=0, atol=0)
-    assert binding.selected_impl == "glm5.torch"
+    # The shared clamp reference introduced in main takes precedence over the
+    # model-local reference while preserving the native scalar semantics.
+    assert binding.selected_impl == "reference.torch"
     assert len(calls) == 3
 
 

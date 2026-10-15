@@ -106,4 +106,6 @@ def test_hopper_gemm_defaults_do_not_leak_into_other_architectures(monkeypatch):
         with patch("vllm.platforms.current_platform", _platform_with_capability(major)):
             config = load_platform_config("nvidia")
         assert ("mm" in config["flagos_blacklist"]) == (major == 9)
-        assert ("mm_out" in config["flagos_blacklist"]) == (major == 9)
+        # The vendor-wide config also disables mm_out independently of the
+        # Hopper-specific mm default.
+        assert "mm_out" in config["flagos_blacklist"]

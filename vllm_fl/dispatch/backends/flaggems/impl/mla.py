@@ -11,7 +11,6 @@ from typing import Any, ClassVar, Optional, Union
 
 import numpy as np
 import torch
-from flag_gems import flash_attn_varlen_func, flash_mla
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -36,6 +35,13 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+import vllm_fl.envs as fl_envs
+
+if fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM:
+    from flaggems_vllm import flash_attn_varlen_func, flash_mla
+else:
+    from flag_gems import flash_attn_varlen_func, flash_mla
+
 logger = init_logger(__name__)
 
 
@@ -58,12 +64,12 @@ class MLAFLImpl(MLACommonImpl[MLACommonMetadata]):
         head_size: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[list[float]],
-        sliding_window: Optional[int],
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
         kv_cache_dtype: str,
-        logits_soft_cap: Optional[float],
+        logits_soft_cap: float | None,
         attn_type: str,
-        kv_sharing_target_layer_name: Optional[str],
+        kv_sharing_target_layer_name: str | None,
         # MLA Specific Arguments
         **mla_args,
     ) -> None:
@@ -132,11 +138,11 @@ class MLAFLImpl(MLACommonImpl[MLACommonMetadata]):
 
     def _forward_decode(
         self,
-        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         layer: AttentionLayer,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 

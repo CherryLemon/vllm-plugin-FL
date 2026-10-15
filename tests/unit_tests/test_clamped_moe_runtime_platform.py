@@ -11,18 +11,14 @@ from vllm_fl.ops.fused_moe import fused_moe_utils as moe
 
 @pytest.mark.parametrize("error", [RuntimeError, torch.OutOfMemoryError])
 def test_clamped_activation_propagates_execution_failure(monkeypatch, error):
-    import importlib
+    import flaggems_vllm
 
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     from vllm_fl.ops.fused_moe.activation import apply_moe_activation
 
-    kernel = importlib.import_module("flag_gems.fused.silu_and_mul_with_clamp")
-
-    def fail(*args):
-        raise error("clamp launch failed")
-
-    monkeypatch.setattr(kernel, "silu_and_mul_with_clamp_out", fail)
+    fail = Mock(side_effect=error("clamp launch failed"))
+    monkeypatch.setattr(flaggems_vllm, "silu_and_mul_with_clamp_out", fail)
     # Meta tensors exercise launch dispatch without allocating accelerator memory.
     with pytest.raises(error, match="clamp launch failed"):
         apply_moe_activation(
@@ -31,6 +27,7 @@ def test_clamped_activation_propagates_execution_failure(monkeypatch, error):
             torch.ones(2, 6, device="meta"),
             clamp_limit=7.0,
         )
+    fail.assert_called_once()
 
 
 def test_clamped_moe_resolves_platform_at_apply_time(monkeypatch):
