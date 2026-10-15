@@ -242,11 +242,14 @@ class WorkerFL(WorkerBase):
         for k, v in sorted(os.environ.items()):
             logger.debug("%s=%r", k, v)
 
-        # Apply the NVIDIA MM encoder dispatch fix before model construction:
-        # CustomOp caches its selected forward method in __init__.
-        from vllm_fl.attention.utils import patch_mm_encoder_attention
-
+        # Apply the MM encoder / partial-RoPE dispatch fixes before model
+        # construction: CustomOp caches its selected forward method in __init__.
+        from vllm_fl.attention.utils import (
+            patch_mm_encoder_attention,
+            patch_oot_apply_rotary_emb,
+        )
         patch_mm_encoder_attention()
+        patch_oot_apply_rotary_emb()
 
         # GLM patches must precede CustomOp construction, including the VLM
         # vision tower. Other models keep the common startup path below.
