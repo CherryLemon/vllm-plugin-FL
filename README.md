@@ -128,6 +128,12 @@ Operator adapters use the plugin dispatch manager, so backend selection,
 fallback, per-op policy, operator-list recording, and I/O diagnostics continue
 to follow the common FlagOS controls.
 
+On Iluvatar with vLLM 0.24, the FlagOS GPU runner binds all attention caches
+within each decoder layer, including separate main and index caches. Binding
+preserves layer order, cache order within a layer, tensor identity and shared
+aliases. This cache initialization fix does not enable graph capture or establish
+model or operator support; validate those separately in the target environment.
+
 ### Operator profiling
 
 See the [operator profiling tools](./tools/operator_profile/README.md) for a
@@ -188,17 +194,21 @@ If there are multiple plugins in the current environment, you can specify use vl
 
 ### HY4 on NVIDIA
 
-HY4 is paired with this branch's vLLM 0.24.0 environment. Install the HY4 extra
-after installing the framework and FlagGems dependencies described above:
+HY4 is paired with this branch's vLLM 0.24.0 environment and the shared
+[FlagGems-vllm integration](./docs/flaggems-vllm.md). Its MLA query concatenation
+and graph-safe paged MQA logits APIs are now merged into upstream FlagGems-vllm.
+They are newer than the v0.2.0 release used by the shared CI installer, so install
+the current upstream main after the framework and FlagGems setup described above:
 
 ```sh
-pip install --no-build-isolation '.[hy4]'
+python3 -m pip install --no-deps --no-build-isolation --force-reinstall \
+  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git'
 ```
 
-The extra pins the public MLA query concatenation API and TLE capability checks
-from [FlagGems-vllm #897](https://github.com/flagos-ai/FlagGems-vllm/pull/897) to
-commit `afac804694b9c807b8de9c73873ceed46f84560f`. Sparse indexer, cache and attention
-replacements also use `flaggems_vllm`; query quantization uses general FlagGems.
+HY4 uses the public `flaggems_vllm` sparse indexer, cache and attention APIs;
+query quantization uses general FlagGems. No model-specific dependency extra or
+fork revision is required. The shared fused-operator rollout switch and its
+default behavior are described in the integration documentation.
 Runtime selection checks callable APIs, device kernels and the shared dispatch
 policy before allocating model weights. A selected operator's execution error
 propagates without retrying another implementation.
@@ -213,12 +223,11 @@ checkpoint, BF16 activations and BF16 portable KV. Other chips, multimodal servi
 are not validated. Sparse indexer providers use explicit entry points while
 preserving the real CUDA platform identity.
 The portable sparse indexer checks the selected paged MQA logits provider's
-graph capability before loading weights. The legacy revision pinned by the
-`hy4` extra requires `--enforce-eager`: it reads context lengths on the CPU.
-A matching FlagGems-vllm build exposing `fp8_fp4_paged_mqa_logits_graph`
-supports static-grid CUDA Graph capture, reading lengths and page mappings
-on the GPU on every replay. The shared dispatch selects that public entry
-point when available.
+graph capability before loading weights. Upstream FlagGems-vllm exposes
+`fp8_fp4_paged_mqa_logits_graph` for static-grid CUDA Graph capture, reading
+lengths and page mappings on the GPU on every replay. The shared dispatch
+selects that public entry point when available; older operator builds without
+the capability require `--enforce-eager`.
 
 With the graph-safe operator build, use `FULL_DECODE_ONLY` with compilation
 mode `NONE`, for example:
@@ -231,7 +240,7 @@ The shared CachedOp prewarming from
 [vllm-plugin-FL #552](https://github.com/flagos-ai/vllm-plugin-FL/pull/552) is
 used after model loading. Whole-model Dynamo compilation remains limited
 by the current FlagGems `libentry` implementation; CUDA Graph mode `NONE`
-and eager execution remain available with the legacy operator build.
+and eager execution remain available.
 
 ### Run a Task
 
