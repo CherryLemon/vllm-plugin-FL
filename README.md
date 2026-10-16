@@ -83,10 +83,9 @@ In theory, vllm-plugin-FL can support all models available in vLLM, as long as n
     pip install --no-build-isolation -e .
     ```
 
-    Qwen3.8-Flash-Next / Qwen4 uses numerical operators from
-    [FlagGems-vllm PR #896](https://github.com/flagos-ai/FlagGems-vllm/pull/896).
-    Install its pinned operator dependency with
-    `pip install --no-build-isolation -e '.[qwen3_8]'`.
+    Qwen3.8-Flash-Next / Qwen4 uses the HC, PLE and QSA operators available
+    on [FlagGems-vllm main](https://github.com/flagos-ai/FlagGems-vllm).
+    Follow the shared [FlagGems-vllm installation instructions](docs/flaggems-vllm.md).
 
     For CUDA-like devices, including CUDA and HIP/ROCm environments that use
     PyTorch's CUDA dispatch key, build the plugin native extension by setting
@@ -132,6 +131,12 @@ model registrations are loaded only for their corresponding architectures.
 Operator adapters use the plugin dispatch manager, so backend selection,
 fallback, per-op policy, operator-list recording, and I/O diagnostics continue
 to follow the common FlagOS controls.
+
+On Iluvatar with vLLM 0.24, the FlagOS GPU runner binds all attention caches
+within each decoder layer, including separate main and index caches. Binding
+preserves layer order, cache order within a layer, tensor identity and shared
+aliases. This cache initialization fix does not enable graph capture or establish
+model or operator support; validate those separately in the target environment.
 
 ### Operator profiling
 

@@ -257,9 +257,9 @@ def _noop_upstream(monkeypatch, *, mutates=True):
                 forward_context[layer_name].kv_cache = kv
                 runner_kv_caches.append(kv)
 
-    import vllm.v1.worker.utils as vllm_utils
+    from vllm_fl.worker import kv_cache_utils
 
-    monkeypatch.setattr(vllm_utils, "bind_kv_cache", fake)
+    monkeypatch.setattr(kv_cache_utils, "bind_kv_cache", fake)
     monkeypatch.setattr(kv_bind, "upstream_binds_kv_cache_owners", lambda: False)
     return calls
 
@@ -286,6 +286,33 @@ def test_validation_failure_leaves_no_mutation(monkeypatch):
         kv_bind.bind_kv_cache(kv_caches, {"qsa": owner}, runner, 1)
     assert runner == []
     assert owner.bound == []
+
+
+def test_owner_hooks_preserve_iluvatar_multi_cache_binding(monkeypatch):
+    from vllm_fl.worker import kv_cache_utils
+
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "current_platform",
+        SimpleNamespace(vendor_name="iluvatar", device_type="cuda"),
+    )
+    caches = {
+        "model.layers.0.main_attn": torch.zeros(2),
+        "model.layers.0.index_attn": torch.zeros(3),
+    }
+    owners = {name: _Owner() for name in caches}
+    runner = []
+    kv_bind.upstream_binds_kv_cache_owners.cache_clear()
+    try:
+        kv_bind.bind_kv_cache(caches, owners, runner)
+    finally:
+        kv_bind.upstream_binds_kv_cache_owners.cache_clear()
+    assert len(runner) == 2
+    for index, (name, tensor) in enumerate(caches.items()):
+        assert runner[index] is tensor
+        assert owners[name].kv_cache is tensor
+        assert len(owners[name].bound) == 1
+        assert owners[name].bound[0] is tensor
 
 
 def test_rebind_replaces_typed_views():

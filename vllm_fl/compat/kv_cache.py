@@ -18,7 +18,7 @@ __all__ = [
 
 def _probe_upstream_hook() -> bool:
     """Observe whether the upstream helper calls a synthetic layer's hook."""
-    from vllm.v1.worker.utils import bind_kv_cache as upstream_bind_kv_cache
+    from vllm_fl.worker.kv_cache_utils import bind_kv_cache as upstream_bind_kv_cache
 
     class _Probe:
         def __init__(self) -> None:
@@ -104,7 +104,7 @@ def bind_kv_cache(
     A failure during binding aborts runner initialization: the partially bound
     runner must be discarded, not retried. Hooks must not mutate cache contents.
     """
-    from vllm.v1.worker.utils import bind_kv_cache as upstream_bind_kv_cache
+    from vllm_fl.worker.kv_cache_utils import bind_kv_cache as upstream_bind_kv_cache
 
     owners = _collect_owners(forward_context, kv_caches)
     # Validate before any mutation at all.

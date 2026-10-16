@@ -118,7 +118,8 @@ def _init_vendor_device():
     """Apply compatibility hooks that must run before vLLM model imports."""
     from vllm_fl.utils import DeviceInfo
 
-    if DeviceInfo().vendor_name == "kunlunxin":
+    vendor_name = DeviceInfo().vendor_name
+    if vendor_name == "kunlunxin":
         from vllm_fl.dispatch.backends.vendor.kunlunxin.patches.patch_fla_utils import (
             _patch_xpu_get_device,
         )
