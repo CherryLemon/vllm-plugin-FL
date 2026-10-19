@@ -372,8 +372,26 @@ class WorkerFL(WorkerBase):
                 patch_sampler_compile_for_iluvatar()
             except Exception as _e:
                 import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "iluvatar worker patch failed: %s", _e
+                )
 
-                _lg.getLogger(__name__).warning("iluvatar worker patch failed: %s", _e)
+        # PTPU: register the Inductor/Dynamo/Triton wiring in EVERY worker
+        # process (torch.compile runs here, not in EngineCore, and the
+        # Inductor/Dynamo registries are per-process). Mirrors the iluvatar
+        # GPUTarget remap above; idempotent + no-op on other devices.
+        if getattr(current_platform, "device_type", "") == "ptpu":
+            try:
+                from vllm_fl.compilation.inductor_backend import (
+                    register_ptpu_inductor_backend,
+                )
+
+                register_ptpu_inductor_backend()
+            except Exception as _e:
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "ptpu inductor backend registration failed: %s", _e
+                )
         # This env var set by Ray causes exceptions with graph building.
         if (
             self.parallel_config.distributed_executor_backend
