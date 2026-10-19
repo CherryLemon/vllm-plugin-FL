@@ -1220,6 +1220,7 @@ provider._has_nvidia_reference_kernels = lambda: False
 set_global_policy(SelectionPolicy.from_dict(per_op_order={
     "attention_backend": ["flagos", "vendor:cuda"],
 }))
+get_default_manager().ensure_initialized()
 from vllm.platforms import current_platform
 from vllm_fl.dispatch.backends.vendor.cuda.cuda import CudaBackend
 vendor = CudaBackend()
@@ -1285,7 +1286,8 @@ print("review contracts passed")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_private_vision_adapter_preserves_public_fa(monkeypatch):
+@pytest.mark.parametrize("fused_mode", ["0", "1"])
+def test_private_vision_adapter_preserves_public_fa(monkeypatch, fused_mode):
     import flag_gems
     import flaggems_vllm
 
@@ -1297,7 +1299,12 @@ def test_private_vision_adapter_preserves_public_fa(monkeypatch):
         calls.append(kwargs)
         return query.clone(), torch.ones(1)
 
-    monkeypatch.setattr(flag_gems, "flash_attn_varlen_func", fa)
+    monkeypatch.setenv("VLLM_FL_USE_FLAGGEMS_VLLM", fused_mode)
+    monkeypatch.setattr(
+        flag_gems,
+        "flash_attn_varlen_func",
+        lambda *a, **kw: pytest.fail("model vision used the paged-only legacy API"),
+    )
     monkeypatch.setattr(flaggems_vllm, "flash_attn_varlen_func", fa)
     q = torch.randn(1, 7, 2, 8)
     cu = torch.tensor([0, 3, 7], dtype=torch.int32)
@@ -1309,9 +1316,11 @@ def test_private_vision_adapter_preserves_public_fa(monkeypatch):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_private_vision_attention_eager_and_replay(dtype):
+@pytest.mark.parametrize("fused_mode", ["0", "1"])
+def test_private_vision_attention_eager_and_replay(monkeypatch, dtype, fused_mode):
     from vllm_fl.models.glm5.vision_attention import Glm5VisionAttention
 
+    monkeypatch.setenv("VLLM_FL_USE_FLAGGEMS_VLLM", fused_mode)
     torch.manual_seed(17)
     query, key, value = [
         torch.randn(1, 33, 4, 64, device="cuda", dtype=dtype) for _ in range(3)

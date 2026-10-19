@@ -6,7 +6,6 @@ from torch import nn
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
-import vllm_fl.envs as fl_envs
 from vllm_fl.dispatch.capabilities import get_flaggems_vllm_operator
 
 _BINDING = None
@@ -21,23 +20,17 @@ def get_vision_binding():
         from vllm_fl.utils import use_flaggems_op
 
         def flag(*args, **kwargs):
-            if fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM:
-                flash_attn_varlen_func = get_flaggems_vllm_operator(
-                    "flash_attn_varlen_func"
-                )
-            else:
-                from flag_gems import flash_attn_varlen_func
-
+            # This is a required model operator, like the MLA/indexer APIs.
+            # Use the public packed/non-paged FA2 contract on every backend.
+            flash_attn_varlen_func = get_flaggems_vllm_operator(
+                "flash_attn_varlen_func"
+            )
             return flash_attn_varlen_func(*args, **kwargs)
 
         def available():
             if not use_flaggems_op("flash_attn_varlen_func"):
                 return False
-            if fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM:
-                return callable(get_flaggems_vllm_operator("flash_attn_varlen_func"))
-            import flag_gems
-
-            return callable(getattr(flag_gems, "flash_attn_varlen_func", None))
+            return callable(get_flaggems_vllm_operator("flash_attn_varlen_func"))
 
         flag._is_available = available
         manager = OpManager()

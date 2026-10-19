@@ -491,9 +491,9 @@ def test_imported_engine_alias_is_owned_and_partial_install_rolls_back():
         """
     )
     env = dict(os.environ)
-    # This process explicitly installs the real engine/config hooks, so keep
-    # general-plugin auto-loading from changing the intended import order.
-    env["VLLM_PLUGINS"] = ""
+    # EngineCore needs the platform plugin on devices whose vLLM wheel lacks
+    # NVIDIA extensions. Model activation still happens explicitly below.
+    env["VLLM_PLUGINS"] = "fl"
     result = subprocess.run(
         [sys.executable, "-c", code],
         env=env,
