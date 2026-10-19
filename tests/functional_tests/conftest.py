@@ -12,6 +12,8 @@ from the root tests/conftest.py. Only functional-specific fixtures belong here.
 
 import pytest
 
+from tests.utils.device_utils import get_backend
+
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
@@ -29,6 +31,9 @@ def pytest_sessionfinish(session, exitstatus):
     _read_thread would segfault when the subprocess pipe breaks on NPU teardown.
     Primary guard for that is TORCHINDUCTOR_COMPILE_THREADS=1 in ascend.yaml.
     """
+    if get_backend() != "ascend":
+        return
+
     import contextlib
     import os
     import threading
