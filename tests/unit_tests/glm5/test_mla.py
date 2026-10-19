@@ -658,7 +658,15 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
     pages = (max_tokens + 511) // 512 * (512 // pool // page)
     backing = torch.full((pages, 16896), 193, dtype=torch.uint8, device="cuda")
     cache = torch.as_strided(backing, (pages, page, dim + 4), (16896, dim + 4, 1))
-    keys = torch.ones(pages, page, dim, device="cuda").to(torch.float8_e4m3fn)
+
+    # Build the wire format on CPU; vendor Torch need not implement FP8 casts
+    # to test the real GPU byte decoder, paged logits and token selection.
+    def fp8_input(shape):
+        encoded = torch.ones(shape).to(torch.float8_e4m3fn)
+        wire = encoded.view(torch.uint8).to("cuda")
+        return wire.view(torch.float8_e4m3fn), encoded.float().to("cuda")
+
+    keys, reference_keys = fp8_input((pages, page, dim))
     scales = (torch.arange(pages * page, device="cuda") + 1).float() / 128
     backing[:, : page * dim].copy_(keys.view(torch.uint8).reshape(pages, -1))
     backing[:, page * dim : page * (dim + 4)].copy_(
@@ -674,7 +682,7 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
     tails = [1, 1, 1, max_tokens % pool] if pool > 1 else [0] * batch
     positions = lengths.long() * pool - 1
     positions += torch.tensor(tails, device="cuda")
-    q = torch.ones(batch, heads, dim, device="cuda").to(torch.float8_e4m3fn)
+    q, reference_q = fp8_input((batch, heads, dim))
     weights = torch.ones(batch, heads, device="cuda")
     decode = DeepSeekV32IndexerDecodeMetadata(
         block_table=table,
@@ -700,10 +708,10 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
     expected_indices = []
     for row, length in enumerate(lengths.tolist()):
         page_ids = table[row].long()
-        row_keys = keys.float()[page_ids].reshape(-1, dim)[:length]
+        row_keys = reference_keys[page_ids].reshape(-1, dim)[:length]
         row_scales = scales.view(pages, page)[page_ids].reshape(-1)[:length]
         values = (
-            torch.relu((q[row].float() @ row_keys.T) * row_scales)
+            torch.relu((reference_q[row] @ row_keys.T) * row_scales)
             * weights[row, :, None]
         ).sum(0)
         reference_logits[row, :length] = values

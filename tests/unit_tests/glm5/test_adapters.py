@@ -15,6 +15,32 @@ from vllm_fl.models.glm5.indexer_backend import Glm5NextIndexerBackend
 from vllm_fl.models.glm5.runtime import Glm5ConfigError, validate_glm5_config
 
 
+def _patch_public_clamp(monkeypatch, function):
+    from vllm_fl.dispatch.backends.flaggems.impl import activation
+
+    def resolve(name):
+        assert name == "silu_and_mul_with_clamp"
+        return function
+
+    monkeypatch.setattr(activation, "get_flaggems_vllm_operator", resolve)
+
+
+@pytest.mark.parametrize(
+    "error", [AttributeError("broken math shim"), OSError("broken ABI")]
+)
+def test_library_load_failure_is_not_reported_as_missing_operator(monkeypatch, error):
+    from vllm_fl.dispatch import capabilities
+    from vllm_fl.models.glm5.indexer_backend import _load_flaggems_op
+
+    def broken(name):
+        raise error
+
+    monkeypatch.setattr(capabilities, "get_flaggems_vllm_operator", broken)
+    with pytest.raises(type(error)) as caught:
+        _load_flaggems_op("concat_mla_q", "concat_mla_q")
+    assert caught.value is error
+
+
 @pytest.fixture(autouse=True)
 def _reset_portable_bindings():
     # Tests replace capabilities/public host APIs; production bindings retain
@@ -138,6 +164,7 @@ def test_vision_blacklist_and_explicit_wrong_provider_fail_preflight(monkeypatch
 @pytest.mark.parametrize("strict", [False, True])
 def test_real_vision_adapter_preserves_unsupported_error(monkeypatch, strict):
     import flag_gems
+    import flaggems_vllm
 
     from vllm_fl.models.glm5 import vision_attention as vision
 
@@ -147,6 +174,7 @@ def test_real_vision_adapter_preserves_unsupported_error(monkeypatch, strict):
         raise NotImplementedError("FA2 unsupported shape")
 
     monkeypatch.setattr(flag_gems, "flash_attn_varlen_func", unsupported)
+    monkeypatch.setattr(flaggems_vllm, "flash_attn_varlen_func", unsupported)
     with (
         policy_context(SelectionPolicy(strict=strict)),
         pytest.raises(NotImplementedError, match="FA2 unsupported"),
@@ -242,6 +270,7 @@ def test_portable_custom_ops_propagate_execution_failure(
 
     monkeypatch.setattr(hooks, "use_nvidia_reference", lambda: False)
     monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *args: fail)
+    _patch_public_clamp(monkeypatch, fail)
     monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
     monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)
     patch = next(
@@ -276,6 +305,7 @@ def test_portable_model_clamp_propagates_unsupported_without_reference(
         raise NotImplementedError("unsupported clamp")
 
     monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *args: unsupported)
+    _patch_public_clamp(monkeypatch, unsupported)
     monkeypatch.setattr(
         SiluAndMulWithClamp,
         "forward_native",
@@ -436,6 +466,7 @@ def test_opaque_clamp_fullgraph_preserves_mutable_policy_and_native_state(monkey
         return torch.full((*x.shape[:-1], x.shape[-1] // 2), 11, dtype=x.dtype)
 
     monkeypatch.setattr(indexer_backend, "_load_flaggems_op", lambda *a: public)
+    _patch_public_clamp(monkeypatch, public)
     monkeypatch.setattr(patch, "use_nvidia_reference", lambda: True)
     monkeypatch.setattr(SiluAndMulWithClamp, "forward_cuda", native)
     monkeypatch.setattr(
@@ -558,6 +589,8 @@ def test_opaque_mhc_fake_metadata_does_not_resolve_policy(tokens, monkeypatch):
 @pytest.mark.parametrize("name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre", "clamp"])
 @pytest.mark.parametrize("backend", ["flagos", "vendor:cuda"])
 def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
+    if backend == "vendor:cuda" and not patch.use_nvidia_reference():
+        pytest.skip("This parameter validates vLLM's native NVIDIA kernels")
     from vllm_fl.models.glm5 import compile_ops
 
     torch.manual_seed(731)
@@ -705,7 +738,16 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         graph.replay()
         check(outputs)
         selected = patch._portable_binding(op_name).selected_impl
-        assert selected == ("glm5.flaggems" if backend == "flagos" else "glm5.cuda")
+        import vllm_fl.envs as fl_envs
+
+        expected = "glm5.flaggems" if backend == "flagos" else "glm5.cuda"
+        if (
+            name == "clamp"
+            and backend == "flagos"
+            and fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM
+        ):
+            expected = "default.flagos"
+        assert selected == expected
 
 
 @pytest.mark.parametrize("rows", [0, 96])
@@ -752,11 +794,10 @@ def test_fwht_fullgraph_preserves_public_binding_and_mutable_policy(
         graphs.append(graph)
         return graph.forward
 
-    compiled = torch.compile(
-        compile_ops.fwht128_quant_fp8,
-        backend=compile_backend,
-        fullgraph=True,
-        dynamic=True,
+    # Exercise Dynamo itself: some device SDKs replace torch.compile with an
+    # eager shim, even for this CPU host-ABI contract.
+    compiled = torch._dynamo.optimize(compile_backend, nopython=True, dynamic=True)(
+        compile_ops.fwht128_quant_fp8
     )
     allowed = SelectionPolicy.from_dict(per_op_order={"fwht128_quant_fp8": ["flagos"]})
     denied = SelectionPolicy.from_dict(
@@ -868,8 +909,8 @@ def test_kda_fullgraph_reads_current_layer_and_request_metadata(monkeypatch):
         fake_output = layer(fake_input, torch.empty(3, dtype=torch.int64))
         assert fake_output.shape == fake_input.shape
     assert events == []
-    forward = torch.compile(
-        layer, backend=compile_backend, fullgraph=True, dynamic=True
+    forward = torch._dynamo.optimize(compile_backend, nopython=True, dynamic=True)(
+        layer
     )
     value = torch.arange(12, dtype=torch.float32).view(3, 4)
     positions = torch.arange(3)
@@ -1007,6 +1048,7 @@ def test_required_library_preflight_fails_before_any_numeric_call(
     from vllm_fl.models.glm5 import causal_conv
 
     monkeypatch.setattr(causal_conv, "INDEXER_BACKEND", backend)
+    monkeypatch.setattr(causal_conv, "use_nvidia_reference", lambda: False)
     monkeypatch.setattr(backend, "_flag", load)
     with (
         policy_context(SelectionPolicy(prefer="flagos")),
@@ -1191,19 +1233,28 @@ for sparse in (False, True):
     else:
         # The forced CUDA fallback is unavailable here. Generic MLA must fail
         # before activation rather than borrow another model's portable plan.
-        with pytest.raises(RuntimeError, match="requires a model runtime plan"):
+        candidates = get_default_manager().registry.get_implementations("attention_backend")
+        has_flagos = any(impl.impl_id == "default.flagos" for impl in candidates)
+        reason = "requires a model runtime plan" if has_flagos else "No implementation selected"
+        with pytest.raises(RuntimeError, match=reason):
             PlatformFL.get_attn_backend_cls(None, selector)
 get_default_manager().clear_failed_impls("attention_backend")
 selector = SimpleNamespace(use_mla=False, use_sparse=False)
 # Compare the public candidate's capability contract on the actual platform.
 # Some non-NVIDIA vendors provide this generic backend; others reject CUDA.
+has_flagos = any(impl.impl_id == "default.flagos" for impl in
+                get_default_manager().registry.get_implementations("attention_backend"))
 try:
     expected = FlagGemsBackend().attention_backend()
 except RuntimeError as error:
     with pytest.raises(RuntimeError, match=re.escape(str(error))):
         PlatformFL.get_attn_backend_cls(None, selector)
 else:
-    assert PlatformFL.get_attn_backend_cls(None, selector) == expected
+    if has_flagos:
+        assert PlatformFL.get_attn_backend_cls(None, selector) == expected
+    else:
+        with pytest.raises(RuntimeError, match="No implementation selected"):
+            PlatformFL.get_attn_backend_cls(None, selector)
 
 import vllm.model_executor.layers.attention.mm_encoder_attention as mm
 import vllm.v1.attention.backends.fa_utils as fa
@@ -1237,6 +1288,7 @@ print("review contracts passed")
 
 def test_private_vision_adapter_preserves_public_fa(monkeypatch):
     import flag_gems
+    import flaggems_vllm
 
     from vllm_fl.models.glm5.vision_attention import _vision_attention
 
@@ -1247,6 +1299,7 @@ def test_private_vision_adapter_preserves_public_fa(monkeypatch):
         return query.clone(), torch.ones(1)
 
     monkeypatch.setattr(flag_gems, "flash_attn_varlen_func", fa)
+    monkeypatch.setattr(flaggems_vllm, "flash_attn_varlen_func", fa)
     q = torch.randn(1, 7, 2, 8)
     cu = torch.tensor([0, 3, 7], dtype=torch.int32)
     torch.testing.assert_close(_vision_attention(q, q, q, cu, 0.5), q)

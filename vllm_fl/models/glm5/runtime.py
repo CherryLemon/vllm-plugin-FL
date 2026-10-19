@@ -186,10 +186,15 @@ def _make_portable_binding(owner, name, flag):
     from vllm_fl.dispatch.manager import OpManager
     from vllm_fl.dispatch.types import BackendImplKind, OpImpl
     from vllm_fl.utils import use_flaggems_op
+    import vllm_fl.envs as fl_envs
 
     manager = OpManager()
     if flag is not None:
-        flag._is_available = lambda: use_flaggems_op(name)
+        # Main owns the enabled shared clamp. Keep the model adapter only for
+        # GLM's existing opt-in path when the global fused switch is disabled.
+        flag._is_available = lambda: use_flaggems_op(name) and (
+            name != "silu_and_mul_with_clamp" or not fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM
+        )
         manager.registry.register_impl(
             OpImpl(name, "glm5.flaggems", BackendImplKind.DEFAULT, flag)
         )

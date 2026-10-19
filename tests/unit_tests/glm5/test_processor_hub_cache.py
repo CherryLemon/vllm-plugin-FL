@@ -27,6 +27,22 @@ REVISION_B = "b" * 40
 
 
 @pytest.fixture(autouse=True)
+def hf_transport(monkeypatch):
+    """These fixtures describe HF snapshots, independent of ModelScope routing."""
+    monkeypatch.setenv("VLLM_USE_MODELSCOPE", "0")
+    if not hasattr(AutoTokenizer, "_from_pretrained_origin"):
+        yield
+        return
+    from modelscope.utils.hf_util.patcher import patch_hub, unpatch_hub
+
+    unpatch_hub()
+    try:
+        yield
+    finally:
+        patch_hub()
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch):
     """An offline snapshot load must never reach the HTTP boundary."""
 

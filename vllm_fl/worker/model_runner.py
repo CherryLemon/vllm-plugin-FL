@@ -6701,8 +6701,11 @@ class ModelRunnerFL(
         # runtime pool here, the profiling cleanup drops the last graph owning
         # that pool; the first real decoder capture then reuses a zero-refcount
         # CachingHostAllocator pool and aborts in capture_begin().
-        original_metadata_pool = self.common_attention_metadata_graph.graph_pool
-        self.common_attention_metadata_graph.graph_pool = profiling_pool
+        metadata_graph = self.common_attention_metadata_graph
+        original_metadata_pool = None
+        if metadata_graph is not None:
+            original_metadata_pool = metadata_graph.graph_pool
+            metadata_graph.graph_pool = profiling_pool
 
         shared_memory_estimate = {}
         per_graph_estimate = {}
@@ -6798,7 +6801,8 @@ class ModelRunnerFL(
             self.cudagraph_dispatcher.keys_initialized = False
             self.maybe_remove_all_loras(self.lora_config)
             self._cleanup_profiling_kv_cache()
-            self.common_attention_metadata_graph.graph_pool = original_metadata_pool
+            if metadata_graph is not None:
+                metadata_graph.graph_pool = original_metadata_pool
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
         # Overlay shared-pool modes, but add private Breakable pools: neither their

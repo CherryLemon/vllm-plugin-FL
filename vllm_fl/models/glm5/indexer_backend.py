@@ -25,13 +25,10 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 def _load_flaggems_op(module: str, name: str) -> Callable | None:
     """Load only the operator library's public, registered host API."""
+    from vllm_fl.dispatch.capabilities import get_flaggems_vllm_operator
+
     aliases = {"fp8_fp4_paged_mqa_logits": "paged_mqa_logits"}
-    try:
-        return getattr(
-            importlib.import_module("flaggems_vllm"), aliases.get(name, name)
-        )
-    except (ImportError, AttributeError, OSError):
-        return None
+    return get_flaggems_vllm_operator(aliases.get(name, name))
 
 
 class Glm5NextIndexerBackend:
@@ -44,7 +41,10 @@ class Glm5NextIndexerBackend:
         self._flag_ops = {}
         self._native_ops = {}
         self._bindings = {}
-        self._manager = OpManager()
+        # These host adapters carry GLM metadata (for example max_seq_len for
+        # persistent top-k). Generic built-ins with the same names have a
+        # different ABI and must not bypass the adapters or their preflight.
+        self._manager = OpManager(register_builtins=False)
         self.name = "common-policy"
 
     def _native(self, module_name, name):

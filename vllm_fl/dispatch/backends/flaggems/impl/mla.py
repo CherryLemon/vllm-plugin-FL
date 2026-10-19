@@ -368,7 +368,8 @@ def _resolve_sparse_mla_kernels():
     from vllm_fl.dispatch.types import BackendImplKind, OpImpl
     from vllm_fl.utils import use_flaggems_op
 
-    manager = OpManager()
+    # This boundary owns its public API/preflight and eager graph contract.
+    manager = OpManager(register_builtins=False)
     bindings = []
     for name in ("concat_and_cache_mla", "flash_mla_sparse_fwd"):
         op = _flag_op(name, name)
