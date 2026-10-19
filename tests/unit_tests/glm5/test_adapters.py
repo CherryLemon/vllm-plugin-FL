@@ -927,7 +927,6 @@ def test_kda_fullgraph_reads_current_layer_and_request_metadata(monkeypatch):
     torch.testing.assert_close(second, value + 9)
     assert events == [(layer.prefix, 5, 1), (replacement.prefix, 9, 0)]
     assert len(graphs) == 1
-    del cpu_lib
 
 
 @pytest.mark.gpu
