@@ -7,9 +7,9 @@ import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 
-# Upstream main after the public HY4 MLA APIs and optional MetaX TLE fixes.
-# v0.2.0 does not provide concat_mla_q or graph-safe paged MQA logits.
-COMMIT = "d4dfdfa777d2f8d8c25eceb4e08bd392644cef46"
+# Public HY4 MLA APIs, optional MetaX TLE fixes, and portable math shims.
+# The math fix is tracked in flagos-ai/FlagGems-vllm#955 (pending merge).
+COMMIT = "6f8a48649fafd8ec811b36acf7ce65915c84a6da"
 REPOSITORY = "https://github.com/flagos-ai/FlagGems-vllm.git"
 RUNTIME_PACKAGES = ("torch", "triton", "flag-gems", "vllm", "numpy")
 PACKAGE_DEPENDENCIES = ("packaging", "pybind11", "PyYAML", "sqlalchemy")

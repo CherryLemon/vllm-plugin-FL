@@ -11,13 +11,17 @@ Install the pinned upstream source along with the plugin:
 
 ```bash
 python3 -m pip install --no-deps --force-reinstall \
-  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@d4dfdfa777d2f8d8c25eceb4e08bd392644cef46'
+  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@6f8a48649fafd8ec811b36acf7ce65915c84a6da'
 python3 -m pip install --no-build-isolation -e .
 ```
 
-CI installs upstream commit `d4dfdfa777d2f8d8c25eceb4e08bd392644cef46`
-(package version `0.3.0-dev1`). This includes the public `concat_mla_q` and
-graph-safe paged MQA logits APIs required by HY4, which are absent from v0.2.0.
+CI installs commit `6f8a48649fafd8ec811b36acf7ce65915c84a6da`
+(package version `0.3.0-dev1`) from
+[FlagGems-vllm #955](https://github.com/flagos-ai/FlagGems-vllm/pull/955),
+which is pending merge and fetchable from the official repository. It includes
+the merged public `concat_mla_q` and graph-safe paged MQA logits APIs required
+by HY4, which are absent from v0.2.0, plus the portable math shim fix needed
+to import the package when a backend's core math lacks `pow` or `tanh`.
 The source commit is fixed for reproducible installs; CI verifies pip's
 `direct_url.json` rather than accepting another checkout with the same version.
 
