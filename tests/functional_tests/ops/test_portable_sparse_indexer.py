@@ -12,7 +12,13 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 from vllm_fl.attention import sparse_indexer as portable
 
-pytestmark = pytest.mark.gpu
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(
+        not native.current_platform.is_cuda(),
+        reason="HY4 currently supports NVIDIA only",
+    ),
+]
 
 
 @pytest.mark.parametrize("rows", [1, 7, 32, 33])
