@@ -4,7 +4,7 @@
 
 NOTE: The reference implementation also offers a fused MLA preprocessing
 wrapper and an HPC gated-MLA GEMM. Neither is available here, so this port
-keeps the eager MLA path with an FP8 or INT8 indexer cache. Fused variants remain a
+keeps the eager MLA path with an FP8 indexer cache. Fused variants remain a
 follow-up for when those kernels become available.
 
 The per-head learnable sink is supported through `.flashmla_sparse`, which
@@ -194,7 +194,7 @@ class Indexer(nn.Module):
         self.quant_block_size = 128
         self.topk_indices_buffer = topk_indices_buffer
 
-        # Quantized indexer cache: FP8/INT8 values plus one fp32 scale per
+        # FP8 naive cache: values in fp8 plus one fp32 scale per
         # ``quant_block_size`` elements.
         assert cache_config is not None, "HYV4 indexer requires cache_config"
         self.k_cache = DeepseekV32IndexerCache(
@@ -277,12 +277,12 @@ class Indexer(nn.Module):
 
         # Only q is quantized here; k quantization is fused with cache insertion.
         q = q.view(-1, self.head_dim)
-        q_quant, q_scale = self.runtime_plan.query_quantizer(
+        q_fp8, q_scale = self.runtime_plan.query_quantizer(
             q,
             self.quant_block_size,
             use_ue8m0=self.scale_fmt is not None,
         )
-        q_quant = q_quant.view(-1, self.n_head, self.head_dim)
+        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
         weights = (
@@ -290,7 +290,7 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return hidden_states, q_quant, k, weights
+        return hidden_states, q_fp8, k, weights
 
 
 class HYV4MLAAttention(nn.Module):
@@ -516,11 +516,8 @@ class HYV4MLAAttention(nn.Module):
         self.learnable_sink = bool(getattr(config, "learnable_sink", False))
         sinks = None
         sink_backend: type[AttentionBackend] | None = None
-        if self.is_sparse and self.runtime_plan.provider == "flaggems":
-            sink_backend = self._resolve_sink_backend(kv_cache_dtype)
         if self.learnable_sink:
-            if sink_backend is None:
-                sink_backend = self._resolve_sink_backend(kv_cache_dtype)
+            sink_backend = self._resolve_sink_backend(kv_cache_dtype)
             self.learnable_sink_param = nn.Parameter(
                 torch.empty(
                     self.num_local_heads,
@@ -552,27 +549,16 @@ class HYV4MLAAttention(nn.Module):
 
     def _resolve_sink_backend(self, kv_cache_dtype: str) -> type[AttentionBackend]:
         """Require a backend that preserves the checkpoint's sink semantics."""
-        from .flashmla_sparse import (
-            HYV4FlashMLASparseBackend,
-            HYV4PortableFlashMLASparseBackend,
-        )
-
         head_size = self.kv_lora_rank + self.qk_rope_head_dim
         dtype = torch.get_default_dtype()
-        plan = getattr(self, "runtime_plan", None)
-        portable = self.is_sparse and plan is not None and plan.provider == "flaggems"
         try:
-            selected_cls = (
-                HYV4PortableFlashMLASparseBackend
-                if portable
-                else get_attn_backend(
-                    head_size=head_size,
-                    dtype=dtype,
-                    kv_cache_dtype=kv_cache_dtype,
-                    use_mla=True,
-                    use_sparse=self.is_sparse,
-                    num_heads=self.num_local_heads,
-                )
+            selected_cls = get_attn_backend(
+                head_size=head_size,
+                dtype=dtype,
+                kv_cache_dtype=kv_cache_dtype,
+                use_mla=True,
+                use_sparse=self.is_sparse,
+                num_heads=self.num_local_heads,
             )
         except Exception as exc:
             raise RuntimeError(
@@ -581,10 +567,10 @@ class HYV4MLAAttention(nn.Module):
                 f"kv_cache_dtype={kv_cache_dtype}): {exc}"
             ) from exc
 
-        if selected_cls.supports_sink() and not portable:
+        if selected_cls.supports_sink():
             return selected_cls
 
-        candidate = selected_cls if portable else HYV4FlashMLASparseBackend
+        from .flashmla_sparse import HYV4FlashMLASparseBackend
 
         # Mirror how the selector derives the configuration-dependent inputs so
         # this check accepts exactly what the backend would accept at runtime.
@@ -600,7 +586,7 @@ class HYV4MLAAttention(nn.Module):
             if cache_config is not None and cache_config.user_specified_block_size
             else None
         )
-        invalid_reasons = candidate.validate_configuration(
+        invalid_reasons = HYV4FlashMLASparseBackend.validate_configuration(
             head_size=head_size,
             dtype=dtype,
             kv_cache_dtype=cast(CacheDType, kv_cache_dtype),
@@ -626,7 +612,7 @@ class HYV4MLAAttention(nn.Module):
             "FLASHMLA_SPARSE impl instead of %s, which cannot apply sinks.",
             selected_cls.get_name(),
         )
-        return candidate
+        return HYV4FlashMLASparseBackend
 
     def _force_sparse_mqa(self) -> None:
         """Keep every token on the sink-capable sparse MQA path.
