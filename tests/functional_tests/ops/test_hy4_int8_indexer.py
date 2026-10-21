@@ -205,7 +205,7 @@ def test_int8_query_fullgraph(monkeypatch):
 
     quantizer = mla_ops.get_operator("per_token_group_quant_int8")
     compiled = torch.compile(quantizer, fullgraph=True)
-    for rows in (1, 7, 33):
+    for rows in (1, 7, 33, 1025):
         x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
         original = x.clone()
         q, scales = compiled(x, 128, use_ue8m0=True)

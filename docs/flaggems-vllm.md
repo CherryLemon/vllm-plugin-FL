@@ -11,11 +11,11 @@ Install the pinned upstream source along with the plugin:
 
 ```bash
 python3 -m pip install --no-deps --force-reinstall \
-  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@7fd0fed43faa8e4b653912cc29f281c5ea9c3e09'
+  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@3042042968cf834f40068ccd85bfe182eec36571'
 python3 -m pip install --no-build-isolation -e .
 ```
 
-CI installs upstream commit `7fd0fed43faa8e4b653912cc29f281c5ea9c3e09`
+CI installs upstream commit `3042042968cf834f40068ccd85bfe182eec36571`
 (package version `0.3.0-dev1`) from
 [FlagGems-vllm #968](https://github.com/flagos-ai/FlagGems-vllm/pull/968), currently
 under review. It builds on merged
@@ -24,6 +24,10 @@ the public `concat_mla_q`, graph-safe paged MQA APIs and portable math shims. It
 adds matching INT8 query, key-cache, prefill and graph-safe decode operators for
 HY4 on pre-FP8 NVIDIA GPUs. Its BF16 sparse MLA dispatcher keeps Ampere/Ada on
 the generic Triton path instead of TLE descriptor copies that require Hopper.
+H100 query/prefill tuning, reproducible INT8/FP8 microbenchmarks and raw results
+are documented in the
+[operator report](https://github.com/flagos-ai/FlagGems-vllm/blob/3042042968cf834f40068ccd85bfe182eec36571/docs/hy4-int8-h100.md).
+H100 retains its FP8 default; these measurements do not change platform selection.
 The source commit is fixed for reproducible installs; CI verifies pip's
 `direct_url.json` rather than accepting another checkout with the same version.
 
