@@ -30,6 +30,7 @@ def hy4_shared_registry_isolation(request, monkeypatch):
         SimpleNamespace(
             vendor_name="nvidia",
             is_cuda=lambda: True,
+            supports_fp8=lambda: True,
             get_device_capability=lambda: DeviceCapability(9, 0),
             has_device_capability=lambda capability: capability <= 90,
         ),

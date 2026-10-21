@@ -201,12 +201,22 @@ The shared CI dependency now includes both APIs. Install the same pinned upstrea
 source using the integration instructions above; no separate HY4 upgrade is needed.
 
 HY4 uses the public `flaggems_vllm` sparse indexer, cache and attention APIs;
-query quantization uses general FlagGems. No model-specific dependency extra or
+FP8 query quantization uses general FlagGems. No model-specific dependency extra or
 fork revision is required. The shared fused-operator rollout switch and its
 default behavior are described in the integration documentation.
 Runtime selection checks callable APIs, device kernels and the shared dispatch
 policy before allocating model weights. A selected operator's execution error
 propagates without retrying another implementation.
+The sparse indexer uses E4M3 FP8 on NVIDIA compute capability 8.9 or newer.
+On SM80/SM86 it selects matching INT8 query, key-cache and MQA-logits operators
+from FlagGems-vllm. This selection is independent of INT8 W8A8 Linear/MoE
+checkpoint weights. The INT8 indexer uses BF16 MLA KV cache; it does not enable
+FP8 MLA KV on hardware without FP8 support. Selection finishes before allocating
+weights, and execution errors do not trigger a retry in another precision.
+The INT8 operators are supplied by
+[FlagGems-vllm #968](https://github.com/flagos-ai/FlagGems-vllm/pull/968), included
+in the shared source pin. INT8 operator and graph tests run on H100; A100
+execution and end-to-end checkpoint quality evaluation remain pending.
 
 Use `hy4_safetensors` to load the preview checkpoint with expert slicing. The
 portable path requires BF16 KV (`auto` with a BF16 model, or `bfloat16`); FP8 KV
