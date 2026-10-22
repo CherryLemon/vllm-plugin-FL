@@ -23,6 +23,8 @@ from vllm_fl.platform import PlatformFL
         ("mthreads", (2, 2), False),
         ("gcu", (4, 0), True),
         ("gcu", (3, 0), False),
+        ("enflame", (4, 0), True),
+        ("enflame", (3, 0), False),
         ("unknown", (9, 0), False),
     ],
 )

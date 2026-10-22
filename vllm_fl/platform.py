@@ -662,6 +662,7 @@ class PlatformFL(Platform):
             "nvidia": DeviceCapability(8, 9),
             "mthreads": DeviceCapability(3, 1),
             "gcu": DeviceCapability(4, 0),
+            "enflame": DeviceCapability(4, 0),
         }.get(cls.vendor_name)
         if minimum is None:
             return False
