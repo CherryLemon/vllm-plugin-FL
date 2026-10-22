@@ -22,8 +22,8 @@ def _packed_math_sdpa(query, key, value, **kwargs):
     assert kwargs["cu_seqlens_q"] is kwargs["cu_seqlens_k"]
     boundaries = kwargs["cu_seqlens_q"][1:]
     positions = torch.arange(query.shape[0], device=query.device)
-    # Some XPU searchsorted implementations inspect boundaries on the host,
-    # freezing them during graph capture. Comparison/reduction stays on device.
+    # Device comparison/reduction makes refreshed sequence boundaries explicit
+    # inputs to the graph, including on XPU runtimes with host-side fallbacks.
     sequences = (positions[:, None] >= boundaries[None, :]).sum(dim=1)
     result = torch.empty_like(query)
     keys = key.permute(1, 2, 0).float()

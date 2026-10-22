@@ -803,8 +803,11 @@ class WorkerFL(WorkerBase):
         # cuda graph capture.
         if (
             current_platform.device_type == "txda"
-            or getattr(current_platform, "vendor_name", None) == "kunlunxin"
+            or getattr(current_platform, "vendor_name", None) in ("kunlunxin", "thead")
         ):
+            # vLLM 0.24 imports MiniMax's NVIDIA implementation even for
+            # unrelated models, initializing unsupported FlashInfer CUDA APIs.
+            # The actual model dummy runs and graph capture remain below.
             logger.warning(
                 "Detected %s device, skipping generic kernel_warmup",
                 getattr(
