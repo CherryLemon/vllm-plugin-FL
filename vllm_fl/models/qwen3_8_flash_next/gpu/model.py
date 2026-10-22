@@ -103,6 +103,7 @@ from ..common.hyperconnection import (
 from ..config import Qwen3_8FlashNextConfig, Qwen3_8FlashNextTextConfig
 from .ple_layer import Qwen3_8FlashNextPLELayer, validate_ple_embedding_weights
 from .qsa import Qwen3_8FlashNextQSAAttention
+from .quantization import with_platform_quantization
 
 _HAS_NATIVE_STACKED_WEIGHTS_MAPPER = hasattr(
     WeightsMapper(), "orig_to_new_stacked"
@@ -661,6 +662,7 @@ class Qwen3_8FlashNextModel(nn.Module):
     hf_to_vllm_mapper = _QWEN35_HF_TO_VLLM_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        vllm_config = with_platform_quantization(vllm_config)
         super().__init__()
         config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
@@ -926,6 +928,7 @@ class Qwen3_8FlashNextForCausalLM(
     requires_raw_input_tokens = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        vllm_config = with_platform_quantization(vllm_config)
         super().__init__()
         config: Qwen3_8FlashNextTextConfig = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
@@ -1227,6 +1230,7 @@ class Qwen3_8FlashNextForConditionalGeneration(
         return Qwen3_8FlashNextModelState
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model") -> None:
+        vllm_config = with_platform_quantization(vllm_config)
         nn.Module.__init__(self)
         config: Qwen3_8FlashNextConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config

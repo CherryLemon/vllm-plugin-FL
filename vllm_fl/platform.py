@@ -647,8 +647,28 @@ class PlatformFL(Platform):
 
             patch_triton_chained_or_for_iluvatar()
 
+    @classmethod
     def supports_fp8(cls) -> bool:
-        return cls.vendor_name == "nvidia"
+        if cls.vendor_name == "nvidia":
+            return cls.has_device_capability(89)
+        if cls.vendor_name == "amd":
+            from vllm.platforms.rocm import RocmPlatform
+
+            return RocmPlatform.supports_fp8()
+        # CUDA-compatible runtimes do not imply native FP8 arithmetic.
+        return False
+
+    @classmethod
+    def is_fp8_fnuz(cls) -> bool:
+        if cls.vendor_name == "amd":
+            from vllm.platforms.rocm import RocmPlatform
+
+            return RocmPlatform.is_fp8_fnuz()
+        return False
+
+    @classmethod
+    def fp8_dtype(cls) -> torch.dtype:
+        return torch.float8_e4m3fnuz if cls.is_fp8_fnuz() else torch.float8_e4m3fn
 
     @classmethod
     def get_device_uuid(cls, device_id: int = 0) -> str:

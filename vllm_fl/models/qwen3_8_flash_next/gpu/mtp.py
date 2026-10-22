@@ -140,7 +140,9 @@ def _make_draft_vllm_config(
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
     draft_vllm_config.quant_config = draft_quant_config
-    return draft_vllm_config
+    from .quantization import with_platform_quantization
+
+    return with_platform_quantization(draft_vllm_config)
 
 
 @support_torch_compile(
