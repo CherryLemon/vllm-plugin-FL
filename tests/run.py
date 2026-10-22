@@ -357,7 +357,7 @@ class TestRunner:
 
         # Use explicit CPU count so the log shows the exact parallelism level.
         # os.cpu_count() can return None on exotic systems; fallback to 1.
-        # Cap at 16: unit tests are short and pure-CPU; beyond 16 workers the
+        # Cap at 16: beyond 16 workers the
         # per-process import overhead (torch, vllm_fl) outweighs the parallelism
         # benefit and can cause memory pressure on large CI machines.
         cpu_workers = min(os.cpu_count() or 1, 16)
@@ -408,7 +408,7 @@ class TestRunner:
             serial_args.extend(["-k", " or ".join(unit_filter.include)])
 
         print(
-            f"[run] Unit tests parallel: {cpu_workers} workers (CPU-only, no device pinning); "
+            f"[run] Unit tests parallel: {cpu_workers} workers (no device pinning); "
             "multi_gpu spawn tests run serially afterwards"
         )
 
@@ -845,6 +845,15 @@ class TestRunner:
             cmd.append("--save-gold")
 
         cmd.extend(tc.extra_args)
+        if self.config.platform == "metax" and tc.task in ("unit", "functional"):
+            cmd.extend(
+                [
+                    "-vv",
+                    "-p",
+                    "tests.utils.pytest_diagnostics",
+                    f"--test-diagnostics-dir=pytest-diagnostics/metax/{tc.task}",
+                ]
+            )
         cmd.extend(self.extra_pytest_args)
 
         return cmd
