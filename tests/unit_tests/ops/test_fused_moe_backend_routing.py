@@ -45,7 +45,10 @@ class _SupportedNativeExperts:
 
 
 @pytest.mark.parametrize("vendor", ["nvidia", "kunlunxin"])
-def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, vendor):
+@pytest.mark.parametrize("use_fused_package", [False, True])
+def test_experts_apply_resolves_platform_before_vendor_dispatch(
+    monkeypatch, vendor, use_fused_package
+):
     """Exercise the execution entry, including a vendor added after import."""
     import flag_gems
     import torch
@@ -59,7 +62,11 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(monkeypatch, ven
     result = torch.full((2, 4), 7.0)
     nvidia = Mock(return_value=result)
     kunlunxin = Mock(return_value=result)
+    monkeypatch.setattr(module.fl_envs, "VLLM_FL_USE_FLAGGEMS_VLLM", use_fused_package)
     monkeypatch.setattr(flag_gems, "fused_experts_impl", nvidia)
+    fused_package = types.ModuleType("flaggems_vllm")
+    fused_package.fused_experts_impl = nvidia
+    monkeypatch.setitem(sys.modules, "flaggems_vllm", fused_package)
     name = "vllm_fl.dispatch.backends.vendor.kunlunxin.impl.fused_moe.fused_moe"
     backend = types.ModuleType(name)
     backend.fused_experts_impl = kunlunxin

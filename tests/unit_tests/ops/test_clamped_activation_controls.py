@@ -23,7 +23,11 @@ def registered_clamp(monkeypatch):
     monkeypatch.delenv("VLLM_FL_PER_OP", raising=False)
     monkeypatch.delitem(op_registry_oot, "SiluAndMulWithClamp", raising=False)
     monkeypatch.setattr(SiluAndMulWithClampFL, "name", SiluAndMulWithClampFL.name)
-    monkeypatch.setattr(custom_ops, "_patch_unquantized_moe_oracle", lambda: None)
+    monkeypatch.setattr(
+        custom_ops,
+        "_patch_unquantized_moe_oracle",
+        lambda *, prefer_flaggems_experts=False: None,
+    )
     monkeypatch.setattr(custom_ops, "_patch_fused_moe_factory", lambda: None)
     with monkeypatch.context() as registration:
         registration.setattr(
