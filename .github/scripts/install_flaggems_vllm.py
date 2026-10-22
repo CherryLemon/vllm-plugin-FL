@@ -7,9 +7,10 @@ import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 
-# Public HY4 MLA APIs, optional MetaX TLE fixes, and portable math shims.
+
 # Pinned to the upstream merge of flagos-ai/FlagGems-vllm#955.
 COMMIT = "f775b37f3066e2935742d26c7592a5dd55499159"
+
 REPOSITORY = "https://github.com/flagos-ai/FlagGems-vllm.git"
 RUNTIME_PACKAGES = ("torch", "triton", "flag-gems", "vllm", "numpy")
 PACKAGE_DEPENDENCIES = ("packaging", "pybind11", "PyYAML", "sqlalchemy")
