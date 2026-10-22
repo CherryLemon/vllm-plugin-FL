@@ -154,7 +154,26 @@ def tp1(monkeypatch):
 @pytest.mark.parametrize(
     "block,activation", [(None, "dynamic"), (None, "static"), ([4, 4], "dynamic")]
 )
-def test_fp8_checkpoint_linear_uses_bf16_gemm(tp1, block, activation):
+@pytest.mark.parametrize("backend", ["default", "rocm"])
+def test_fp8_checkpoint_linear_uses_bf16_gemm(
+    tp1, monkeypatch, block, activation, backend
+):
+    from vllm.model_executor.layers import linear, utils
+
+    # Keep upstream GEMM selection and LinearMethod.apply real. Only replace
+    # the GPU-only ROCm op at its boundary, since this test uses CPU tensors.
+    # Exercise both choices on every CI host, including non-ROCm builders.
+    platform = SimpleNamespace(
+        is_cpu=lambda: False,
+        is_rocm=lambda: backend == "rocm",
+        is_cuda_alike=lambda: True,
+    )
+    monkeypatch.setattr(linear, "current_platform", platform)
+    monkeypatch.setattr(utils, "current_platform", platform)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    rocm_gemm = Mock(side_effect=torch.nn.functional.linear)
+    monkeypatch.setattr(torch.ops.vllm, "rocm_unquantized_gemm", rocm_gemm)
+
     config = QwenFp8Bf16Config(fp8_config(block=block, activation=activation))
     layer = ReplicatedLinear(
         5, 7, bias=False, params_dtype=torch.bfloat16, quant_config=config
@@ -182,6 +201,14 @@ def test_fp8_checkpoint_linear_uses_bf16_gemm(tp1, block, activation):
     torch.testing.assert_close(
         actual, torch.nn.functional.linear(x, expected.bfloat16()), rtol=0, atol=0
     )
+    if backend == "rocm":
+        rocm_gemm.assert_called_once()
+        args = rocm_gemm.call_args.args
+        assert args[0] is x
+        assert args[1] is layer.weight
+        assert args[0].dtype == args[1].dtype == torch.bfloat16
+    else:
+        rocm_gemm.assert_not_called()
     assert QwenFp8Bf16LinearMethod.apply is UnquantizedLinearMethod.apply
 
 
