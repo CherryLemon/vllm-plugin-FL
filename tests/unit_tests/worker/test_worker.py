@@ -34,14 +34,16 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("vendor", ["nvidia", "thead", "kunlunxin"])
 @pytest.mark.parametrize("capture", [False, True])
 def test_vendor_warmup_keeps_model_execution_and_capture(monkeypatch, vendor, capture):
-    import vllm_fl.worker.worker as module
+    import vllm_fl.worker.worker as worker_module
 
     events = []
     compilation = SimpleNamespace(
-        mode=module.CompilationMode.VLLM_COMPILE,
+        mode=worker_module.CompilationMode.VLLM_COMPILE,
         compile_sizes=[7],
         cudagraph_mode=(
-            module.CUDAGraphMode.FULL if capture else module.CUDAGraphMode.NONE
+            worker_module.CUDAGraphMode.FULL
+            if capture
+            else worker_module.CUDAGraphMode.NONE
         ),
         cudagraph_capture_sizes=[1, 2],
         get_compile_ranges=lambda: [],
@@ -70,7 +72,7 @@ def test_vendor_warmup_keeps_model_execution_and_capture(monkeypatch, vendor, ca
         model_config=SimpleNamespace(seed=17),
     )
     monkeypatch.setattr(
-        module,
+        worker_module,
         "current_platform",
         SimpleNamespace(device_type="cuda", vendor_name=vendor),
     )
@@ -80,14 +82,14 @@ def test_vendor_warmup_keeps_model_execution_and_capture(monkeypatch, vendor, ca
         assert obj is worker
         events.append(("nvidia",))
 
-    monkeypatch.setattr(module, "kernel_warmup", nvidia_warmup)
+    monkeypatch.setattr(worker_module, "kernel_warmup", nvidia_warmup)
     monkeypatch.setattr(
-        module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+        worker_module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
     )
     monkeypatch.setattr(
-        module, "set_random_seed", lambda seed: events.append(("seed", seed))
+        worker_module, "set_random_seed", lambda seed: events.append(("seed", seed))
     )
-    module.WorkerFL.compile_or_warm_up_model(worker)
+    worker_module.WorkerFL.compile_or_warm_up_model(worker)
     expected = [("dummy", 7)]
     if vendor == "nvidia":
         expected.append(("nvidia",))
@@ -210,9 +212,9 @@ class TestMemorySnapshot:
 
     def test_default_values_without_auto_measure(self):
         """Test MemorySnapshot initializes with correct default values."""
-        from vllm_fl.worker.worker import MemorySnapshot
+        import vllm_fl.worker.worker as worker_module
 
-        snapshot = MemorySnapshot(auto_measure=False)
+        snapshot = worker_module.MemorySnapshot(auto_measure=False)
 
         assert snapshot.torch_peak == 0
         assert snapshot.free_memory == 0
@@ -223,9 +225,9 @@ class TestMemorySnapshot:
 
     def test_subtraction_computes_difference(self):
         """Test MemorySnapshot subtraction operator computes correct differences."""
-        from vllm_fl.worker.worker import MemorySnapshot
+        import vllm_fl.worker.worker as worker_module
 
-        snapshot1 = MemorySnapshot(auto_measure=False)
+        snapshot1 = worker_module.MemorySnapshot(auto_measure=False)
         snapshot1.torch_peak = 1000
         snapshot1.free_memory = 5000
         snapshot1.total_memory = 10000
@@ -234,7 +236,7 @@ class TestMemorySnapshot:
         snapshot1.non_torch_memory = 2000
         snapshot1.timestamp = 10.0
 
-        snapshot2 = MemorySnapshot(auto_measure=False)
+        snapshot2 = worker_module.MemorySnapshot(auto_measure=False)
         snapshot2.torch_peak = 500
         snapshot2.free_memory = 6000
         snapshot2.total_memory = 10000
@@ -257,9 +259,9 @@ class TestMemoryProfilingResult:
 
     def test_default_values(self):
         """Test MemoryProfilingResult initializes with correct default values."""
-        from vllm_fl.worker.worker import MemoryProfilingResult
+        import vllm_fl.worker.worker as worker_module
 
-        result = MemoryProfilingResult()
+        result = worker_module.MemoryProfilingResult()
 
         assert result.weights_memory == 0
         assert result.torch_peak_increase == 0
@@ -269,9 +271,9 @@ class TestMemoryProfilingResult:
 
     def test_creates_default_snapshots(self):
         """Test MemoryProfilingResult creates default snapshot objects."""
-        from vllm_fl.worker.worker import MemoryProfilingResult
+        import vllm_fl.worker.worker as worker_module
 
-        result = MemoryProfilingResult()
+        result = worker_module.MemoryProfilingResult()
 
         assert result.before_profile is not None
         assert result.after_profile is not None
