@@ -147,6 +147,7 @@ def test_vision_blacklist_and_explicit_wrong_provider_fail_preflight(monkeypatch
     from vllm_fl.models.glm5 import vision_attention as vision
 
     monkeypatch.setattr(vision, "_BINDING", None)
+    monkeypatch.setattr(vision, "_use_math_sdpa", lambda: False)
     monkeypatch.setenv("VLLM_FL_FLAGOS_BLACKLIST", "flash_attn_varlen_func")
     with policy_context(SelectionPolicy()), pytest.raises(RuntimeError):
         vision.Glm5VisionAttention(2, 8, 0.5)
@@ -170,6 +171,7 @@ def test_real_vision_adapter_preserves_unsupported_error(monkeypatch, strict):
     from vllm_fl.models.glm5 import vision_attention as vision
 
     monkeypatch.setattr(vision, "_BINDING", None)
+    monkeypatch.setattr(vision, "_use_math_sdpa", lambda: False)
 
     def unsupported(*args, **kwargs):
         raise NotImplementedError("FA2 unsupported shape")
@@ -1160,6 +1162,7 @@ def test_glm_validator_preserves_other_models_supported_modes(arch):
 
 @pytest.mark.parametrize("tokens", [128, 512, 2051])
 def test_mqa_adapter_preserves_prefill_scale_shape(tokens, monkeypatch):
+    monkeypatch.setattr(patch.current_platform, "supports_fp8", lambda: True)
     backend = Glm5NextIndexerBackend()
     monkeypatch.setattr(backend, "is_nvidia", False)
     calls = []
@@ -1192,6 +1195,7 @@ def test_mqa_adapter_preserves_prefill_scale_shape(tokens, monkeypatch):
 def test_mqa_unavailable_or_unsupported_has_no_numeric_reference(
     monkeypatch, missing_op
 ):
+    monkeypatch.setattr(patch.current_platform, "supports_fp8", lambda: True)
     backend = Glm5NextIndexerBackend()
     monkeypatch.setattr(backend, "is_nvidia", False)
     calls = []
@@ -1305,7 +1309,10 @@ def test_private_vision_adapter_preserves_public_fa(monkeypatch, fused_mode):
     import flag_gems
     import flaggems_vllm
 
-    from vllm_fl.models.glm5.vision_attention import _vision_attention
+    from vllm_fl.models.glm5 import vision_attention as vision
+
+    monkeypatch.setattr(vision, "_BINDING", None)
+    monkeypatch.setattr(vision, "_use_math_sdpa", lambda: False)
 
     calls = []
 
@@ -1322,7 +1329,7 @@ def test_private_vision_adapter_preserves_public_fa(monkeypatch, fused_mode):
     monkeypatch.setattr(flaggems_vllm, "flash_attn_varlen_func", fa)
     q = torch.randn(1, 7, 2, 8)
     cu = torch.tensor([0, 3, 7], dtype=torch.int32)
-    torch.testing.assert_close(_vision_attention(q, q, q, cu, 0.5), q)
+    torch.testing.assert_close(vision._vision_attention(q, q, q, cu, 0.5), q)
     assert calls[0]["fa_version"] == 2
     assert calls[0]["max_seqlen_q"] == 7
     assert calls[0]["cu_seqlens_q"] is cu
@@ -1331,8 +1338,20 @@ def test_private_vision_adapter_preserves_public_fa(monkeypatch, fused_mode):
 @pytest.mark.gpu
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fused_mode", ["0", "1"])
-def test_private_vision_attention_eager_and_replay(monkeypatch, dtype, fused_mode):
-    from vllm_fl.models.glm5.vision_attention import Glm5VisionAttention
+@pytest.mark.parametrize("math_backend", [False, True])
+def test_private_vision_attention_eager_and_replay(
+    monkeypatch, dtype, fused_mode, math_backend
+):
+    from vllm_fl.models.glm5 import vision_attention as vision
+
+    monkeypatch.setattr(vision, "_BINDING", None)
+    if math_backend:
+        monkeypatch.setattr(vision, "_use_math_sdpa", lambda: True)
+        monkeypatch.setattr(
+            vision,
+            "get_flaggems_vllm_operator",
+            lambda name: pytest.fail("math SDPA must not resolve the unsupported FA2"),
+        )
 
     monkeypatch.setenv("VLLM_FL_USE_FLAGGEMS_VLLM", fused_mode)
     torch.manual_seed(17)
@@ -1340,7 +1359,7 @@ def test_private_vision_attention_eager_and_replay(monkeypatch, dtype, fused_mod
         torch.randn(1, 33, 4, 64, device="cuda", dtype=dtype) for _ in range(3)
     ]
     cu = torch.tensor([0, 16, 33], dtype=torch.int32, device="cuda")
-    layer = Glm5VisionAttention(4, 64, 64**-0.5)
+    layer = vision.Glm5VisionAttention(4, 64, 64**-0.5)
 
     def ref(boundary):
         chunks = []

@@ -167,7 +167,7 @@ class Glm5NextIndexerBackend:
             **kwargs,
         )
 
-    def preflight(self):
+    def preflight_indexer(self):
         descriptions = []
         if self.use_fp8:
             descriptions.append(self.per_token_group_quant_fp8(_preflight=True))
@@ -195,6 +195,10 @@ class Glm5NextIndexerBackend:
             self.expand_pools_and_append_tail,
         ):
             descriptions.append(method(_preflight=True))
+        return descriptions
+
+    def preflight(self):
+        descriptions = self.preflight_indexer()
         # Resolve required public entries during model initialization, before
         # state/cache mutation or CUDA graph capture can begin.
         for name in (

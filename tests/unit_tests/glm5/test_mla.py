@@ -343,6 +343,9 @@ NATIVE_ENTRIES = [
 
 @pytest.fixture
 def backend_factory(monkeypatch):
+    # Native ABI contracts model an FP8-capable NVIDIA device, independently
+    # of the runner. Real BF16/device execution is covered below separately.
+    monkeypatch.setattr(indexer_backend.current_platform, "supports_fp8", lambda: True)
     monkeypatch.setattr(indexer_backend, "use_nvidia_reference", lambda: True)
     monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
     monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)

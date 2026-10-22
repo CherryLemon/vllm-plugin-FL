@@ -148,6 +148,9 @@ def _glm_config():
 
 def _protect_patched_state(monkeypatch):
     """Restore any class/module attributes the real activation patches."""
+    # Follow the real lifecycle even when xdist runs this test before every
+    # registration test in this worker process.
+    assert glm_patch.register_glm5_next_support() is True
     from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 
     monkeypatch.setattr(

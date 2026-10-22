@@ -19,8 +19,10 @@ The native DeepGEMM candidate additionally requires NVIDIA SM90+ and its ABI.
 No device kernels are added. INT8 quantization/GEMM primitives exist, but the
 pinned operator library has no complete matching INT8 K-pool/cache/MQA chain.
 BF16 therefore avoids introducing an INT8 quantization, scale or cache ABI.
-The pinned library also lacks the newer public BF16 paged-MQA API; the adapter
-uses its existing BF16 GEMM rather than copying or adding a paged kernel.
+The public BF16 paged-MQA kernel specializes head counts 32/64, dimension 128
+and dense 64-entry pages. The adapter uses the existing BF16 GEMM/reduction
+for both prefill and decode, including other head counts, 32-entry pages and
+padded physical strides that the specialized kernel does not cover.
 
 The main MLA cache, KDA state, vision attention and unquantized MoE already use
 BF16/FP32. FP8 checkpoint conversion is outside this change: the loader continues
@@ -33,5 +35,14 @@ profiling workspace use the selected dtype. BF16 removes quantization error but
 can change near-tied TopK choices; whole-model accuracy/performance equivalence
 has not been established. Composite execution may be slower than fused FP8.
 
-CI and the GLM extra use upstream's common FlagGems-vllm pin
-`6f8a48649fafd8ec811b36acf7ce65915c84a6da`, including its portable math shim.
+CI and the GLM extra use the same FlagGems-vllm portability pin
+`4ec48111ae38053f9e428d2c3a7caa99b50d2abe`, from operator PR #941. It includes the common main
+math shim, optional constexpr/optimizer-hint compatibility, software FP8 cache
+writes for HY4 on A100, and synchronized wall-clock tuning when Kunlunxin event
+timing returns zero. Successful event timings are unchanged.
+
+Kunlunxin vision attention selects existing PyTorch SDPA math operations before
+execution because its FA2 compiler rejects select predicates. The adapter keeps
+packed sequence boundaries on device and chunks queries to bound intermediate
+memory. Other platforms retain public FlagGems-vllm FA2. This is a correctness
+path with no new device kernel; its performance is not qualified.

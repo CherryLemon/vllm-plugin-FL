@@ -69,6 +69,7 @@ def _upstream_api(calls, *, error=None):
 
 @pytest.fixture
 def load_adapter(monkeypatch):
+    monkeypatch.setattr(indexer_backend.current_platform, "supports_fp8", lambda: True)
     monkeypatch.setattr(indexer_backend, "use_nvidia_reference", lambda: True)
     monkeypatch.setattr(provider, "use_nvidia_reference", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
@@ -333,6 +334,7 @@ def _assert_outputs_close(reference, actual) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 24, 257, 1024])
+@pytest.mark.gpu
 def test_mhc_broadcast_matches_materialized_reference(tokens: int) -> None:
     generic, broadcast = _require_cuda_broadcast_kernel()
     values = _make_inputs(tokens)
@@ -347,6 +349,7 @@ def test_mhc_broadcast_matches_materialized_reference(tokens: int) -> None:
         assert torch.equal(lhs, rhs)
 
 
+@pytest.mark.gpu
 def test_mhc_broadcast_cuda_graph_replay() -> None:
     generic, broadcast = _require_cuda_broadcast_kernel()
     values = _make_inputs(24)
@@ -376,6 +379,7 @@ def test_mhc_broadcast_cuda_graph_replay() -> None:
 
 
 @pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.gpu
 def test_mhc_broadcast_converts_norm_weight_like_upstream(strided: bool) -> None:
     generic, broadcast = _require_cuda_broadcast_kernel()
     values = _make_inputs(24)
@@ -391,6 +395,7 @@ def test_mhc_broadcast_converts_norm_weight_like_upstream(strided: bool) -> None
     _assert_outputs_close(reference, actual)
 
 
+@pytest.mark.gpu
 def test_mhc_broadcast_empty_tokens() -> None:
     _, broadcast = _require_cuda_broadcast_kernel()
     values = _make_inputs(0)
@@ -404,6 +409,7 @@ def test_mhc_broadcast_empty_tokens() -> None:
         assert output.device == values["residual"].device
 
 
+@pytest.mark.gpu
 def test_mhc_broadcast_fullgraph_compile_and_replay() -> None:
     generic, broadcast = _require_cuda_broadcast_kernel()
     values = _make_inputs(24)
@@ -460,6 +466,7 @@ def test_mhc_broadcast_fullgraph_compile_and_replay() -> None:
 @pytest.mark.parametrize(
     "tokens,strided", [(0, False), (0, True), (1, False), (24, False)]
 )
+@pytest.mark.gpu
 def test_mhc_broadcast_fake_matches_actual_metadata(tokens, strided) -> None:
     _, broadcast = _require_cuda_broadcast_kernel()
     from torch._subclasses.fake_tensor import FakeTensorMode

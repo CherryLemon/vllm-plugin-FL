@@ -3,12 +3,47 @@
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_fl.dispatch.capabilities import get_flaggems_vllm_operator
 
 _BINDING = None
+
+
+def _use_math_sdpa():
+    return current_platform.vendor_name == "kunlunxin"
+
+
+def _packed_math_sdpa(query, key, value, **kwargs):
+    """Reuse existing SDPA math ops when the XPU FA2 compiler rejects selects."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    assert kwargs["dropout_p"] == 0 and not kwargs["causal"]
+    assert kwargs["cu_seqlens_q"] is kwargs["cu_seqlens_k"]
+    boundaries = kwargs["cu_seqlens_q"][1:]
+    positions = torch.arange(query.shape[0], device=query.device)
+    sequences = torch.searchsorted(boundaries, positions, right=True)
+    result = torch.empty_like(query)
+    keys = key.transpose(0, 1).unsqueeze(0)
+    values = value.transpose(0, 1).unsqueeze(0)
+    # A small query tile bounds mask/intermediate memory independently of the
+    # packed token count. GPU boundaries remain dynamic during graph replay.
+    with sdpa_kernel(SDPBackend.MATH):
+        for start in range(0, query.shape[0], 32):
+            mask = sequences[start : start + 32, None] == sequences[None, :]
+            output = F.scaled_dot_product_attention(
+                query[start : start + 32].transpose(0, 1).unsqueeze(0),
+                keys,
+                values,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=kwargs["softmax_scale"],
+            )
+            result[start : start + 32] = output.squeeze(0).transpose(0, 1)
+    return result
 
 
 def get_vision_binding():
@@ -28,7 +63,7 @@ def get_vision_binding():
             return flash_attn_varlen_func(*args, **kwargs)
 
         def available():
-            if not use_flaggems_op("flash_attn_varlen_func"):
+            if _use_math_sdpa() or not use_flaggems_op("flash_attn_varlen_func"):
                 return False
             return callable(get_flaggems_vllm_operator("flash_attn_varlen_func"))
 
@@ -42,10 +77,25 @@ def get_vision_binding():
                 flag,
             )
         )
+        _packed_math_sdpa._is_available = lambda: (
+            _use_math_sdpa() and use_flaggems_op("flash_attn_varlen_func")
+        )
+        manager.registry.register_impl(
+            OpImpl(
+                "flash_attn_varlen_func",
+                "glm5.vision.torch",
+                BackendImplKind.REFERENCE,
+                _packed_math_sdpa,
+            )
+        )
+        manager.bump_policy_epoch()
         _BINDING = OperatorBinding(
             manager,
             "flash_attn_varlen_func",
-            graph_capabilities={"glm5.vision.flaggems": True},
+            graph_capabilities={
+                "glm5.vision.flaggems": True,
+                "glm5.vision.torch": True,
+            },
         )
     return _BINDING
 

@@ -148,7 +148,8 @@ class Bf16Indexer:
         cache = cache.squeeze(2)
         del schedule_metadata
         # Reuse BF16 GEMM/ReLU/reduction for arbitrary physical page strides and
-        # head counts; the specialized BF16 API is absent from the pinned library.
+        # head counts; the specialized BF16 API only handles dense 64-entry pages
+        # with head count 32/64 and does not accept physical cache strides.
         result = query.new_empty((batch * next_n, max_model_len), dtype=torch.float32)
         offsets = torch.arange(max_model_len, device=query.device)
         page_indices = offsets // cache.shape[1]

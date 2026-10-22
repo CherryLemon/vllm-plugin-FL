@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capability-gated indexer storage, numerical and replay contracts."""
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 import torch
 
@@ -75,7 +78,7 @@ def test_bf16_fake_and_preflight_never_resolve_fp8(bf16_backend):
         )
     assert values.dtype == torch.bfloat16 and values.shape == (3, 128)
     assert scale.dtype == torch.float32 and scale.shape == (3, 1)
-    descriptions = bf16_backend.preflight()
+    descriptions = bf16_backend.preflight_indexer()
     assert descriptions
     assert all("fp8" not in name for name in bf16_backend._bindings)
 
@@ -244,8 +247,6 @@ def test_portable_metadata_does_not_launch_deepgemm(monkeypatch, native, glm_lay
 
 
 def test_nvidia_capability_does_not_initialize_cuda(monkeypatch):
-    from vllm.platforms.cuda import NvmlCudaPlatform
-
     monkeypatch.setattr(PlatformFL, "vendor_name", "nvidia")
     monkeypatch.setattr(
         torch.cuda,
@@ -258,7 +259,11 @@ def test_nvidia_capability_does_not_initialize_cuda(monkeypatch):
         calls.append(device_id)
         return DeviceCapability(9, 0)
 
-    monkeypatch.setattr(NvmlCudaPlatform, "get_device_capability", capability)
+    # Vendor wheels need not ship NVIDIA's extension imported by this module.
+    # Stub the NVML boundary, retaining the actual PlatformFL capability logic.
+    cuda_module = ModuleType("vllm.platforms.cuda")
+    cuda_module.NvmlCudaPlatform = SimpleNamespace(get_device_capability=capability)
+    monkeypatch.setitem(sys.modules, "vllm.platforms.cuda", cuda_module)
     assert PlatformFL.get_device_capability(2) == DeviceCapability(9, 0)
     assert PlatformFL.supports_fp8()
     assert calls == [2, 0]
