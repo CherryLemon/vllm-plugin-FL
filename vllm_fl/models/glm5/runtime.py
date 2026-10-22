@@ -192,8 +192,12 @@ def _make_portable_binding(owner, name, flag):
     if flag is not None:
         # Main owns the enabled shared clamp. Keep the model adapter only for
         # GLM's existing opt-in path when the global fused switch is disabled.
-        flag._is_available = lambda: use_flaggems_op(name) and (
-            name != "silu_and_mul_with_clamp" or not fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM
+        flag._is_available = lambda: (
+            use_flaggems_op(name)
+            and (
+                name != "silu_and_mul_with_clamp"
+                or not fl_envs.VLLM_FL_USE_FLAGGEMS_VLLM
+            )
         )
         manager.registry.register_impl(
             OpImpl(name, "glm5.flaggems", BackendImplKind.DEFAULT, flag)
@@ -442,6 +446,17 @@ def validate_glm5_config(vllm_config) -> None:
             "GLM5-Next on vLLM 0.24 supports unquantized checkpoints only; "
             "FP8/mixed-precision attention projection loading is not implemented"
         )
+
+    if not current_platform.supports_fp8():
+        text = getattr(model, "hf_text_config", None) or getattr(
+            model, "hf_config", None
+        )
+        if getattr(text, "qk_rope_head_dim", 0) != 0 or not getattr(
+            text, "index_kpool_compress", True
+        ):
+            raise Glm5ConfigError(
+                "GLM5 BF16 indexer requires zero RoPE channels and K-pool compression"
+            )
 
 
 def _glm5_attention_override(use_mla: bool, use_sparse: bool) -> str | None:

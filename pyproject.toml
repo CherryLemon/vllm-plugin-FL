@@ -44,7 +44,7 @@ Homepage = "https://github.com/flagos-ai/vllm-plugin-FL"
 
 [project.optional-dependencies]
 glm5 = [
-    "flaggems_vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@main",
+    "flaggems_vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@6f8a48649fafd8ec811b36acf7ce65915c84a6da",
     "tilelang==0.1.9",
 ]
 test = [
@@ -52,6 +52,7 @@ test = [
     "pytest-cov",
     "pytest-timeout",
     "pytest-json-report",
+    "pytest-xdist>=3.0.0",
     "numpy",
     "requests",
     "openai",

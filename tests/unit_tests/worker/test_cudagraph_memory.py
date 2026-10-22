@@ -80,6 +80,7 @@ def test_graph_memory_preserves_pool_policy_and_cleans_up(
     runner = SimpleNamespace(
         common_attention_metadata_graph=metadata,
         vllm_config=SimpleNamespace(),
+        graph_runtime=None,
         _init_minimal_kv_cache_for_profiling=MagicMock(),
         _cleanup_profiling_kv_cache=MagicMock(),
         cudagraph_dispatcher=dispatcher,

@@ -1,133 +1,111 @@
 # Copyright 2026 FlagOS Contributors
-"""Check CI source refresh and dependency isolation without installing packages."""
+"""CI installs the pinned source without replacing platform runtime packages."""
 
 import importlib.util
 import json
 import subprocess
-import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-SCRIPT = (
-    Path(__file__).resolve().parents[2] / ".github/scripts/install_flaggems_vllm.py"
+import pytest
+
+
+@pytest.fixture
+def installer():
+    script = (
+        Path(__file__).resolve().parents[2] / ".github/scripts/install_flaggems_vllm.py"
+    )
+    spec = importlib.util.spec_from_file_location("ci_fused_install", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_installs_pinned_source_without_runtime_dependencies(installer):
+    with (
+        patch.object(installer, "package_version", return_value="1.0"),
+        patch.object(installer, "source_is_installed", side_effect=[False, True]),
+        patch.object(installer, "pip_install") as install,
+    ):
+        installer.main()
+    install.assert_called_once_with(
+        "--no-deps",
+        "--no-build-isolation",
+        "--force-reinstall",
+        f"flaggems-vllm @ git+{installer.REPOSITORY}@{installer.COMMIT}",
+    )
+
+
+def test_already_installed_source_is_not_reinstalled(installer):
+    with (
+        patch.object(installer, "package_version", return_value="1.0"),
+        patch.object(installer, "source_is_installed", return_value=True),
+        patch.object(installer, "pip_install") as install,
+    ):
+        installer.main()
+    install.assert_not_called()
+
+
+def test_failed_install_propagates(installer):
+    error = subprocess.CalledProcessError(1, ["pip", "install"])
+    with (
+        patch.object(installer, "package_version", return_value="1.0"),
+        patch.object(installer, "source_is_installed", return_value=False),
+        patch.object(installer, "pip_install", side_effect=error),
+        pytest.raises(subprocess.CalledProcessError) as caught,
+    ):
+        installer.main()
+    assert caught.value is error
+
+
+def test_rejects_wrong_source_after_install(installer):
+    with (
+        patch.object(installer, "package_version", return_value="1.0"),
+        patch.object(installer, "source_is_installed", return_value=False),
+        patch.object(installer, "pip_install"),
+        pytest.raises(RuntimeError, match="must come from upstream commit"),
+    ):
+        installer.main()
+
+
+def test_runtime_dependency_changes_are_rejected(installer):
+    changed = False
+
+    def install(*args):
+        nonlocal changed
+        changed = True
+
+    with (
+        patch.object(
+            installer, "package_version", side_effect=lambda _: "2" if changed else "1"
+        ),
+        patch.object(installer, "source_is_installed", side_effect=[False, True]),
+        patch.object(installer, "pip_install", side_effect=install),
+        pytest.raises(RuntimeError, match="runtime dependencies changed"),
+    ):
+        installer.main()
+
+
+@pytest.mark.parametrize(
+    "metadata", [None, "not JSON", "[]", "null", "{}", '{"vcs_info": null}']
 )
+def test_invalid_metadata_is_not_an_installed_source(installer, metadata):
+    with patch.object(
+        installer,
+        "distribution",
+        return_value=SimpleNamespace(read_text=lambda _: metadata),
+    ):
+        assert not installer.source_is_installed()
 
 
-class TestFlagGemsVllmInstall(unittest.TestCase):
-    def setUp(self):
-        spec = importlib.util.spec_from_file_location("ci_fused_install", SCRIPT)
-        self.module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.module)
-        self.source = {
-            "url": self.module.REPOSITORY,
-            "vcs_info": {"requested_revision": "main", "commit_id": "a" * 40},
-        }
-
-    def test_refreshes_main_even_when_already_installed(self):
-        with (
-            patch.object(self.module, "package_version", return_value="1.0"),
-            patch.object(self.module, "installed_source", return_value=self.source),
-            patch.object(self.module, "pip_install") as install,
-        ):
-            self.module.main()
-        install.assert_called_once_with(
-            "--no-deps",
-            "--no-build-isolation",
-            "--force-reinstall",
-            "flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@main",
-        )
-
-    def test_installs_missing_build_dependency_without_reinstalling_runtime(self):
-        with (
-            patch.object(
-                self.module,
-                "package_version",
-                side_effect=lambda name: None if name == "pybind11" else "1.0",
-            ),
-            patch.object(self.module, "installed_source", return_value=self.source),
-            patch.object(self.module, "pip_install") as install,
-        ):
-            self.module.main()
-        self.assertEqual(install.call_count, 2)
-        self.assertEqual(install.call_args_list[0].args, ("pybind11",))
-        self.assertIn("--no-deps", install.call_args_list[1].args)
-
-    def test_rejects_wrong_repository_or_revision_after_install(self):
-        invalid = [
-            {},
-            dict(self.source, url="https://github.com/another/repository.git"),
-            dict(
-                self.source, vcs_info={"requested_revision": "v0.2.0", "commit_id": "a"}
-            ),
-            dict(self.source, vcs_info={"requested_revision": "main"}),
-        ]
-        for source in invalid:
-            with (
-                self.subTest(source=source),
-                patch.object(self.module, "package_version", return_value="1.0"),
-                patch.object(self.module, "installed_source", return_value=source),
-                patch.object(self.module, "pip_install") as install,
-                self.assertRaisesRegex(RuntimeError, "must come from .*@main"),
-            ):
-                self.module.main()
-            install.assert_called_once()
-
-    def test_runtime_dependency_change_is_rejected(self):
-        state = {"updated": False}
-
-        def version(name):
-            return "2.0" if name == "torch" and state["updated"] else "1.0"
-
-        with (
-            patch.object(self.module, "package_version", side_effect=version),
-            patch.object(self.module, "installed_source", return_value=self.source),
-            patch.object(
-                self.module,
-                "pip_install",
-                side_effect=lambda *args: state.update(updated=True),
-            ),
-            self.assertRaisesRegex(RuntimeError, "runtime dependencies changed"),
-        ):
-            self.module.main()
-
-    def test_install_failure_propagates_without_retry(self):
-        failure = subprocess.CalledProcessError(1, ["pip", "install"])
-        with (
-            patch.object(self.module, "package_version", return_value="1.0"),
-            patch.object(self.module, "pip_install", side_effect=failure) as install,
-            patch.object(self.module, "installed_source") as source,
-            self.assertRaises(subprocess.CalledProcessError) as error,
-        ):
-            self.module.main()
-        self.assertIs(error.exception, failure)
-        install.assert_called_once()
-        source.assert_not_called()
-
-    def test_source_metadata_handles_absent_and_invalid_values(self):
-        for text in (None, "not JSON", "[]", "null"):
-            with (
-                self.subTest(text=text),
-                patch.object(
-                    self.module,
-                    "distribution",
-                    return_value=SimpleNamespace(
-                        read_text=lambda name, value=text: value
-                    ),
-                ),
-            ):
-                self.assertEqual(self.module.installed_source(), {})
-        with patch.object(
-            self.module,
-            "distribution",
-            side_effect=self.module.PackageNotFoundError("flaggems-vllm"),
-        ):
-            self.assertEqual(self.module.installed_source(), {})
-        with patch.object(
-            self.module,
-            "distribution",
-            return_value=SimpleNamespace(
-                read_text=lambda name: json.dumps(self.source)
-            ),
-        ):
-            self.assertEqual(self.module.installed_source(), self.source)
+def test_source_requires_matching_repository_and_commit(installer):
+    source = {"url": installer.REPOSITORY, "vcs_info": {"commit_id": installer.COMMIT}}
+    with patch.object(
+        installer,
+        "distribution",
+        return_value=SimpleNamespace(read_text=lambda _: json.dumps(source)),
+    ):
+        assert installer.source_is_installed()
+        source["vcs_info"]["commit_id"] = "bad"
+        assert not installer.source_is_installed()

@@ -47,7 +47,11 @@ def _has_nvidia_reference_kernels() -> bool:
 
 
 def use_nvidia_reference() -> bool:
-    return current_platform.is_cuda() and _has_nvidia_reference_kernels()
+    return (
+        current_platform.is_cuda()
+        and _has_nvidia_reference_kernels()
+        and current_platform.has_device_capability(90)
+    )
 
 
 __all__ = ["use_nvidia_reference"]

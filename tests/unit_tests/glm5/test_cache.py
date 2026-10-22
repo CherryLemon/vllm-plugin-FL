@@ -776,6 +776,7 @@ def run_reshape(backend, spec, kernel_size):
         kv_cache_config=SimpleNamespace(kv_cache_tensors=[], kv_cache_groups=[group]),
         cache_config=SimpleNamespace(cache_dtype="auto"),
         runner_only_attn_layers=set(),
+        use_ascend_hybrid_cache=False,
         _kv_cache_spec_attn_group_iterator=lambda: iter([group]),
     )
     raw = torch.zeros(spec.page_size_bytes * 3, dtype=torch.uint8)
@@ -801,30 +802,32 @@ def test_other_compressed_backend_keeps_own_page_size(storage):
 
 
 @pytest.mark.parametrize("logical,padding", [(256, 0), (512, 0), (512, 256)])
+@pytest.mark.parametrize("dtype,head_size", [(torch.uint8, 132), (torch.bfloat16, 128)])
 def test_glm_padded_pages_are_views_with_shared_descriptor(
-    logical, padding, monkeypatch
+    logical, padding, dtype, head_size, monkeypatch
 ):
     from vllm.platforms import current_platform
 
     monkeypatch.setattr(
         current_platform, "get_device_capability", lambda: SimpleNamespace(major=9)
     )
+    itemsize = torch.empty((), dtype=dtype).element_size()
     spec = MLAAttentionSpec(
         block_size=logical,
         compress_ratio=4,
         num_kv_heads=1,
-        head_size=132,
-        dtype=torch.uint8,
-        page_size_padded=logical // 4 * 132 + padding,
+        head_size=head_size,
+        dtype=dtype,
+        page_size_padded=logical // 4 * head_size * itemsize + padding,
         indexes_kv_by_block_stride=True,
     )
     layout = get_physical_cache_layout(Glm5NextIndexerAttentionBackend, spec)
     raw, cache = run_reshape(Glm5NextIndexerAttentionBackend, spec, 64)
     assert cache.shape[:2] == (3 * layout.pages_per_block, layout.kernel_block_size)
-    assert cache.stride(0) == spec.page_size_bytes // layout.pages_per_block
+    assert cache.stride(0) * itemsize == spec.page_size_bytes // layout.pages_per_block
     assert cache.data_ptr() == raw.data_ptr()
     cache[-1, -1, ...] = 17
-    assert raw.eq(17).any()
+    assert raw.view(dtype).eq(17).any()
 
 
 def test_metadata_builder_delegates_non_glm_and_uses_same_glm_layout(monkeypatch):

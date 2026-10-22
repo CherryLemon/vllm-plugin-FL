@@ -54,6 +54,7 @@ def _reset_portable_bindings():
 def backend(monkeypatch):
     from vllm_fl.models.glm5 import provider
 
+    monkeypatch.setattr(provider.current_platform, "supports_fp8", lambda: True)
     monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
     monkeypatch.delenv("VLLM_FL_FLAGOS_WHITELIST", raising=False)
     monkeypatch.delenv("VLLM_FL_FLAGOS_BLACKLIST", raising=False)
@@ -751,10 +752,15 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
 
 
 @pytest.mark.parametrize("rows", [0, 96])
-def test_fwht_fake_matches_public_api_without_policy(rows, monkeypatch):
+@pytest.mark.parametrize("use_fp8", [False, True])
+def test_fwht_fake_matches_public_api_without_policy(rows, use_fp8, monkeypatch):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     from vllm_fl.models.glm5 import compile_ops, indexer_backend
+
+    monkeypatch.setattr(
+        indexer_backend.current_platform, "supports_fp8", lambda: use_fp8
+    )
 
     def resolve(*args, **kwargs):
         pytest.fail("Fake FWHT resolved policy or executed a kernel")
@@ -767,7 +773,8 @@ def test_fwht_fake_matches_public_api_without_policy(rows, monkeypatch):
     with FakeTensorMode():
         q = torch.empty(rows, 128, dtype=torch.bfloat16)
         values, scales = compile_ops.fwht128_quant_fp8(q)
-    assert values.shape == (rows, 128) and values.dtype == torch.float8_e4m3fn
+    assert values.shape == (rows, 128)
+    assert values.dtype == (torch.float8_e4m3fn if use_fp8 else torch.bfloat16)
     assert scales.shape == (rows, 1) and scales.dtype == torch.float32
     assert values.stride() == (128, 1) and scales.stride() == (1, 1)
     assert values.device == scales.device == q.device
@@ -931,7 +938,14 @@ def test_kda_fullgraph_reads_current_layer_and_request_metadata(monkeypatch):
 
 @pytest.mark.gpu
 def test_fwht_public_abi_survives_compile_and_graph_replay():
-    from flaggems_vllm import fwht128_quant_fp8 as public_fwht
+    from flaggems_vllm import fwht128_quant_fp8, hadamard128
+
+    from vllm.platforms import current_platform
+
+    def public_fwht(q):
+        if current_platform.supports_fp8():
+            return fwht128_quant_fp8(q)
+        return hadamard128(q), q.new_ones((q.shape[0], 1), dtype=torch.float32)
 
     from vllm_fl.models.glm5 import compile_ops
 

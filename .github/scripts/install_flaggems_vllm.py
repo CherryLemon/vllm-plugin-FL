@@ -1,5 +1,5 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
-"""Install FlagGems-vllm main in every platform's CI interpreter."""
+"""Install the same pinned FlagGems-vllm source in every CI interpreter."""
 
 import json
 import os
@@ -7,7 +7,9 @@ import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 
-SOURCE_REF = "main"
+# Public HY4 MLA APIs, optional MetaX TLE fixes, and portable math shims.
+# The math fix is tracked in flagos-ai/FlagGems-vllm#955 (pending merge).
+COMMIT = "6f8a48649fafd8ec811b36acf7ce65915c84a6da"
 REPOSITORY = "https://github.com/flagos-ai/FlagGems-vllm.git"
 RUNTIME_PACKAGES = ("torch", "triton", "flag-gems", "vllm", "numpy")
 PACKAGE_DEPENDENCIES = ("packaging", "pybind11", "PyYAML", "sqlalchemy")
@@ -20,13 +22,18 @@ def package_version(name):
         return None
 
 
-def installed_source():
+def source_is_installed():
     try:
         text = distribution("flaggems-vllm").read_text("direct_url.json")
         source = json.loads(text or "{}")
     except (PackageNotFoundError, ValueError):
-        return {}
-    return source if isinstance(source, dict) else {}
+        return False
+    if not isinstance(source, dict) or not isinstance(source.get("vcs_info"), dict):
+        return False
+    return (
+        source.get("url", "").removesuffix(".git") == REPOSITORY.removesuffix(".git")
+        and source.get("vcs_info", {}).get("commit_id") == COMMIT
+    )
 
 
 def pip_install(*args):
@@ -39,27 +46,22 @@ def main():
     missing = [name for name in PACKAGE_DEPENDENCIES if package_version(name) is None]
     if missing:
         pip_install(*missing)
-    # Branch contents can change without a package-version change. Refresh main
-    # even when the image already contains an installation from that branch.
-    pip_install(
-        "--no-deps",
-        "--no-build-isolation",
-        "--force-reinstall",
-        f"flaggems-vllm @ git+{REPOSITORY}@{SOURCE_REF}",
-    )
-    source = installed_source()
-    vcs = source.get("vcs_info", {})
-    if (
-        source.get("url", "").removesuffix(".git") != REPOSITORY.removesuffix(".git")
-        or vcs.get("requested_revision") != SOURCE_REF
-        or not vcs.get("commit_id")
-    ):
-        raise RuntimeError(f"FlagGems-vllm must come from {REPOSITORY}@{SOURCE_REF}")
+    if not source_is_installed():
+        # Replace another source even if its package version is identical.
+        # Reuse the build tools already used by this platform's plugin setup.
+        pip_install(
+            "--no-deps",
+            "--no-build-isolation",
+            "--force-reinstall",
+            f"flaggems-vllm @ git+{REPOSITORY}@{COMMIT}",
+        )
+    if not source_is_installed():
+        raise RuntimeError(f"FlagGems-vllm must come from upstream commit {COMMIT}")
     after = {name: package_version(name) for name in RUNTIME_PACKAGES}
     if after != before:
         raise RuntimeError(f"CI runtime dependencies changed: {before} -> {after}")
     print(
-        f"FlagGems-vllm: {SOURCE_REF}, commit {vcs['commit_id']}, "
+        f"FlagGems-vllm: upstream commit {COMMIT}, "
         f"package metadata {package_version('flaggems-vllm')}"
     )
 

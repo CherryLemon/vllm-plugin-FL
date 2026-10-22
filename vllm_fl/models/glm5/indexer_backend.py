@@ -12,6 +12,7 @@ from collections.abc import Callable
 from functools import cached_property
 
 import torch
+
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -35,9 +36,12 @@ class Glm5NextIndexerBackend:
     """GLM implementations selected by the published common dispatch policy."""
 
     def __init__(self) -> None:
+        from .indexer_bf16 import Bf16Indexer
         from vllm_fl.dispatch.manager import OpManager
 
-        self.is_nvidia = use_nvidia_reference()
+        self.use_fp8 = current_platform.supports_fp8()
+        self.bf16 = Bf16Indexer(self)
+        self.is_nvidia = self.use_fp8 and use_nvidia_reference()
         self._flag_ops = {}
         self._native_ops = {}
         self._bindings = {}
@@ -165,8 +169,12 @@ class Glm5NextIndexerBackend:
 
     def preflight(self):
         descriptions = []
+        if self.use_fp8:
+            descriptions.append(self.per_token_group_quant_fp8(_preflight=True))
+        else:
+            for name in ("hadamard128", "qsa_store_cache_rows", "router_gemm"):
+                descriptions.append(self._kpool(name, _preflight=True))
         for method in (
-            self.per_token_group_quant_fp8,
             self.indexer_k_quant_and_cache,
             self.cp_gather_indexer_k_quant_cache,
             self.mqa_logits,
@@ -227,6 +235,10 @@ class Glm5NextIndexerBackend:
         )
 
     def indexer_k_quant_and_cache(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "indexer_k_bf16_and_cache", None, self.bf16.insert, *args, **kwargs
+            )
         return self._run(
             "indexer_k_quant_and_cache",
             "indexer_k_quant_and_cache",
@@ -238,6 +250,10 @@ class Glm5NextIndexerBackend:
         )
 
     def cp_gather_indexer_k_quant_cache(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "gather_indexer_k_bf16_cache", None, self.bf16.gather, *args, **kwargs
+            )
         return self._run(
             "cp_gather_indexer_k_quant_cache",
             "cp_gather_indexer_k_quant_cache",
@@ -249,6 +265,10 @@ class Glm5NextIndexerBackend:
         )
 
     def mqa_logits(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "bf16_mqa_logits", None, self.bf16.logits, *args, **kwargs
+            )
         return self._run(
             "fp8_fp4_mqa_logits",
             "fp8_fp4_mqa_logits",
@@ -260,6 +280,10 @@ class Glm5NextIndexerBackend:
         )
 
     def paged_mqa_logits(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "bf16_paged_mqa_logits", None, self.bf16.paged_logits, *args, **kwargs
+            )
         return self._run(
             "fp8_fp4_paged_mqa_logits",
             "fp8_fp4_paged_mqa_logits",
@@ -337,12 +361,8 @@ class Glm5NextIndexerBackend:
                 (workspace,) = workspace_manager().get_simultaneous(
                     ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
                 )
-                return persistent(
-                    logits, lengths, output, workspace, k, max_seq_len
-                )
-            return ordinary(
-                logits, next_n, lengths, output, rows, s0, s1, k
-            )
+                return persistent(logits, lengths, output, workspace, k, max_seq_len)
+            return ordinary(logits, next_n, lengths, output, rows, s0, s1, k)
 
         return self._call_flag(
             "top_k_per_row_decode",
@@ -412,12 +432,24 @@ class Glm5NextIndexerBackend:
         return self._call_flag(name, self._flag(name, name), None, *args, **kwargs)
 
     def fwht128_quant_fp8(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "indexer_query_bf16", None, self.bf16.query, *args, **kwargs
+            )
         return self._kpool("fwht128_quant_fp8", *args, **kwargs)
 
     def kpool_compress_and_write_cache(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "kpool_compress_bf16", None, self.bf16.compress, *args, **kwargs
+            )
         return self._kpool("kpool_compress_and_write_cache", *args, **kwargs)
 
     def kpool_decode_update_and_maybe_write_cache_batched(self, *args, **kwargs):
+        if not self.use_fp8:
+            return self._call_flag(
+                "kpool_decode_bf16", None, self.bf16.decode, *args, **kwargs
+            )
         return self._kpool(
             "kpool_decode_update_and_maybe_write_cache_batched", *args, **kwargs
         )

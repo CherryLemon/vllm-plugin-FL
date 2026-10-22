@@ -235,12 +235,30 @@ def _indexer_build_patch(fingerprint: str) -> PendingPatch:
             common_attn_metadata = common_attn_metadata.replace(
                 block_table_tensor=translated_table
             )
-        return pristine(
-            self,
-            common_prefix_len,
-            common_attn_metadata,
-            fast_build,
-        )
+        # vLLM constructs DeepGEMM scheduling metadata merely because the
+        # package is installed. Portable/BF16 GLM scoring does not use it and
+        # must not launch it on an unsupported device (e.g. A100).
+        from vllm_fl.activation import temporary_patches
+        from vllm_fl.models.glm5.provider import use_nvidia_reference
+
+        patches = []
+        if (
+            getattr(self, "_glm5_physical_layout", None) is not None
+            and not use_nvidia_reference()
+        ):
+            patches.append(
+                PendingPatch(
+                    target=f"{indexer_backend.__name__}.has_deep_gemm",
+                    owner=indexer_backend,
+                    attr="has_deep_gemm",
+                    pristine=indexer_backend.has_deep_gemm,
+                    replacement=lambda: False,
+                    fingerprint=fingerprint,
+                    phase="metadata",
+                )
+            )
+        with temporary_patches(patches):
+            return pristine(self, common_prefix_len, common_attn_metadata, fast_build)
 
     return _runtime_patch(
         owner,
@@ -493,7 +511,9 @@ def install_glm5_next_kpool() -> None:
                 parallel.decode_context_parallel_size != 1
                 or parallel.prefill_context_parallel_size != 1
             ):
-                raise ValueError("GLM5-Next K-pool does not support context parallelism")
+                raise ValueError(
+                    "GLM5-Next K-pool does not support context parallelism"
+                )
 
             if (
                 vllm_config.cache_config.enable_prefix_caching
@@ -542,7 +562,9 @@ def install_glm5_next_kpool() -> None:
             engine_core, "resolve_kv_cache_block_sizes"
         ):
             if engine_core.resolve_kv_cache_block_sizes is not original_block_sizes:
-                raise RuntimeError("GLM5-Next KV block resolver has an unexpected owner")
+                raise RuntimeError(
+                    "GLM5-Next KV block resolver has an unexpected owner"
+                )
             stage(engine_core, "resolve_kv_cache_block_sizes", resolve_block_sizes)
 
     coordinator_cls = kv_cache_coordinator.HybridKVCacheCoordinator

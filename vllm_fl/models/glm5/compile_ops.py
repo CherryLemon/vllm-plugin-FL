@@ -170,8 +170,11 @@ def _clamp_fake(x, swiglu_limit, alpha, beta):
 
 
 def _fwht128_quant_fp8_fake(q):
+    from vllm.platforms import current_platform
+
+    dtype = torch.float8_e4m3fn if current_platform.supports_fp8() else torch.bfloat16
     return (
-        q.new_empty(q.shape, dtype=torch.float8_e4m3fn),
+        q.new_empty(q.shape, dtype=dtype),
         q.new_empty((q.shape[0], 1), dtype=torch.float32),
     )
 

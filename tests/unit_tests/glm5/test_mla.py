@@ -19,7 +19,6 @@ from vllm_fl.dispatch.manager import OpManager
 from vllm_fl.dispatch.policy import SelectionPolicy, policy_context
 from vllm_fl.models.glm5 import indexer_backend, runtime as glm5_patch
 from vllm_fl.models.glm5.sparse_indexer import (
-    INDEXER_BACKEND,
     sparse_attn_indexer_kpool,
 )
 
@@ -648,9 +647,18 @@ def test_failure_after_cache_write_propagates_without_second_impl(monkeypatch):
 @pytest.mark.parametrize(
     "pool,max_tokens", [(1, 4096), (4, 4096), (4, 4095), (4, 4097)]
 )
+@pytest.mark.parametrize("force_bf16", [False, True])
 def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
-    monkeypatch, pool, max_tokens
+    monkeypatch, pool, max_tokens, force_bf16
 ):
+    from vllm_fl.models.glm5 import sparse_indexer
+
+    use_fp8 = indexer_backend.current_platform.supports_fp8() and not force_bf16
+    monkeypatch.setattr(
+        indexer_backend.current_platform, "supports_fp8", lambda: use_fp8
+    )
+    backend = indexer_backend.Glm5NextIndexerBackend()
+    monkeypatch.setattr(sparse_indexer, "INDEXER_BACKEND", backend)
     page, dim, heads, batch = 64, 128, 32, 4
     capacity = (max_tokens + pool - 1) // pool
     # Actual K-pool indexer: 512 logical tokens per block, translated into
@@ -666,12 +674,25 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
         wire = encoded.view(torch.uint8).to("cuda")
         return wire.view(torch.float8_e4m3fn), encoded.float().to("cuda")
 
-    keys, reference_keys = fp8_input((pages, page, dim))
     scales = (torch.arange(pages * page, device="cuda") + 1).float() / 128
-    backing[:, : page * dim].copy_(keys.view(torch.uint8).reshape(pages, -1))
-    backing[:, page * dim : page * (dim + 4)].copy_(
-        scales.view(pages, page).view(torch.uint8)
-    )
+    if use_fp8:
+        keys, reference_keys = fp8_input((pages, page, dim))
+        backing[:, : page * dim].copy_(keys.view(torch.uint8).reshape(pages, -1))
+        backing[:, page * dim : page * (dim + 4)].copy_(
+            scales.view(pages, page).view(torch.uint8)
+        )
+    else:
+        backing = torch.full((pages, 8448), -13, dtype=torch.bfloat16, device="cuda")
+        cache = torch.as_strided(backing, (pages, page, dim), (8448, dim, 1))
+        # Distinct BF16 values avoid ambiguous TopK ties at the cutoff.
+        distinct = (
+            (torch.arange(pages * page, dtype=torch.int16) + 0x3800)
+            .view(torch.bfloat16)
+            .to("cuda")
+        )
+        cache.copy_(distinct.view(pages, page, 1).expand(-1, -1, dim))
+        reference_keys = cache.float()
+        scales.fill_(1)
     before = backing.clone()
     table = torch.stack(
         [torch.arange(pages, device="cuda").roll(row) for row in range(batch)]
@@ -682,7 +703,11 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
     tails = [1, 1, 1, max_tokens % pool] if pool > 1 else [0] * batch
     positions = lengths.long() * pool - 1
     positions += torch.tensor(tails, device="cuda")
-    q, reference_q = fp8_input((batch, heads, dim))
+    if use_fp8:
+        q, reference_q = fp8_input((batch, heads, dim))
+    else:
+        q = torch.ones(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+        reference_q = q.float()
     weights = torch.ones(batch, heads, device="cuda")
     decode = DeepSeekV32IndexerDecodeMetadata(
         block_table=table,
@@ -721,7 +746,7 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
         expected_indices.append(sorted(tokens))
 
     calls = []
-    actual_paged = INDEXER_BACKEND.paged_mqa_logits
+    actual_paged = backend.paged_mqa_logits
 
     def observe_paged(*args, **kwargs):
         logits = actual_paged(*args, **kwargs)
@@ -736,7 +761,7 @@ def test_real_decode_uses_pool_capacity_and_preserves_token_selection(
 
     # A forwarding observer around the real public resolver/kernel; no
     # numerical, dependency, metadata or top-k implementation is replaced.
-    monkeypatch.setattr(INDEXER_BACKEND, "paged_mqa_logits", observe_paged)
+    monkeypatch.setattr(backend, "paged_mqa_logits", observe_paged)
     with set_forward_context({"indexer": metadata}, VllmConfig()):
         result = sparse_attn_indexer_kpool(
             torch.empty(batch, 1, device="cuda"),

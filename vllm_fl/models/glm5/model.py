@@ -10,9 +10,10 @@ from collections.abc import Iterable
 from types import MethodType
 
 import torch
-import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from einops import rearrange
 from torch import nn
+
+import vllm.model_executor.layers.fused_moe as fused_moe_layers
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import ParallelConfig, VllmConfig
@@ -122,8 +123,8 @@ else:
 
 
 from vllm_fl.models.glm5.indexer_backend import INDEXER_BACKEND
-from vllm_fl.models.glm5.sparse_indexer import SparseAttnIndexerKpool
 from vllm_fl.models.glm5.kpool import Glm5NextIndexerCache, Glm5NextTailCache
+from vllm_fl.models.glm5.sparse_indexer import SparseAttnIndexerKpool
 
 logger = init_logger(__name__)
 
@@ -352,9 +353,7 @@ class Glm5NextLinearAttention(KimiGatedDeltaNetAttention):
         # vLLM's existing KDA op reads current request metadata at its eager
         # attention boundary. Keep that body and common policy outside Dynamo;
         # PIECEWISE compilation already splits at vllm::kda_attention.
-        torch.ops.vllm.kda_attention(
-            q, k, v, g1, beta, core_attn_out, self.prefix
-        )
+        torch.ops.vllm.kda_attention(q, k, v, g1, beta, core_attn_out, self.prefix)
         core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         return self.o_proj(core_attn_out)[0]
@@ -663,11 +662,14 @@ class Glm5NextMLAAttention(DeepseekV2MLAAttention):
                     dtype=torch.bfloat16,
                 )
             )
+            use_fp8 = current_platform.supports_fp8()
             indexer.k_cache = Glm5NextIndexerCache(
                 head_dim=(
                     indexer.head_dim + indexer.head_dim // indexer.quant_block_size * 4
+                    if use_fp8
+                    else indexer.head_dim
                 ),
-                dtype=torch.uint8,
+                dtype=torch.uint8 if use_fp8 else torch.bfloat16,
                 prefix=old_cache.prefix,
                 cache_config=cache_config,
                 index_kpool=kpool,

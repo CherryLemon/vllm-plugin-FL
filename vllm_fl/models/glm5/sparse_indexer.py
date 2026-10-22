@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
-
 import torch
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -270,7 +269,9 @@ def sparse_attn_indexer_kpool(
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype()
+    fp8_dtype = (
+        current_platform.fp8_dtype() if INDEXER_BACKEND.use_fp8 else torch.bfloat16
+    )
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
@@ -976,9 +977,9 @@ class SparseAttnIndexerKpool(CustomOp):
         weights: torch.Tensor,
     ):
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
-        assert isinstance(
-            q_quant, torch.Tensor
-        ), "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
+        assert isinstance(q_quant, torch.Tensor), (
+            "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
+        )
         if rocm_aiter_ops.is_enabled():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,

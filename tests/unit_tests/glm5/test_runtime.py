@@ -670,15 +670,24 @@ def clear_provider_cache():
 
 @pytest.mark.usefixtures("clear_provider_cache")
 @pytest.mark.parametrize(
-    "cuda,abi,deep,expected",
+    "cuda,capability,abi,deep,expected",
     [
-        (True, True, True, True),
-        (False, True, True, False),
-        (True, False, True, False),
-        (True, True, False, False),
+        (True, 90, True, True, True),
+        (True, 80, True, True, False),
+        (True, 89, True, True, False),
+        (False, 90, True, True, False),
+        (True, 90, False, True, False),
+        (True, 90, True, False, False),
     ],
 )
-def test_native_requires_all_capabilities(monkeypatch, cuda, abi, deep, expected):
+def test_native_requires_all_capabilities(
+    monkeypatch, cuda, capability, abi, deep, expected
+):
+    monkeypatch.setattr(
+        provider.current_platform,
+        "has_device_capability",
+        lambda minimum: capability >= minimum,
+    )
     monkeypatch.setattr(provider.current_platform, "is_cuda", lambda: cuda)
     monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: abi)
     monkeypatch.setattr(provider, "_has_deep_gemm", lambda: deep)
