@@ -62,6 +62,17 @@ def _public_ops(monkeypatch, *, query=None, writer=None):
 
 
 @pytest.mark.usefixtures("clean_worker_patch_records")
+def test_missing_query_abi_does_not_initialize_a_device(monkeypatch):
+    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+    monkeypatch.setattr(
+        torch, "ones", lambda *a, **kw: pytest.fail("ABI probe allocated a tensor")
+    )
+    assert not glm5_patch._concat_handles_zero_rope(
+        lambda *a: pytest.fail("missing native query was executed")
+    )
+
+
+@pytest.mark.usefixtures("clean_worker_patch_records")
 def test_supported_native_query_and_cache_keep_identity(monkeypatch):
     monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: True)
     calls = []
@@ -123,7 +134,9 @@ def test_zero_rope_guard_preserves_positive_rope_native_path(monkeypatch):
 
 @pytest.mark.usefixtures("clean_worker_patch_records")
 def test_missing_cache_abi_selects_public_writer_before_native_call(monkeypatch):
-    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+    monkeypatch.setattr(
+        glm5_patch, "_has_vllm_cache_op", lambda name: name == "concat_mla_q"
+    )
     calls = []
 
     def missing_native(*args):
@@ -157,7 +170,9 @@ def test_missing_cache_abi_selects_public_writer_before_native_call(monkeypatch)
     "error_type", [RuntimeError, NotImplementedError, torch.OutOfMemoryError]
 )
 def test_writer_failure_after_mutation_is_not_retried(monkeypatch, error_type):
-    monkeypatch.setattr(glm5_patch, "_has_vllm_cache_op", lambda name: False)
+    monkeypatch.setattr(
+        glm5_patch, "_has_vllm_cache_op", lambda name: name == "concat_mla_q"
+    )
     calls = []
     error = error_type("writer failed after writing")
 

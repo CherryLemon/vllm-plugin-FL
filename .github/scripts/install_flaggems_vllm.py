@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, distribution, version
 
 # Public HY4/GLM APIs, portable math/constexpr hints, and XPU timer recovery.
 # Includes the shared main pin plus flagos-ai/FlagGems-vllm#941.
-COMMIT = "4ec48111ae38053f9e428d2c3a7caa99b50d2abe"
+COMMIT = "27f7b83a0c3bf05c288e513280c6f8337893b7a7"
 REPOSITORY = "https://github.com/flagos-ai/FlagGems-vllm.git"
 RUNTIME_PACKAGES = ("torch", "triton", "flag-gems", "vllm", "numpy")
 PACKAGE_DEPENDENCIES = ("packaging", "pybind11", "PyYAML", "sqlalchemy")

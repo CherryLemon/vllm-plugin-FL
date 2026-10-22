@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Register and activate the plugin-owned GLM5-Next runtime components."""
 
-from functools import cache, lru_cache, wraps
+from functools import cache, wraps
 from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType, SimpleNamespace
 
@@ -78,8 +78,12 @@ def _has_vllm_cache_op(op_name: str) -> bool:
     return True
 
 
-@lru_cache(maxsize=None)
+@cache
 def _concat_handles_zero_rope(concat) -> bool:
+    # Empty-build wheels have no native kernel to probe. Activation can run
+    # before the worker selects its device, so do not allocate tensors here.
+    if not _has_vllm_cache_op("concat_mla_q"):
+        return False
     device = current_platform.device_type
     q = torch.ones((1, 1, 512), dtype=torch.bfloat16, device=device)
     rope = torch.empty((1, 1, 0), dtype=q.dtype, device=device)
@@ -182,11 +186,11 @@ def _silu_and_mul_with_clamp_oot(op, self, x):
 
 def _make_portable_binding(owner, name, flag):
     """Use the existing policy binding inside the opaque GLM Torch ops."""
+    import vllm_fl.envs as fl_envs
     from vllm_fl.dispatch.binding import OperatorBinding
     from vllm_fl.dispatch.manager import OpManager
     from vllm_fl.dispatch.types import BackendImplKind, OpImpl
     from vllm_fl.utils import use_flaggems_op
-    import vllm_fl.envs as fl_envs
 
     manager = OpManager()
     if flag is not None:

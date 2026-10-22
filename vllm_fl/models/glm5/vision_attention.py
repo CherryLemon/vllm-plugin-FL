@@ -3,7 +3,6 @@
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -18,31 +17,26 @@ def _use_math_sdpa():
 
 
 def _packed_math_sdpa(query, key, value, **kwargs):
-    """Reuse existing SDPA math ops when the XPU FA2 compiler rejects selects."""
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-
+    """Compose existing math ops when the XPU FA2 compiler rejects selects."""
     assert kwargs["dropout_p"] == 0 and not kwargs["causal"]
     assert kwargs["cu_seqlens_q"] is kwargs["cu_seqlens_k"]
     boundaries = kwargs["cu_seqlens_q"][1:]
     positions = torch.arange(query.shape[0], device=query.device)
-    sequences = torch.searchsorted(boundaries, positions, right=True)
+    # Some XPU searchsorted implementations inspect boundaries on the host,
+    # freezing them during graph capture. Comparison/reduction stays on device.
+    sequences = (positions[:, None] >= boundaries[None, :]).sum(dim=1)
     result = torch.empty_like(query)
-    keys = key.transpose(0, 1).unsqueeze(0)
-    values = value.transpose(0, 1).unsqueeze(0)
+    keys = key.permute(1, 2, 0).float()
+    values = value.transpose(0, 1).float()
     # A small query tile bounds mask/intermediate memory independently of the
     # packed token count. GPU boundaries remain dynamic during graph replay.
-    with sdpa_kernel(SDPBackend.MATH):
-        for start in range(0, query.shape[0], 32):
-            mask = sequences[start : start + 32, None] == sequences[None, :]
-            output = F.scaled_dot_product_attention(
-                query[start : start + 32].transpose(0, 1).unsqueeze(0),
-                keys,
-                values,
-                attn_mask=mask,
-                dropout_p=0.0,
-                scale=kwargs["softmax_scale"],
-            )
-            result[start : start + 32] = output.squeeze(0).transpose(0, 1)
+    for start in range(0, query.shape[0], 32):
+        mask = sequences[start : start + 32, None] == sequences[None, :]
+        queries = query[start : start + 32].transpose(0, 1).float()
+        scores = (queries @ keys) * kwargs["softmax_scale"]
+        scores.masked_fill_(~mask, float("-inf"))
+        output = scores.softmax(dim=-1) @ values
+        result[start : start + 32] = output.transpose(0, 1)
     return result
 
 
