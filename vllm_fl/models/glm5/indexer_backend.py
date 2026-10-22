@@ -40,6 +40,12 @@ class Glm5NextIndexerBackend:
         from vllm_fl.dispatch.manager import OpManager
 
         self.use_fp8 = current_platform.supports_fp8()
+        # The current C550 plain-Triton TopK path fails during TTGIR lowering.
+        # Select existing Torch TopK before execution on the BF16 MetaX path.
+        self.use_torch_topk = (
+            not self.use_fp8
+            and getattr(current_platform, "vendor_name", None) == "metax"
+        )
         self.bf16 = Bf16Indexer(self)
         self.is_nvidia = self.use_fp8 and use_nvidia_reference()
         self._flag_ops = {}
@@ -135,7 +141,7 @@ class Glm5NextIndexerBackend:
                 graph_capabilities={
                     "glm5.flaggems": graph,
                     "glm5.cuda": None,
-                    "glm5.torch": False,
+                    "glm5.torch": graph,
                 },
             )
         if _preflight:
@@ -311,7 +317,24 @@ class Glm5NextIndexerBackend:
         *,
         _preflight=False,
     ):
+        if self.use_torch_topk:
+            from .indexer_topk import topk_prefill
 
+            return self._call_flag(
+                "top_k_per_row_prefill",
+                None,
+                topk_prefill,
+                logits,
+                row_starts,
+                row_ends,
+                indices,
+                num_rows,
+                stride0,
+                stride1,
+                top_k,
+                graph=True,
+                _preflight=_preflight,
+            )
         return self._run(
             "top_k_per_row_prefill",
             "top_k_per_row_prefill",
@@ -343,7 +366,25 @@ class Glm5NextIndexerBackend:
         max_seq_len=None,
         _preflight=False,
     ):
+        if self.use_torch_topk:
+            from .indexer_topk import topk_decode
 
+            return self._call_flag(
+                "top_k_per_row_decode",
+                None,
+                topk_decode,
+                logits,
+                next_n,
+                seq_lens,
+                indices,
+                num_rows,
+                stride0,
+                stride1,
+                top_k,
+                max_seq_len=max_seq_len,
+                graph=True,
+                _preflight=_preflight,
+            )
         flag_op = self._flag("top_k_per_row_decode", "top_k_per_row_decode")
         ordinary = self._native("torch.ops._C", "top_k_per_row_decode")
         persistent = self._native("torch.ops._C", "persistent_topk")

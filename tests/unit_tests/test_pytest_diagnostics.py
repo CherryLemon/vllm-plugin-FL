@@ -14,11 +14,11 @@ import pytest
 def test_live_failure_and_active_test_are_preserved(tmp_path, workers):
     test_file = tmp_path / "test_repro.py"
     test_file.write_text(
-        "import time\n"
+        "import ctypes\n"
         "def test_failure():\n"
         "    assert 1 == 2, 'intentional diagnostic regression'\n"
         "def test_slow():\n"
-        "    time.sleep(0.5)\n"
+        "    ctypes.PyDLL(None).usleep(500000)\n"
     )
     diagnostics = tmp_path / "diagnostics"
     command = [
@@ -56,6 +56,6 @@ def test_live_failure_and_active_test_are_preserved(tmp_path, workers):
     assert "intentional diagnostic regression" in failure["traceback"]
     assert any(record.get("nodeid", "").endswith("test_slow") for record in records)
     stacks = "\n".join(path.read_text() for path in diagnostics.glob("*-stacks.log"))
-    assert "Active test after 0.1s:" in stacks
+    assert "Timeout (" in stacks
     assert "test_slow" in stacks
     assert "1 failed, 1 passed" in output

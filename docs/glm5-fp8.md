@@ -46,3 +46,9 @@ execution because its FA2 compiler rejects select predicates. The adapter keeps
 packed sequence boundaries on device and chunks queries to bound intermediate
 memory. Other platforms retain public FlagGems-vllm FA2. This is a correctness
 path with no new device kernel; its performance is not qualified.
+
+MetaX's current plain-Triton TopK path fails during TTGIR lowering. Its BF16
+indexer selects existing PyTorch TopK/scatter/sort operations before execution,
+under the common reference policy. Row bounds, short-row padding, valid `-inf`
+ties and MTP offsets are preserved; output indices use a canonical order.
+This correctness path has not been performance-qualified on C550.

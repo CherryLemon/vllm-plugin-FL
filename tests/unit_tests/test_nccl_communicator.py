@@ -2,6 +2,7 @@
 """THead reuses NCCL without initializing NVIDIA-only optional packages."""
 
 import builtins
+from importlib import util
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +11,33 @@ import torch
 
 @pytest.mark.parametrize("world_size", [1, 4])
 @pytest.mark.parametrize("stateless", [False, True])
-def test_nccl_transport_without_flashinfer(monkeypatch, world_size, stateless):
+@pytest.mark.parametrize("parent_patched", [False, True])
+def test_nccl_transport_without_flashinfer(
+    monkeypatch, world_size, stateless, parent_patched
+):
+    from vllm.distributed.device_communicators import cuda_communicator
+
     from vllm_fl.distributed import nccl_communicator as module
 
+    if parent_patched:
+        monkeypatch.setattr(
+            cuda_communicator.CudaCommunicator,
+            "all_reduce",
+            lambda *a: pytest.fail("THead test invoked another vendor's global patch"),
+        )
+    parent_method = cuda_communicator.CudaCommunicator.all_reduce
+    # This test simulates THead's upstream NCCL method. MetaX patches the
+    # shared parent method globally at registration; load the installed source
+    # independently and bind only this test's subclass, preserving MetaX's patch.
+    spec = util.spec_from_file_location(
+        "vllm.distributed.device_communicators._nccl_contract",
+        cuda_communicator.__file__,
+    )
+    upstream = util.module_from_spec(spec)
+    spec.loader.exec_module(upstream)
+    monkeypatch.setattr(
+        module.NcclCommunicatorFL, "all_reduce", upstream.CudaCommunicator.all_reduce
+    )
     original_import = builtins.__import__
 
     def checked_import(name, *args, **kwargs):
@@ -26,6 +51,7 @@ def test_nccl_transport_without_flashinfer(monkeypatch, world_size, stateless):
     def init_base(self, cpu_group, device, device_group, unique_name, *args):
         self.cpu_group = cpu_group
         self.device = device
+        self.device_group = device_group
         self.world_size = world_size
         self.use_all2all = False
         self.all2all_manager = None
@@ -55,6 +81,7 @@ def test_nccl_transport_without_flashinfer(monkeypatch, world_size, stateless):
         assert not calls
         assert communicator.pynccl_comm is None
     communicator.destroy()
+    assert cuda_communicator.CudaCommunicator.all_reduce is parent_method
     assert communicator.pynccl_comm is None
     if world_size > 1:
         assert calls[-1] == "destroy"

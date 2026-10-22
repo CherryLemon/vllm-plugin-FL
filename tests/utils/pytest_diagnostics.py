@@ -3,8 +3,8 @@
 
 import faulthandler
 import json
-import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -47,31 +47,49 @@ class _Diagnostics:
         )
         if report.failed:
             event["traceback"] = str(report.longrepr)
+            event["captured"] = list(report.sections)
             reporter = self.config.pluginmanager.getplugin("terminalreporter")
             if reporter is not None and self.worker == "controller":
                 reporter.write_sep("=", f"FAILED NOW: {report.nodeid} ({report.when})")
                 reporter.write_line(str(report.longrepr))
+                for title, content in report.sections:
+                    reporter.write_sep("-", title)
+                    reporter.write_line(content)
                 reporter.flush()
         self._record(**event)
 
-    @pytest.hookimpl(hookwrapper=True)
-    def pytest_runtest_protocol(self, item):
-        def dump():
-            self.stacks.write(f"Active test after {self.timeout}s: {item.nodeid}\n")
-            faulthandler.dump_traceback(file=self.stacks, all_threads=True)
-
-        timer = None
-        if self.timeout > 0:
-            timer = threading.Timer(self.timeout, dump)
-            timer.daemon = True
-            timer.start()
+    @contextmanager
+    def _watch(self, item, phase):
+        if self.timeout <= 0:
+            yield
+            return
+        self.stacks.write(f"Watching {item.nodeid} ({phase})\n")
+        # The C watchdog can dump a native call holding the GIL. It never
+        # interrupts the test; re-arm for teardown after a failing call phase.
+        faulthandler.dump_traceback_later(
+            self.timeout, repeat=True, file=self.stacks, exit=False
+        )
         try:
             yield
         finally:
-            if timer is not None:
-                timer.cancel()
-                timer.join()
+            faulthandler.cancel_dump_traceback_later()
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_setup(self, item):
+        with self._watch(item, "setup"):
+            yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(self, item):
+        with self._watch(item, "call"):
+            yield
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_teardown(self, item):
+        with self._watch(item, "teardown"):
+            yield
 
     def pytest_unconfigure(self):
+        faulthandler.cancel_dump_traceback_later()
         self.events.close()
         self.stacks.close()

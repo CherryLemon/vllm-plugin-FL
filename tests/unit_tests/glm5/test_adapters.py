@@ -1219,6 +1219,7 @@ def test_mqa_unavailable_or_unsupported_has_no_numeric_reference(
     assert calls == ([] if missing_op else ["public"])
 
 
+@pytest.mark.gpu
 def test_fresh_process_attention_dispatch_and_vision_import_isolation():
     code = r"""
 from types import SimpleNamespace

@@ -361,6 +361,7 @@ class TestRunner:
         # per-process import overhead (torch, vllm_fl) outweighs the parallelism
         # benefit and can cause memory pressure on large CI machines.
         cpu_workers = min(os.cpu_count() or 1, 16)
+        isolate_gpu = self.config.platform == "metax"
 
         extra_args = [
             "--tb=short",
@@ -373,7 +374,7 @@ class TestRunner:
             # vendor device layer (kunlunxin: "CUDA error: invalid device
             # ordinal").  They run serially in a second pass below instead.
             "-m",
-            "not multi_gpu",
+            "not gpu and not multi_gpu" if isolate_gpu else "not multi_gpu",
             "--cov=vllm_fl",
             "--cov-report=term-missing",
             f"--cov-report=json:coverage-{self.config.platform}.json",
@@ -412,20 +413,52 @@ class TestRunner:
             "multi_gpu spawn tests run serially afterwards"
         )
 
-        return [
+        cases = [
             TestCase(
                 name=f"unit ({self.config.platform})",
                 pytest_path=test_path,
                 task="unit",
+                case="cpu" if isolate_gpu else "",
                 extra_args=extra_args,
             ),
             TestCase(
                 name=f"unit-multi-gpu ({self.config.platform})",
                 pytest_path=test_path,
                 task="unit",
+                case="multi-gpu" if isolate_gpu else "",
                 extra_args=serial_args,
             ),
         ]
+        if isolate_gpu:
+            gpu_workers = max(1, min(get_device_count(), 8))
+            gpu_args = extra_args.copy()
+            gpu_args[gpu_args.index("-n") + 1] = str(gpu_workers)
+            gpu_args[gpu_args.index("-m") + 1] = "gpu and not multi_gpu"
+            gpu_args[
+                gpu_args.index(f"--json-report-file=report-{self.config.platform}.json")
+            ] = f"--json-report-file=report-{self.config.platform}-gpu.json"
+            gpu_args.extend(
+                [
+                    "--cov-append",
+                    "-p",
+                    "tests.utils.xdist_devices",
+                    f"--test-device-env={get_visible_device_env_var()}",
+                ]
+            )
+            cases.insert(
+                1,
+                TestCase(
+                    name=f"unit-gpu ({self.config.platform})",
+                    pytest_path=test_path,
+                    task="unit",
+                    case="gpu",
+                    extra_args=gpu_args,
+                ),
+            )
+            print(
+                f"[run] GPU unit tests: {gpu_workers} workers, one visible device each"
+            )
+        return cases
 
     def _discover_from_yaml(
         self,
@@ -851,7 +884,7 @@ class TestRunner:
                     "-vv",
                     "-p",
                     "tests.utils.pytest_diagnostics",
-                    f"--test-diagnostics-dir=pytest-diagnostics/metax/{tc.task}",
+                    f"--test-diagnostics-dir=pytest-diagnostics/metax/{tc.task}-{tc.case or 'all'}",
                 ]
             )
         cmd.extend(self.extra_pytest_args)

@@ -10,6 +10,8 @@ same model and refuse a different one.
 import multiprocessing as mp
 from types import SimpleNamespace
 
+import pytest
+
 
 def _glm_config():
     return SimpleNamespace(
@@ -128,6 +130,7 @@ def _run(ctx, target, timeout=180):
     return result
 
 
+@pytest.mark.gpu
 def test_spawn_worker_activates_real_plan_and_policy():
     result = _run(mp.get_context("spawn"), _child_spawn_activate)
     assert "error" not in result, result
@@ -176,6 +179,7 @@ def _protect_real_activation_state(monkeypatch):
             monkeypatch.setattr(_custom_ops, name, getattr(_custom_ops, name))
 
 
+@pytest.mark.gpu
 def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
     _protect_real_activation_state(monkeypatch)
     from vllm_fl.models.glm5 import provider
