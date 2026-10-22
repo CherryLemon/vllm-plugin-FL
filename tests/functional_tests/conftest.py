@@ -14,7 +14,6 @@ import os
 
 import pytest
 
-
 from tests.utils.device_utils import get_backend, get_visible_device_env_var
 
 # ---------------------------------------------------------------------------
@@ -51,6 +50,11 @@ def pytest_configure(config):
     os.environ[env_var] = index
     worker_id = worker_input.get("workerid", "?")
     print(f"\n[functional] {worker_id}: {env_var}={index}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe teardown (Ascend NPU GC workaround)
+# ---------------------------------------------------------------------------
 
 
 @pytest.hookimpl(trylast=True)
