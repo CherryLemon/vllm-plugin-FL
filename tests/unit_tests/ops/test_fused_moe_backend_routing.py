@@ -62,7 +62,7 @@ def test_experts_apply_resolves_platform_before_vendor_dispatch(
     result = torch.full((2, 4), 7.0)
     nvidia = Mock(return_value=result)
     kunlunxin = Mock(return_value=result)
-    monkeypatch.setattr(module.fl_envs, "VLLM_FL_USE_FLAGGEMS_VLLM", use_fused_package)
+    monkeypatch.setenv("VLLM_FL_USE_FLAGGEMS_VLLM", "1" if use_fused_package else "0")
     monkeypatch.setattr(flag_gems, "fused_experts_impl", nvidia)
     fused_package = types.ModuleType("flaggems_vllm")
     fused_package.fused_experts_impl = nvidia
