@@ -42,6 +42,86 @@ from vllm_fl.utils import (
 
 logger = init_logger(__name__)
 
+
+def _configure_ascend_compilation(vllm_config: "VllmConfig") -> None:
+    """Configure eager FX execution with ordinary Ascend FULL decode graphs.
+
+    Ascend compiler options may be omitted or explicitly disabled with False.
+    The six recognized rc1 compiler options have no implementation here; reject
+    true values, non-booleans and unknown keys, including in eager mode.
+    """
+    from vllm.config import CompilationMode, CUDAGraphMode
+
+    additional_config = vllm_config.additional_config
+    if additional_config is None:
+        additional_config = {}
+    if not isinstance(additional_config, dict):
+        raise TypeError("additional_config must be a dict")
+    ascend_compilation = additional_config.get("ascend_compilation_config", {})
+    if not isinstance(ascend_compilation, dict):
+        raise TypeError("additional_config.ascend_compilation_config must be a dict")
+    disabled_compiler_options = {
+        "enable_npugraph_ex",
+        "enable_static_kernel",
+        "fuse_norm_quant",
+        "fuse_qknorm_rope",
+        "fuse_allreduce_rms",
+        "fuse_muls_add",
+    }
+    for name, enabled in ascend_compilation.items():
+        if name not in disabled_compiler_options:
+            raise ValueError(f"Unknown ascend_compilation_config option: {name!r}")
+        if not isinstance(enabled, bool):
+            raise TypeError(f"ascend_compilation_config.{name} must be bool")
+        if enabled:
+            raise NotImplementedError(
+                f"{name}=true is not supported by FL basic Ascend graph support"
+            )
+
+    compilation = vllm_config.compilation_config
+    model_config = vllm_config.model_config
+    enforce_eager = bool(
+        model_config is not None and model_config.enforce_eager
+    )
+    if enforce_eager or compilation.cudagraph_mode == CUDAGraphMode.NONE:
+        compilation.mode = CompilationMode.NONE
+        compilation.cudagraph_mode = CUDAGraphMode.NONE
+        return
+    if compilation.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+        raise NotImplementedError(
+            "FL basic Ascend graph support requires NONE or FULL_DECODE_ONLY"
+        )
+    # Match the runner's upstream switch (including vLLM's cached env value).
+    # BreakableCUDAGraphWrapper bypasses our runner-owned graph task lifecycle.
+    from vllm.envs import VLLM_USE_BREAKABLE_CUDAGRAPH
+
+    if VLLM_USE_BREAKABLE_CUDAGRAPH:
+        raise NotImplementedError(
+            "VLLM_USE_BREAKABLE_CUDAGRAPH=1 is not supported by FL Ascend graphs; "
+            "ordinary FULL_DECODE_ONLY graphs require the runner-owned runtime"
+        )
+    if vllm_config.parallel_config.use_ubatching:
+        raise NotImplementedError(
+            "FL basic Ascend FULL decode graphs do not support ubatching"
+        )
+    if compilation.mode not in (
+        None, CompilationMode.NONE, CompilationMode.VLLM_COMPILE
+    ):
+        raise NotImplementedError(
+            "FL Ascend graph compilation supports VLLM_COMPILE or NONE"
+        )
+    if os.environ.get("ASCEND_LAUNCH_BLOCKING", "0") == "1":
+        raise ValueError("ACL graph is incompatible with ASCEND_LAUNCH_BLOCKING=1")
+    compilation.mode = CompilationMode.VLLM_COMPILE
+    compilation.backend = "eager"
+    compilation.use_inductor = False
+    compilation.use_inductor_graph_partition = False
+    compilation.splitting_ops = []
+    compilation.cudagraph_num_of_warmups = 1
+    compilation.pass_config.fuse_norm_quant = False
+    compilation.pass_config.fuse_act_quant = False
+    compilation.pass_config.fuse_attn_quant = False
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -58,12 +138,19 @@ def _configure_musa_tp_piecewise_graph(
     *,
     all2all_backend: str,
     data_parallel_size: int,
+    device_type: str = "musa",
 ) -> None:
-    """Keep MUSA TP collectives outside stream-captured graph segments."""
-    # ProcessGroupMCCL's watchdog may call MUSA APIs while another thread is
-    # capturing a graph. Blocking wait avoids creating that watchdog thread.
-    # This must be set before the process group is constructed.
-    os.environ.setdefault("TORCH_MCCL_BLOCKING_WAIT", "1")
+    """Keep TP collectives outside stream-captured graph segments.
+
+    Shared by MUSA (MCCL) and PTPU (PCCL/FlagCX): neither vendor's collective
+    library can run while a device stream is being captured, so the TP
+    communication ops must be split out of the piecewise cudagraph.
+    """
+    if device_type == "musa":
+        # ProcessGroupMCCL's watchdog may call MUSA APIs while another thread is
+        # capturing a graph. Blocking wait avoids creating that watchdog thread.
+        # This must be set before the process group is constructed.
+        os.environ.setdefault("TORCH_MCCL_BLOCKING_WAIT", "1")
 
     # Do not enable vLLM's global input-copy wrapper here. Full-model inputs
     # have dynamic shapes and strides, while only the PIECEWISE segments after
@@ -85,7 +172,7 @@ def _configure_musa_tp_piecewise_graph(
         data_parallel_size=data_parallel_size,
     )
     assert compilation_config.splitting_ops is not None
-    for op in SPLITTING_OPS.get("musa", ()):
+    for op in SPLITTING_OPS.get(device_type, ()):
         if op not in compilation_config.splitting_ops:
             compilation_config.splitting_ops.append(op)
 
@@ -107,6 +194,8 @@ class PlatformFL(Platform):
         else device_info.device_type
     )
     device_type = device_info.device_type
+    # vLLM 0.24 routes small torch.compile helpers through this platform key.
+    simple_compile_backend = "eager" if device_type == "npu" else "inductor"
     dispatch_key = device_info.dispatch_key
     torch_device_fn = device_info.torch_device_fn
     ray_device_key: str = "GPU"
@@ -242,6 +331,13 @@ class PlatformFL(Platform):
         import vllm.kernels  # noqa: F401
 
     @classmethod
+    def get_compile_backend(cls) -> str:
+        """Select upstream eager FX execution for Ascend."""
+        if cls.device_type == "npu":
+            return "eager"
+        return super().get_compile_backend()
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
@@ -292,21 +388,26 @@ class PlatformFL(Platform):
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
 
+        if cls.device_type == "npu":
+            _configure_ascend_compilation(vllm_config)
+
         if (
             cls.device_type == "musa"
             and compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             logger.info(
-                "MUSA: Downgrading cudagraph_mode from %s to PIECEWISE because "
-                "FULL cudagraphs require musaStreamCaptureModeThreadLocal which "
-                "is not yet supported by torch_musa. PIECEWISE graphs still "
-                "provide graph capture benefits for non-TP-communication regions.",
+                "%s: Downgrading cudagraph_mode from %s to PIECEWISE because "
+                "FULL cudagraphs require thread-local stream capture which is "
+                "not yet supported by this vendor backend. PIECEWISE graphs "
+                "still provide graph capture benefits for non-TP-communication "
+                "regions.",
+                cls.device_type.upper(),
                 compilation_config.cudagraph_mode,
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         if (
-            cls.device_type == "musa"
+            cls.device_type in ("musa", "ptpu")
             and parallel_config.tensor_parallel_size > 1
             and compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
         ):
@@ -319,10 +420,13 @@ class PlatformFL(Platform):
                 compilation_config,
                 all2all_backend=parallel_config.all2all_backend,
                 data_parallel_size=effective_dp_size,
+                device_type=cls.device_type,
             )
             logger.info(
-                "MUSA: Keeping TP collective ops outside PIECEWISE graph "
-                "capture because MCCL does not support stream capture."
+                "%s: Keeping TP collective ops outside PIECEWISE graph "
+                "capture because the vendor collective library (MCCL/PCCL) "
+                "does not support stream capture.",
+                cls.device_type.upper(),
             )
 
         if (
@@ -469,6 +573,12 @@ class PlatformFL(Platform):
             "enflame",
             "kunlunxin",
             "biren",
+            # sunrise/PTPU: opt in to the static-graph path so VllmConfig
+            # resolves a non-NONE cudagraph_mode (defaults to PIECEWISE) instead
+            # of hard-forcing NONE in the else branch (vllm/config/vllm.py).
+            # TP 集合通信的拆分配置在 check_and_update_config 与
+            # SPLITTING_OPS["ptpu"] 里。
+            "sunrise",
         ]
 
     @classmethod
@@ -494,6 +604,19 @@ class PlatformFL(Platform):
         """Copy blocks from device to host (CPU)."""
         _src_cache = src_cache[:, src_block_indices]
         dst_cache[:, dst_block_indices] = _src_cache.cpu()
+
+    @classmethod
+    def _align_hybrid_block_size(cls, vllm_config, backend_cls) -> None:
+        if cls.vendor_name == "ascend":
+            from vllm_fl.kv_cache.ascend.hybrid import (
+                align_hybrid_block_size,
+                uses_dense_hybrid_cache,
+            )
+
+            if uses_dense_hybrid_cache(vllm_config.model_config):
+                align_hybrid_block_size(vllm_config)
+                return
+        super()._align_hybrid_block_size(vllm_config, backend_cls)
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
@@ -558,6 +681,30 @@ class PlatformFL(Platform):
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
+        # PTPU: route collectives through torch.ops.vllm.* custom ops so that
+        # Dynamo treats FlagCX/PCCL all-reduce as an opaque op (traced via its
+        # fake impl only) instead of stepping into the real communicator, whose
+        # `with self._device_ctx:` and lazy init are untraceable (gb0142). This
+        # also lets the ops be split out of piecewise cudagraphs (SPLITTING_OPS
+        # "ptpu"), keeping PCCL off the captured stream. Mirrors MUSA/CUDA.
+        #
+        # Gate on graph mode: this custom-op wrapping is only needed when
+        # torch.compile actually traces the collectives. Under enforce-eager
+        # (cudagraph_mode == NONE) there is no Dynamo tracing, so keep the
+        # stock direct-communicator path to avoid changing eager behaviour.
+        if cls.device_type == "ptpu":
+            from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
+
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is None:
+                # Config not resolved yet (early probe); default to the eager
+                # path — the GroupCoordinator that matters is built after
+                # check_and_update_config has finalized cudagraph_mode.
+                return False
+            return (
+                vllm_config.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            )
         return cls.vendor_name in ("nvidia", "thead", "iluvatar")
 
     @classmethod
