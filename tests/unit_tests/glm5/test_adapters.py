@@ -658,11 +658,11 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         ) + post.float() * x.float().unsqueeze(-2)
         return result.bfloat16() if materialize else result
 
-    def reference(materialized_residual=None):
+    def reference(materialized_residual=None) -> list[torch.Tensor]:
         if name == "mhc_pre":
-            return pre_reference(residual)
+            return list(pre_reference(residual))
         if name == "mhc_post":
-            return (post_reference(),)
+            return [post_reference()]
         if name == "mhc_fused_post_pre":
             r = post_reference()
             # The native small-token FMA kernel accumulates projection/RMS
@@ -675,10 +675,10 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
             # BF16 post rounding difference must not be amplified into an
             # unrelated FP32 mixing-weight failure.
             pre_input = r if materialized_residual is None else materialized_residual
-            return (r, *pre_reference(pre_input, projected))
+            return [r, *pre_reference(pre_input, projected)]
         gate = x[:, : hidden // 2].float().clamp(max=limit)
         up = x[:, hidden // 2 :].float().clamp(min=-limit, max=limit)
-        return ((gate * torch.sigmoid(alpha * gate) * (up + beta)).bfloat16(),)
+        return [(gate * torch.sigmoid(alpha * gate) * (up + beta)).bfloat16()]
 
     def call(r, value, weight, scaling, bias, post_mix, comb_mix, norm_weight):
         if name == "mhc_pre":
@@ -714,7 +714,9 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         materialized = (
             actual[0] if name == "mhc_fused_post_pre" and backend == "flagos" else None
         )
-        for output, expected in zip(actual, reference(materialized)):
+        expected_outputs = reference(materialized)
+        assert len(actual) == len(expected_outputs)
+        for output, expected in zip(actual, expected_outputs):
             assert output.shape == expected.shape and output.dtype == expected.dtype
             assert output.stride() == expected.stride()
             # Retain the existing library mHC norm tolerances. FP32 mixing
