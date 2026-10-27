@@ -115,6 +115,100 @@ def test_registration_connects_config_model_and_mtp_hooks(monkeypatch):
     assert SpeculativeConfig.__post_init__ is mtp.hyv4_mtp_speculative_post_init
 
 
+def test_outer_architecture_keeps_normal_text_inputs_and_rejects_media(monkeypatch):
+    class CausalModel:
+        def forward(self, *args, **kwargs):
+            return args, kwargs
+
+        def load_weights(self, weights):
+            return list(weights)
+
+    class TextPositions:
+        def __init__(self, count):
+            self.count = count
+
+        def repeat(self, axes, copies):
+            assert copies == 1
+            return [list(range(self.count)) for _ in range(axes)]
+
+    fixtures = {
+        "torch": {
+            "long": "long",
+            "arange": lambda count, **kwargs: TextPositions(count),
+        },
+        "vllm.model_executor.models.interfaces": {
+            "SupportsMRoPE": type("MRoPE", (), {})
+        },
+        "hy4_text_fixture.model": {"HYV4ForCausalLM": CausalModel},
+    }
+    for name, attrs in fixtures.items():
+        module = ModuleType(name)
+        vars(module).update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+    wrapper = load("hy4_text_fixture.text_compat", "nvidia/text_compat.py")
+    model = wrapper.HYV4VLForConditionalGeneration()
+    ids, positions, intermediate, embeddings = [object() for _ in range(4)]
+    args, kwargs = model.forward(ids, positions, intermediate, embeddings)
+    assert args == (ids, positions, intermediate, embeddings)
+    assert kwargs == {}
+    assert model.supports_multimodal is False
+    assert model.get_mrope_input_positions([7, 8, 9], []) == (
+        [[0, 1, 2], [0, 1, 2], [0, 1, 2]],
+        0,
+    )
+    for key in (
+        "pixel_values",
+        "pixel_values_videos",
+        "image_embeds",
+        "multi_modal_data",
+    ):
+        with pytest.raises(NotImplementedError, match="text-only"):
+            model.forward(ids, positions, **{key: object()})
+    with pytest.raises(NotImplementedError, match="text-only"):
+        model.get_mrope_input_positions([7], [object()])
+    with pytest.raises(NotImplementedError, match="text-only"):
+        model.embed_multimodal(pixel_values=object())
+    with pytest.raises(NotImplementedError, match="text-only"):
+        model.get_placeholder_str("image", 0)
+    value = object()
+    assert model.load_weights(
+        [
+            ("model.embed_tokens.weight", value),
+            ("language_model.lm_head.weight", value),
+            ("vit.embeddings.weight", object()),
+            ("visual.layers.0.weight", object()),
+        ]
+    ) == [("model.embed_tokens.weight", value), ("lm_head.weight", value)]
+
+
+def test_real_text_config_accepts_checkpoint_header_without_media_components(
+    monkeypatch,
+):
+    pytest.importorskip("transformers")
+    pytest.importorskip("huggingface_hub.dataclasses")
+    spec = importlib.util.spec_from_file_location(
+        "hy4_real_config_contract", PACKAGE / "config.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    quantization = {"format": "int-quantized"}
+    config = module.HYV4VLConfig(
+        text_config={"hidden_size": 6144, "num_hidden_layers": 78},
+        quantization_config=quantization,
+        vision_config={"hidden_size": 1152},
+        image_token_id=120120,
+    )
+    assert config.hidden_size == 6144
+    assert config.num_hidden_layers == 78
+    assert config.get_text_config() is config.text_config
+    assert config.text_config.quantization_config == quantization
+    assert config.architectures == ["HYV4VLForConditionalGeneration"]
+    assert config.text_config.rope_parameters["mrope_section"] == [12, 10, 10]
+    assert not hasattr(config, "vision_config")
+    assert not hasattr(config, "image_token_id")
+
+
 def test_uniform_decode_plan_and_first_proposal_boundary():
     graph = load("hy4_draft_contract", "nvidia/mtp_draft_graph.py")
     sizes = (1, 2, 4, 8, 16, 32, 64, 128, 256)

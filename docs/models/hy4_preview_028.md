@@ -6,18 +6,45 @@ test dependency is native vLLM 0.28.0. Hy4-preview support already merged in
 vLLM 0.24 main line. Its model/configuration concepts are prerequisites being
 ported here, not newly invented model support or a second performance result.
 
-The package keeps checkpoint and registry identifiers such as `hy_v4`,
-`HYV4ForCausalLM`, `HYV4VLForConditionalGeneration` and `HYV4MTP` unchanged.
-It includes configuration, text/VL model and weight mapping, sparse MLA sink and
-indexer integration, compressed-tensors W8A8 selection and MTP metadata mapping.
-Registration uses the plugin's existing `register_model` extension point.
+## Cross-branch text prerequisites
+
+The PR target is still `0.5.0-dev` at
+`0fc46f4086cae74fb19337ad31e6d7f69d8d8df6`. The separately inspected
+`0.4.0-dev` head is `9ad9a78930ced6e6b48505de46a72a72cdd35c97`;
+these two heads currently have the same source tree,
+`7f84954dde18b36ea841589356215d6857569549`. This PR has not been retargeted.
+Neither target tree contains the Hy4-preview package from main's #453.
+
+The necessary text prerequisites are configuration, causal model/weight mapping,
+MLA/indexer/sink integration, routed/shared experts and plugin registration.
+They are a version-scoped port of the existing adaptation, not achievements
+newly counted as this round's optimizations. The code keeps identifiers such as
+`hy_v4`, `HYV4ForCausalLM` and `HYV4MTP` unchanged.
+
+There is no processor, vision encoder, image/video preprocessing or multimodal
+registration in this PR. A small `text_compat.py` entry retains the existing
+`HYV4VLForConditionalGeneration` checkpoint architecture name for ordinary text
+inference. It uses the same causal text model, preserves token IDs/embeddings,
+ignores encoder weights without allocating them, and explicitly rejects media
+inputs. Its outer configuration keeps only the nested text configuration.
+Repeated text positions retain the checkpoint's three-axis rotary shape; no
+media grid or placeholder logic is implemented.
+
+## This round's optimization integration
+
+The optional increments are IHC post/pre and MLA provider consumers, W8A8
+O-proj selection, MTP configuration/quantization metadata, ordinary draft-body /
+full3 / tail graphs, mixed-prefill wrappers, input staging and common request
+metadata. They do not rewrite the core scheduler. Each numerical library API
+and each native compatibility requirement is listed below; none is counted as
+already delivered just because its consumer is present here.
 
 ## Ownership and dependencies
 
 The plugin owns model data flow, metadata, checkpoint mapping, graph input
 staging and provider selection. Reusable numerical kernels remain in FlagGems
 and FlagGems-vllm. iHC pre/post use the existing public library implementations;
-image normalization uses its Torch reference composition in this forward-port.
+no reusable numerical kernel body is copied into this framework port.
 
 The optional production paths extracted from the historical E23 source are
 default-off. API presence is a dependency, not proof that the path executed.
@@ -51,15 +78,19 @@ targets the main line; this version-scoped package does not amend that PR.
 The RMS public API work in FlagGems-vllm
 [#1001](https://github.com/flagos-ai/FlagGems-vllm/pull/1001) is separate.
 
-Additional optional E23 APIs are explicit pending library dependencies until
-their delivery is verified: `indexer_prefix_topk` /
-`supports_indexer_prefix_topk`, `int8_indexer_paged_logits_empty_tile`,
-`mrope_strided_cache` / `can_mrope_strided_cache`, `decode_indexer_metadata`,
-`mtp_tail_step`, `async_input_correct`, `async_input_gather` and
-`populate_request_metadata`. This draft does not claim that #1002 already
-contains every one of them. Keep their corresponding options disabled unless
-the required provider is installed. The optional gate-quant and decode-O-proj
-providers are imported only when their selected paths run.
+Library delivery was checked separately from these consumers:
+
+| Status | Contracts |
+|---|---|
+| Published in FlagGems-vllm #1002 at `d5179b3bd7b4e23d37b09a16ad44bd6cbd8782e2` | iHC post/pre, Q/sink concat/pad, gate-times-INT8 quantization, SM90 decode INT8 GEMM, grouped routing TopK, pure SiLU/quant fusion |
+| Also published in #1002 at the same head; no current-model GPU qualification implied | MRoPE strided cache, MTP tail state, async correct/gather and request-ID metadata |
+| Held / not delivered by the performance PR | prefix TopK, decode-indexer metadata, empty-tile logits; core FlagGems INT8 indexer also retains a graph-validation gap |
+
+The eleven published library contracts and their framework consumers remain
+separate from current-model integration validation. The optional gate-quant and
+decode-O-proj providers load only when selected paths run. Held APIs do not
+become delivered merely because their consumers exist here. Full MTP/metadata
+integration still requires the separate native work and GPU checks above.
 
 ## Validation boundaries
 
@@ -67,7 +98,7 @@ The submitted forward-port has CPU registration/metadata/launch-selection
 contracts, Python syntax/import-closure checks and formatting checks. It has not
 been integrated or run on GPUs against the current branch and library PR heads.
 CPU tests do not establish tensor numerics, graph replay, MTP acceptance,
-multimodal correctness, distributed safety or serving performance.
+distributed safety or serving performance. Media support is outside this PR.
 
 Historical E23 measured one fixed prompt, C1, 1024 input / 256 output tokens,
 three repeats, with combined mean TPOT 10.256724 ms. That result belongs to its

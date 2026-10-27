@@ -43,7 +43,7 @@ def register_hy_v4():
     )
     ModelRegistry.register_model(
         "HYV4VLForConditionalGeneration",
-        "vllm_fl.models.hy_v4.nvidia.vl_model:HYV4VLForConditionalGeneration",
+        "vllm_fl.models.hy_v4.nvidia.text_compat:HYV4VLForConditionalGeneration",
     )
     ModelRegistry.register_model("HYV4MTP", "vllm_fl.models.hy_v4.nvidia.mtp:HYV4MTP")
 
