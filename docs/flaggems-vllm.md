@@ -11,11 +11,11 @@ Install the pinned upstream source along with the plugin:
 
 ```bash
 python3 -m pip install --no-deps --force-reinstall \
-  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@b54fd7517625ee24499e6ec699207087fb73f1ec'
+  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@c32cddfa3b68a4905191684cefadcf1c7da441ce'
 python3 -m pip install --no-build-isolation -e .
 ```
 
-CI installs commit `b54fd7517625ee24499e6ec699207087fb73f1ec`
+CI installs commit `c32cddfa3b68a4905191684cefadcf1c7da441ce`
 (package version `0.3.0-dev1`) from
 [FlagGems-vllm #941](https://github.com/flagos-ai/FlagGems-vllm/pull/941), including
 library main and the merged
@@ -24,7 +24,8 @@ the merged public `concat_mla_q` and graph-safe paged MQA logits APIs required
 by HY4, which are absent from v0.2.0, plus the portable math shim fix needed
 to import the package when a backend's core math lacks `pow` or `tanh`.
 It also contains public Hadamard reuse and mHC pre/post timing corrections for
-Kunlunxin, plus optional FlagTree API handling for stock Triton.
+Kunlunxin, compile-time HC4 pre reduction dimensions, and optional FlagTree API
+handling for stock Triton.
 The source commit is fixed for reproducible installs; CI verifies pip's
 `direct_url.json` rather than accepting another checkout with the same version.
 

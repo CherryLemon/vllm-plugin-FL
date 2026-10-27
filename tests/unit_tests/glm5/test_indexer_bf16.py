@@ -70,6 +70,52 @@ def _hadamard_reference(x):
     return (x.cpu().double() @ matrix / 128**0.5).to(torch.bfloat16).to(x.device)
 
 
+def _assert_bf16_pool_state(
+    request, phase, storage, tail, expected_storage, expected_tail, inputs
+):
+    try:
+        for actual, expected in (
+            (storage, expected_storage),
+            (tail, expected_tail),
+        ):
+            torch.testing.assert_close(
+                actual, expected.to(actual.device), rtol=0, atol=0
+            )
+    except AssertionError as error:
+        directory = request.config.getoption("test_diagnostics_dir", default=None)
+        if directory is not None:
+            try:
+                from pathlib import Path
+
+                def snapshot(tensor):
+                    return dict(
+                        value=tensor.detach().cpu().clone(),
+                        stride=tensor.stride(),
+                        device=str(tensor.device),
+                    )
+
+                # Only this fixed small case is recorded, once, after failure.
+                payload = dict(
+                    nodeid=request.node.nodeid,
+                    phase=phase,
+                    torch_version=str(torch.__version__),
+                    pool_size=4,
+                    inputs={name: snapshot(t) for name, t in inputs.items()},
+                    actual=dict(storage=snapshot(storage), tail=snapshot(tail)),
+                    expected=dict(storage=expected_storage, tail=expected_tail),
+                )
+                worker = getattr(request.config, "workerinput", {}).get(
+                    "workerid", "controller"
+                )
+                path = Path(directory) / f"{worker}-bf16-pool-{phase}.pt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(payload, path)
+                print(f"BF16 pool failure tensors: {path}")
+            except Exception as diagnostic_error:
+                print(f"BF16 pool tensor snapshot failed: {diagnostic_error!r}")
+        raise AssertionError(f"{phase}: {error}") from error
+
+
 def test_bf16_fake_and_preflight_never_resolve_fp8(bf16_backend):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -105,7 +151,7 @@ def test_bf16_query_compile_and_graph_replay(bf16_backend):
 
 
 @pytest.mark.gpu
-def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend):
+def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend, request):
     device = indexer_backend.current_platform.device_type
     torch.manual_seed(132)
     # A physical page has padding; flattening it would silently write a copy.
@@ -116,14 +162,20 @@ def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend):
     scores = torch.randn_like(keys)
     ape = torch.randn(4, 128, device=device)
     slots = torch.tensor([31, 33, -1], device=device)
+    # Freeze independent reference inputs before any cache/tail mutation.
+    cpu_keys, cpu_scores, cpu_ape = (t.cpu().clone() for t in (keys, scores, ape))
+    gates = torch.softmax(cpu_scores.float() + cpu_ape, 1)
+    pooled = (cpu_keys.float() * gates).sum(1).to(torch.bfloat16)
+    expected = _hadamard_reference(pooled)
+    base_storage = torch.full(storage.shape, -13, dtype=storage.dtype, device="cpu")
+    base_storage[0, 31, :128] = expected[0]
+    base_storage[1, 1, :128] = expected[1]
+    empty_tail = torch.zeros(tail.shape, dtype=tail.dtype, device="cpu")
+    inputs = dict(keys=keys, scores=scores, ape=ape, slots=slots)
     bf16_backend.kpool_compress_and_write_cache(cache, keys, scores, ape, slots, 4)
-    gates = torch.softmax(scores.cpu().float() + ape.cpu(), 1)
-    pooled = (keys.cpu().float() * gates).sum(1).to(torch.bfloat16)
-    expected = _hadamard_reference(pooled).to(device)
-    torch.testing.assert_close(cache[0, 31], expected[0], rtol=0, atol=0)
-    torch.testing.assert_close(cache[1, 1], expected[1], rtol=0, atol=0)
-    assert (storage[:, :, 128:] == -13).all()
-    assert (cache[2] == -13).all()
+    _assert_bf16_pool_state(
+        request, "prefill", storage, tail, base_storage, empty_tail, inputs
+    )
 
     tail[0, 0, :3] = keys[0, :3]
     tail[0, 1, :3] = scores[0, :3]
@@ -132,6 +184,27 @@ def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend):
     tail_slots = torch.tensor([[3], [-1]], device=device)
     positions = torch.tensor([[3], [-1]], device=device)
     cache_slots = torch.tensor([[34], [-1]], device=device)
+    inputs.update(
+        dec_keys=dec_keys,
+        dec_scores=dec_scores,
+        tail_slots=tail_slots,
+        positions=positions,
+        cache_slots=cache_slots,
+    )
+
+    def expected_decode_state():
+        ref_keys = cpu_keys[0].float().clone()
+        ref_keys[3] = dec_keys[0, 0].cpu().float()
+        ref_pool = (ref_keys * gates[0]).sum(0).to(torch.bfloat16)
+        expected_storage = base_storage.clone()
+        expected_storage[1, 2, :128] = _hadamard_reference(ref_pool)
+        expected_tail = empty_tail.clone()
+        expected_tail[0, 0] = ref_keys.to(torch.bfloat16)
+        expected_tail[0, 1] = cpu_scores[0]
+        return expected_storage, expected_tail
+
+    def check(phase, expected_state):
+        _assert_bf16_pool_state(request, phase, storage, tail, *expected_state, inputs)
 
     def run():
         bf16_backend.kpool_decode_update_and_maybe_write_cache_batched(
@@ -146,23 +219,22 @@ def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend):
             4,
         )
 
+    expected_state = expected_decode_state()
+    run()
+    check("initial_eager", expected_state)
     for _ in range(3):
         run()
+    check("warmed_eager", expected_state)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
     for multiplier in (0.5, -1):
         dec_keys.mul_(multiplier)
+        expected_state = expected_decode_state()
         cache[1, 2].fill_(torch.nan)
+        tail[0, :, 3].fill_(torch.nan)
         graph.replay()
-        ref_keys = keys[0].cpu().float()
-        ref_keys[3] = dec_keys[0, 0].cpu().float()
-        ref_pool = (ref_keys * gates[0]).sum(0).to(torch.bfloat16)
-        torch.testing.assert_close(
-            cache[1, 2], _hadamard_reference(ref_pool).to(device), rtol=0, atol=0
-        )
-        assert (tail[1:] == 0).all()
-        assert (storage[:, :, 128:] == -13).all()
+        check(f"replay_{multiplier}", expected_state)
 
 
 @pytest.mark.gpu
