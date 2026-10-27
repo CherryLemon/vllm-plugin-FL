@@ -9,20 +9,57 @@ from pathlib import Path
 
 def test_hip_activations_keep_oot_dispatch_and_native_controls():
     # Import the production activation module without importing FlagGems, whose
-    # initialization requires an accelerator. Only CachedOp is a stand-in;
-    # CustomOp registration, construction, controls and torch.compile are real.
+    # initialization requires an accelerator. Select the real UnspecifiedPlatform
+    # through vLLM's plugin API before its first import: NVML can still detect
+    # devices when CUDA_VISIBLE_DEVICES is empty. CachedOp and HIP identity are
+    # stand-ins; registration, construction, controls and torch.compile are real.
     probe = textwrap.dedent(
         r"""
         import importlib.util
+        from importlib import metadata
         import sys
         import types
         from pathlib import Path
         from unittest.mock import patch
 
+        def contract_platform():
+            return "vllm.platforms.interface.UnspecifiedPlatform"
+
+        real_entry_points = metadata.entry_points
+        platform_entry = metadata.EntryPoint(
+            name="cpu_contract",
+            value="__main__:contract_platform",
+            group="vllm.platform_plugins",
+        )
+
+        def isolated_entry_points(*args, **kwargs):
+            if kwargs.get("group") == "vllm.platform_plugins":
+                return metadata.EntryPoints((platform_entry,))
+            return real_entry_points(*args, **kwargs)
+
+        # A test-local entry point isolates bootstrap without inventing native
+        # ABI modules. All other entry-point groups retain their real contents.
+        metadata.entry_points = isolated_entry_points
         import torch
+        import vllm.platforms as platforms
         from vllm.config import CompilationConfig, CompilationMode
         from vllm.model_executor import custom_op
         from vllm.model_executor.layers import activation as upstream
+        from vllm.platforms.interface import UnspecifiedPlatform
+
+        assert type(platforms.current_platform) is UnspecifiedPlatform
+        # Also verify selection when the host exposes a native CUDA candidate,
+        # as THead's CUDA-compatible NVML does, without loading its NVIDIA ABI.
+        with patch.dict(
+            platforms.builtin_platform_plugins,
+            {"cuda": lambda: "vllm.platforms.cuda.CudaPlatform"},
+            clear=True,
+        ):
+            assert platforms.resolve_current_platform_cls_qualname() == (
+                "vllm.platforms.interface.UnspecifiedPlatform"
+            )
+        assert "vllm.platforms.cuda" not in sys.modules
+        assert "vllm._C_stable_libtorch" not in sys.modules
 
         root = Path(sys.argv[1])
         calls = []
@@ -102,7 +139,7 @@ def test_hip_activations_keep_oot_dispatch_and_native_controls():
         """
     )
     env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES="", VLLM_PLUGINS="")
+    env.update(CUDA_VISIBLE_DEVICES="", VLLM_PLUGINS="cpu_contract")
     result = subprocess.run(
         [sys.executable, "-c", probe, str(Path(__file__).resolve().parents[3])],
         env=env,
