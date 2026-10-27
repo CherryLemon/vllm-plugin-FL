@@ -171,13 +171,12 @@ Use the native dependency declared by this branch (`vllm==0.28.0`). The model
 uses native sparse-MLA/indexer metadata and ordinary runner/proposer APIs; no
 native source patch or `_hy4_call_model` hook is required. `HY4_INDEXER_DTYPE`
 selects `auto`, `fp8` or `int8`; auto retains FP8 on NVIDIA SM90+ and selects
-INT8 elsewhere. INT8 requires the public `flag_gems.fused.int8_sparse_indexer`
-APIs in [FlagGems #7782](https://github.com/flagos-ai/FlagGems/pull/7782).
+INT8 elsewhere. INT8 requires `flag_gems.fused.int8_sparse_indexer`, which is not published
+by the linked component PRs or stock FlagGems. Explicit INT8 and non-SM90 auto
+selection therefore remain blocked on that operator-library dependency; no
+historical diagnostic patch is offered as a production installation method.
+NVIDIA SM90+ auto selection retains the native FP8 indexer.
 
-```sh
-# Only needed when selecting the INT8 indexer.
-pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@a15441de4a9249485d5f58feff975d48b59f6620"
-```
 
 
 Optional iHC post/pre, MLA concat/pad, M-RoPE cache and INT8 O-projection
