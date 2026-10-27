@@ -591,7 +591,7 @@ def test_opaque_mhc_fake_metadata_does_not_resolve_policy(tokens, monkeypatch):
 @pytest.mark.gpu
 @pytest.mark.parametrize("name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre", "clamp"])
 @pytest.mark.parametrize("backend", ["flagos", "vendor:cuda"])
-def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
+def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
     if backend == "vendor:cuda" and not patch.use_nvidia_reference():
         pytest.skip("This parameter validates vLLM's native NVIDIA kernels")
     from vllm_fl.models.glm5 import compile_ops
@@ -704,25 +704,82 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
             )
         return (compile_ops.forward_clamp(state, value),)
 
-    def check(actual):
+    def check(actual, phase):
         expected_outputs = reference()
-        assert len(actual) == len(expected_outputs)
-        for output, expected in zip(actual, expected_outputs):
-            assert output.shape == expected.shape and output.dtype == expected.dtype
-            assert output.stride() == expected.stride()
-            # Retain the existing library mHC norm tolerances. FP32 mixing
-            # outputs use the independent reference's existing 2e-5 bound.
-            tolerance = 2e-5 if output.dtype == torch.float32 else 0.01
-            torch.testing.assert_close(output, expected, rtol=tolerance, atol=tolerance)
+        output_index = None
+        try:
+            assert len(actual) == len(expected_outputs)
+            for output_index, (output, expected) in enumerate(
+                zip(actual, expected_outputs)
+            ):
+                assert output.shape == expected.shape and output.dtype == expected.dtype
+                assert output.stride() == expected.stride()
+                # Retain the existing library mHC norm tolerances. FP32 mixing
+                # outputs use the independent reference's existing 2e-5 bound.
+                tolerance = 2e-5 if output.dtype == torch.float32 else 0.01
+                torch.testing.assert_close(
+                    output, expected, rtol=tolerance, atol=tolerance
+                )
+        except AssertionError:
+            # Preserve the actual device-generated inputs only after failure;
+            # the independent oracle and the captured graph stay untouched.
+            try:
+                directory = request.config.getoption(
+                    "test_diagnostics_dir", default=None
+                )
+                if directory is not None:
+                    from pathlib import Path
+
+                    def snapshot(tensors):
+                        return [
+                            {
+                                "value": tensor.detach().cpu().clone(),
+                                "shape": tuple(tensor.shape),
+                                "stride": tensor.stride(),
+                                "dtype": str(tensor.dtype),
+                                "device": str(tensor.device),
+                            }
+                            for tensor in tensors
+                        ]
+
+                    worker = getattr(request.config, "workerinput", {}).get(
+                        "workerid", "controller"
+                    )
+                    directory = Path(directory)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    path = directory / (
+                        f"{worker}-{name}-{backend.replace(':', '_')}-{phase}.pt"
+                    )
+                    torch.save(
+                        {
+                            "nodeid": request.node.nodeid,
+                            "phase": phase,
+                            "output_index": output_index,
+                            "backend": backend,
+                            "seed": 731,
+                            "scalars": scalars,
+                            "activation": (limit, alpha, beta),
+                            "torch_version": str(torch.__version__),
+                            "inputs": snapshot(inputs),
+                            "before": snapshot(before),
+                            "actual": snapshot(actual),
+                            "expected": snapshot(expected_outputs),
+                        },
+                        path,
+                    )
+                    print(f"GLM failure tensors: {path}")
+            except Exception as error:
+                print(f"GLM failure tensor snapshot failed: {error!r}")
+            raise
 
     op_name = "silu_and_mul_with_clamp" if name == "clamp" else name
     policy = SelectionPolicy.from_dict(per_op_order={op_name: [backend]})
     inputs = (residual, x, fn, scale, base, post, comb, norm)
     before = [t.clone() for t in inputs]
     with policy_context(policy):
-        check(call(*inputs))
+        check(call(*inputs), "initial_eager")
         compiled = torch.compile(call, fullgraph=True, dynamic=True)
-        check(compiled(*inputs))
+        check(compiled(*inputs), "compiled")
         for _ in range(3):
             compiled(*inputs)
         torch.cuda.synchronize()
@@ -741,7 +798,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         for output in outputs:
             output.fill_(torch.nan)
         graph.replay()
-        check(outputs)
+        check(outputs, "refreshed_replay")
         # The refreshed eager call consumes the same input values as replay.
         # This also checks the BF16 boundary exactly across the two paths.
         for output, eager in zip(outputs, call(*inputs)):
