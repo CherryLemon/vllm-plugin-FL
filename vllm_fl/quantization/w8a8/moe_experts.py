@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -448,6 +450,11 @@ class FlagGemsW8A8Experts(TritonExperts):
                 clamp_limit=clamp_limit,
             )
         else:
+            output_buffer_kwargs = {}
+            if os.environ.get("HY4_W8A8_MOE_OUTPUT_BUFFER", "0") == "1":
+                # Native modular apply allocated this output independently of
+                # hidden/shared inputs; the op also declines visible aliases.
+                output_buffer_kwargs["output_buffer"] = output
             result = _flaggems_fused_experts_impl(
                 hidden_states=hidden_states,
                 w1=w1,
@@ -471,8 +478,11 @@ class FlagGemsW8A8Experts(TritonExperts):
                 block_shape=None,
                 w1_bias=quant_config.w1_bias,
                 w2_bias=quant_config.w2_bias,
+                gemm1_clamp_limit=clamp_limit,
+                **output_buffer_kwargs,
             )
-        output.copy_(result)
+        if result is not output:
+            output.copy_(result)
 
 
 __all__ = [
