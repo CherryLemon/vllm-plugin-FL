@@ -11,11 +11,11 @@ Install the pinned upstream source along with the plugin:
 
 ```bash
 python3 -m pip install --no-deps --force-reinstall \
-  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@3ea19ac191097158bf61396bbc5a8fc3aee0d2a8'
+  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@b54fd7517625ee24499e6ec699207087fb73f1ec'
 python3 -m pip install --no-build-isolation -e .
 ```
 
-CI installs commit `3ea19ac191097158bf61396bbc5a8fc3aee0d2a8`
+CI installs commit `b54fd7517625ee24499e6ec699207087fb73f1ec`
 (package version `0.3.0-dev1`) from
 [FlagGems-vllm #941](https://github.com/flagos-ai/FlagGems-vllm/pull/941), including
 library main and the merged

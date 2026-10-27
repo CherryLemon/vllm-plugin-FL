@@ -36,14 +36,15 @@ can change near-tied TopK choices; whole-model accuracy/performance equivalence
 has not been established. Composite execution may be slower than fused FP8.
 
 CI and the GLM extra use the same FlagGems-vllm portability pin
-`3ea19ac191097158bf61396bbc5a8fc3aee0d2a8`, from operator PR #941. It includes the common main
+`b54fd7517625ee24499e6ec699207087fb73f1ec`, from operator PR #941. It includes the common main
 math shim, optional constexpr/optimizer-hint compatibility, software FP8 cache
 writes for HY4 on A100, and synchronized wall-clock tuning when Kunlunxin event
 timing returns zero. Kunlunxin reuses the public FlagGems Hadamard transform
 with the same FP32 butterfly order and existing FP32-accumulating GEMM for mHC
 projection. Both mHC pre and post autotuners retain successful event timings;
 kernel errors propagate without another execution. Stock Triton does not require
-FlagTree-private imports or optional autotuning settings.
+FlagTree-private imports or optional autotuning settings. Other vendors retain
+their native autotuning API without Kunlunxin-only callback arguments.
 
 Kunlunxin vision attention selects existing PyTorch SDPA math operations before
 execution because its FA2 compiler rejects select predicates. The adapter keeps
