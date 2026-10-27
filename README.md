@@ -176,14 +176,18 @@ INT8 elsewhere. INT8 uses the published quantize/cache-store/paged-logits APIs i
 exact public revision when selecting INT8:
 
 ```sh
-pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@bfb7b3fab3487a20e37ffb535ee3854eeefcff95"
+pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@b3cb254c55b52c450131ada0ba87109ca18c6c25"
 ```
 
 The API retains finite BF16/FP16/FP32 inputs and the packed cache layout.
-Current-package GPU math, graph replay, strict FP32 power-of-two boundary
+An isolated H100 public-wheel run at prior Core revision
+`bfb7b3fab3487a20e37ffb535ee3854eeefcff95` recorded 51 passes and one failure:
+the strict FP32 nextafter power-of-two quantization scale was half the independent
+reference. This pin changes the shared query/key scale arithmetic; its GPU rerun
+is pending. Current combined-package GPU math, graph replay, strict boundary
 checks and whole-model equivalence remain unqualified. NVIDIA SM90+ auto
-selection retains the native FP8 indexer; API publication does not qualify a
-new device or change the framework's precision policy.
+selection retains the native FP8 indexer; this dependency update does not change
+the framework's precision policy.
 
 
 
