@@ -36,10 +36,12 @@ can change near-tied TopK choices; whole-model accuracy/performance equivalence
 has not been established. Composite execution may be slower than fused FP8.
 
 CI and the GLM extra use the same FlagGems-vllm portability pin
-`27f7b83a0c3bf05c288e513280c6f8337893b7a7`, from operator PR #941. It includes the common main
+`fac9121cf86294489d4a9ac07a6056f4e931c994`, from operator PR #941. It includes the common main
 math shim, optional constexpr/optimizer-hint compatibility, software FP8 cache
 writes for HY4 on A100, and synchronized wall-clock tuning when Kunlunxin event
-timing returns zero. Successful event timings are unchanged.
+timing returns zero. Kunlunxin uses the equivalent gather-based Hadamard
+butterflies and existing FP32-accumulating GEMM for mHC projection. Successful
+event timings are unchanged; kernel errors propagate without another execution.
 
 Kunlunxin vision attention selects existing PyTorch SDPA math operations before
 execution because its FA2 compiler rejects select predicates. The adapter keeps

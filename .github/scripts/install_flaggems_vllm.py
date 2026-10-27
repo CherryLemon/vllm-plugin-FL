@@ -7,9 +7,9 @@ import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 
-# Public HY4/GLM APIs, portable math/constexpr hints, and XPU timer recovery.
-# Includes the shared main pin plus flagos-ai/FlagGems-vllm#941.
-COMMIT = "27f7b83a0c3bf05c288e513280c6f8337893b7a7"
+# Public HY4/GLM APIs, portable math/constexpr hints, and Kunlunxin GLM fixes.
+# Includes library main and flagos-ai/FlagGems-vllm#941.
+COMMIT = "fac9121cf86294489d4a9ac07a6056f4e931c994"
 REPOSITORY = "https://github.com/flagos-ai/FlagGems-vllm.git"
 RUNTIME_PACKAGES = ("torch", "triton", "flag-gems", "vllm", "numpy")
 PACKAGE_DEPENDENCIES = ("packaging", "pybind11", "PyYAML", "sqlalchemy")
