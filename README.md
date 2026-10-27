@@ -183,11 +183,15 @@ The API retains finite BF16/FP16/FP32 inputs and the packed cache layout.
 An isolated H100 public-wheel run at prior Core revision
 `bfb7b3fab3487a20e37ffb535ee3854eeefcff95` recorded 51 passes and one failure:
 the strict FP32 nextafter power-of-two quantization scale was half the independent
-reference. This pin changes the shared query/key scale arithmetic; its GPU rerun
-is pending. Current combined-package GPU math, graph replay, strict boundary
-checks and whole-model equivalence remain unqualified. NVIDIA SM90+ auto
-selection retains the native FP8 indexer; this dependency update does not change
-the framework's precision policy.
+reference. That failure is preserved. The pinned corrected Core wheel passed all
+72 component-packet tests on H100/SM90 with Torch 2.13.0+cu129 and Triton 3.6.0,
+including strict query/cache scale boundaries and ordinary mutable-input graph
+replay for the three public INT8 APIs. This total includes CPU reference and
+metadata tests; it is not 72 GPU mathematics cases. The run used the real installed
+package and did not execute this framework adapter. Combined-package GPU math,
+framework graph replay and whole-model equivalence remain unqualified. NVIDIA
+SM90+ auto selection retains the native FP8 indexer; this dependency update does
+not change the framework's precision policy.
 
 
 
