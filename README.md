@@ -171,11 +171,20 @@ Use the native dependency declared by this branch (`vllm==0.28.0`). The model
 uses native sparse-MLA/indexer metadata and ordinary runner/proposer APIs; no
 native source patch or `_hy4_call_model` hook is required. `HY4_INDEXER_DTYPE`
 selects `auto`, `fp8` or `int8`; auto retains FP8 on NVIDIA SM90+ and selects
-INT8 elsewhere. INT8 requires `flag_gems.fused.int8_sparse_indexer`, which is not published
-by the linked component PRs or stock FlagGems. Explicit INT8 and non-SM90 auto
-selection therefore remain blocked on that operator-library dependency; no
-historical diagnostic patch is offered as a production installation method.
-NVIDIA SM90+ auto selection retains the native FP8 indexer.
+INT8 elsewhere. INT8 uses the published quantize/cache-store/paged-logits APIs in
+[FlagGems #7782](https://github.com/flagos-ai/FlagGems/pull/7782). Install the
+exact public revision when selecting INT8:
+
+```sh
+pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@bfb7b3fab3487a20e37ffb535ee3854eeefcff95"
+```
+
+The API retains finite BF16/FP16/FP32 inputs and the packed cache layout.
+Current-package GPU math, graph replay, strict FP32 power-of-two boundary
+checks and whole-model equivalence remain unqualified. NVIDIA SM90+ auto
+selection retains the native FP8 indexer; API publication does not qualify a
+new device or change the framework's precision policy.
+
 
 
 
