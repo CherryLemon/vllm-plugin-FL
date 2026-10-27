@@ -36,7 +36,7 @@ can change near-tied TopK choices; whole-model accuracy/performance equivalence
 has not been established. Composite execution may be slower than fused FP8.
 
 CI and the GLM extra use the same FlagGems-vllm portability pin
-`71d54d2c00f9f23c546f891b67ec7394c337b4cd`, from operator PR #941. It includes the common main
+`80a8e9716abed1bac3fc0ba5fd4e9f650ae3f989`, from operator PR #941. It includes the common main
 math shim, optional constexpr/optimizer-hint compatibility, software FP8 cache
 writes for HY4 on A100, and synchronized wall-clock tuning when Kunlunxin event
 timing returns zero. Kunlunxin reuses the public FlagGems Hadamard transform
@@ -45,8 +45,9 @@ projection. Both mHC pre and post autotuners retain successful event timings;
 kernel errors propagate without another execution. Stock Triton does not require
 FlagTree-private imports or optional autotuning settings. Other vendors retain
 their native autotuning API without Kunlunxin-only callback arguments. HC4 mHC pre
-declares its hidden dimensions at compile time; numeric operations and autotune
-candidates are unchanged. Kunlunxin cache stores skip invalid rows before
+declares its hidden dimensions at compile time; numeric operations are unchanged.
+Kunlunxin HC4 autotuning uses shape-bounded tiles, preserving other vendors and the original model-size
+candidates. Kunlunxin cache stores skip invalid rows before
 vector memory operations, preserving sentinel slots and physical page padding.
 
 Kunlunxin vision attention selects existing PyTorch SDPA math operations before

@@ -11,11 +11,11 @@ Install the pinned upstream source along with the plugin:
 
 ```bash
 python3 -m pip install --no-deps --force-reinstall \
-  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@71d54d2c00f9f23c546f891b67ec7394c337b4cd'
+  'flaggems-vllm @ git+https://github.com/flagos-ai/FlagGems-vllm.git@80a8e9716abed1bac3fc0ba5fd4e9f650ae3f989'
 python3 -m pip install --no-build-isolation -e .
 ```
 
-CI installs commit `71d54d2c00f9f23c546f891b67ec7394c337b4cd`
+CI installs commit `80a8e9716abed1bac3fc0ba5fd4e9f650ae3f989`
 (package version `0.3.0-dev1`) from
 [FlagGems-vllm #941](https://github.com/flagos-ai/FlagGems-vllm/pull/941), including
 library main and the merged
@@ -26,7 +26,9 @@ to import the package when a backend's core math lacks `pow` or `tanh`.
 It also contains public Hadamard reuse and mHC pre/post timing corrections for
 Kunlunxin, compile-time HC4 pre reduction dimensions, and optional FlagTree API
 handling for stock Triton. Kunlunxin QSA/cache row stores use a scalar
-validity guard so invalid slots perform no vector memory operation.
+validity guard so invalid slots perform no vector memory operation. HC4 pre
+tile pruning follows the hidden size on Kunlunxin; other vendor defaults and the
+original model-size candidate order are preserved.
 The source commit is fixed for reproducible installs; CI verifies pip's
 `direct_url.json` rather than accepting another checkout with the same version.
 

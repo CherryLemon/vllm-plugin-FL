@@ -70,9 +70,7 @@ def _hadamard_reference(x):
     return (x.cpu().double() @ matrix / 128**0.5).to(torch.bfloat16).to(x.device)
 
 
-def _assert_bf16_pool_state(
-    request, phase, storage, tail, expected_storage, expected_tail, inputs
-):
+def _assert_bf16_pool_state(phase, storage, tail, expected_storage, expected_tail):
     try:
         for actual, expected in (
             (storage, expected_storage),
@@ -82,37 +80,6 @@ def _assert_bf16_pool_state(
                 actual, expected.to(actual.device), rtol=0, atol=0
             )
     except AssertionError as error:
-        directory = request.config.getoption("test_diagnostics_dir", default=None)
-        if directory is not None:
-            try:
-                from pathlib import Path
-
-                def snapshot(tensor):
-                    return dict(
-                        value=tensor.detach().cpu().clone(),
-                        stride=tensor.stride(),
-                        device=str(tensor.device),
-                    )
-
-                # Only this fixed small case is recorded, once, after failure.
-                payload = dict(
-                    nodeid=request.node.nodeid,
-                    phase=phase,
-                    torch_version=str(torch.__version__),
-                    pool_size=4,
-                    inputs={name: snapshot(t) for name, t in inputs.items()},
-                    actual=dict(storage=snapshot(storage), tail=snapshot(tail)),
-                    expected=dict(storage=expected_storage, tail=expected_tail),
-                )
-                worker = getattr(request.config, "workerinput", {}).get(
-                    "workerid", "controller"
-                )
-                path = Path(directory) / f"{worker}-bf16-pool-{phase}.pt"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(payload, path)
-                print(f"BF16 pool failure tensors: {path}")
-            except Exception as diagnostic_error:
-                print(f"BF16 pool tensor snapshot failed: {diagnostic_error!r}")
         raise AssertionError(f"{phase}: {error}") from error
 
 
@@ -151,7 +118,7 @@ def test_bf16_query_compile_and_graph_replay(bf16_backend):
 
 
 @pytest.mark.gpu
-def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend, request):
+def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend):
     device = indexer_backend.current_platform.device_type
     torch.manual_seed(132)
     # A physical page has padding; flattening it would silently write a copy.
@@ -171,11 +138,8 @@ def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend, request):
     base_storage[0, 31, :128] = expected[0]
     base_storage[1, 1, :128] = expected[1]
     empty_tail = torch.zeros(tail.shape, dtype=tail.dtype, device="cpu")
-    inputs = dict(keys=keys, scores=scores, ape=ape, slots=slots)
     bf16_backend.kpool_compress_and_write_cache(cache, keys, scores, ape, slots, 4)
-    _assert_bf16_pool_state(
-        request, "prefill", storage, tail, base_storage, empty_tail, inputs
-    )
+    _assert_bf16_pool_state("prefill", storage, tail, base_storage, empty_tail)
 
     tail[0, 0, :3] = keys[0, :3]
     tail[0, 1, :3] = scores[0, :3]
@@ -184,13 +148,6 @@ def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend, request):
     tail_slots = torch.tensor([[3], [-1]], device=device)
     positions = torch.tensor([[3], [-1]], device=device)
     cache_slots = torch.tensor([[34], [-1]], device=device)
-    inputs.update(
-        dec_keys=dec_keys,
-        dec_scores=dec_scores,
-        tail_slots=tail_slots,
-        positions=positions,
-        cache_slots=cache_slots,
-    )
 
     def expected_decode_state():
         ref_keys = cpu_keys[0].float().clone()
@@ -204,7 +161,7 @@ def test_bf16_pool_tail_decode_and_padded_cache_replay(bf16_backend, request):
         return expected_storage, expected_tail
 
     def check(phase, expected_state):
-        _assert_bf16_pool_state(request, phase, storage, tail, *expected_state, inputs)
+        _assert_bf16_pool_state(phase, storage, tail, *expected_state)
 
     def run():
         bf16_backend.kpool_decode_update_and_maybe_write_cache_batched(
