@@ -892,18 +892,13 @@ class TestRunner:
             cmd.append("--save-gold")
 
         cmd.extend(tc.extra_args)
-        if (self.config.platform == "metax" and tc.task in ("unit", "functional")) or (
-            self.config.platform == "kunlunxin" and tc.task == "unit"
-        ):
+        if self.config.platform == "metax" and tc.task in ("unit", "functional"):
             cmd.extend(
                 [
                     "-vv",
                     "-p",
                     "tests.utils.pytest_diagnostics",
-                    (
-                        f"--test-diagnostics-dir=pytest-diagnostics/{self.config.platform}/"
-                        f"{tc.task}-{tc.case or 'all'}"
-                    ),
+                    f"--test-diagnostics-dir=pytest-diagnostics/metax/{tc.task}-{tc.case or 'all'}",
                 ]
             )
         cmd.extend(self.extra_pytest_args)

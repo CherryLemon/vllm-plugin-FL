@@ -4,7 +4,6 @@
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -642,7 +641,7 @@ def test_mhc_post_reference_retains_signal_below_tf32_precision(
 @pytest.mark.gpu
 @pytest.mark.parametrize("name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre", "clamp"])
 @pytest.mark.parametrize("backend", ["flagos", "vendor:cuda"])
-def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
+def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
     if backend == "vendor:cuda" and not patch.use_nvidia_reference():
         pytest.skip("This parameter validates vLLM's native NVIDIA kernels")
     from vllm_fl.models.glm5 import compile_ops
@@ -763,105 +762,12 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
             tolerance = 2e-5 if output.dtype == torch.float32 else 0.01
             torch.testing.assert_close(output, expected, rtol=tolerance, atol=tolerance)
 
-    @contextmanager
-    def trace_initial_eager():
-        directory = request.config.getoption("test_diagnostics_dir", default=None)
-        if (
-            directory is None
-            or name != "mhc_pre"
-            or backend != "flagos"
-            or patch.current_platform.vendor_name != "kunlunxin"
-        ):
-            yield
-            return
-        import importlib
-        import json
-        from pathlib import Path
-
-        module = importlib.import_module("flaggems_vllm.ops.mhc.mhc_pre")
-        tuner = module.mhc_pre_fused_kernel_hc_mult_4
-        original_hook = tuner.pre_hook
-        history = []
-        previous = last_non_reset = None
-        total_calls = dropped_records = 0
-
-        def metadata(value):
-            if isinstance(value, torch.Tensor):
-                return {
-                    "shape": tuple(value.shape),
-                    "stride": value.stride(),
-                    "dtype": str(value.dtype),
-                }
-            if value is None or isinstance(value, (bool, int, float, str)):
-                return value
-            if isinstance(value, (tuple, list)):
-                return [metadata(item) for item in value]
-            return {"type": type(value).__qualname__}
-
-        def observed_hook(full_nargs, *args, **kwargs):
-            nonlocal previous, last_non_reset, total_calls, dropped_records
-            total_calls += 1
-            try:
-                event = {
-                    "metadata": {
-                        key: metadata(value) for key, value in full_nargs.items()
-                    },
-                    "args": metadata(args),
-                    "kwargs": {key: metadata(value) for key, value in kwargs.items()},
-                }
-                if not kwargs.get("reset_only", args[0] if args else False):
-                    last_non_reset = {"call": total_calls, **event}
-            except Exception as error:
-                event = {"metadata_error": repr(error)}
-            if previous == event:
-                history[-1]["calls"] += 1
-            else:
-                if len(history) == 256:
-                    del history[0]
-                    dropped_records += 1
-                history.append({"calls": 1, **event})
-                previous = event
-            return original_hook(full_nargs, *args, **kwargs)
-
-        tuner.pre_hook = observed_hook
-        try:
-            yield
-        except Exception as error:
-            try:
-                directory = Path(directory)
-                directory.mkdir(parents=True, exist_ok=True)
-                worker = getattr(request.config, "workerinput", {}).get(
-                    "workerid", "controller"
-                )
-                path = directory / f"{worker}-mhc-pre-autotune.json"
-                path.write_text(
-                    json.dumps(
-                        {
-                            "nodeid": request.node.nodeid,
-                            "error": repr(error),
-                            "total_calls": total_calls,
-                            "truncated": dropped_records > 0,
-                            "dropped_records": dropped_records,
-                            "last_non_reset": last_non_reset,
-                            "pre_hook_calls": history,
-                        },
-                        indent=2,
-                    )
-                )
-                print(f"MHC pre autotune metadata: {path}")
-            except Exception as dump_error:
-                print(f"MHC pre autotune metadata failed: {dump_error!r}")
-            raise
-        finally:
-            tuner.pre_hook = original_hook
-
     op_name = "silu_and_mul_with_clamp" if name == "clamp" else name
     policy = SelectionPolicy.from_dict(per_op_order={op_name: [backend]})
     inputs = (residual, x, fn, scale, base, post, comb, norm)
     before = [t.clone() for t in inputs]
     with policy_context(policy):
-        with trace_initial_eager():
-            check(call(*inputs))
+        check(call(*inputs))
         compiled = torch.compile(call, fullgraph=True, dynamic=True)
         check(compiled(*inputs))
         for _ in range(3):
