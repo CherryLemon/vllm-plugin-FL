@@ -135,7 +135,15 @@ def _init_vendor_device():
     from vllm_fl.utils import DeviceInfo
 
     vendor_name = DeviceInfo().vendor_name
-    if vendor_name == "kunlunxin":
+    if vendor_name == "nvidia":
+        # FlashInfer chooses the first loaded libcudart by name. Bind it to
+        # Torch's CUDA runtime before optional TileLang probes load a stub
+        # with the same prefix but an incomplete CUDA runtime ABI.
+        try:
+            importlib.import_module("flashinfer.comm")
+        except (ImportError, OSError) as error:
+            logger.debug("Optional FlashInfer communication is unavailable: %s", error)
+    elif vendor_name == "kunlunxin":
         from vllm_fl.dispatch.backends.vendor.kunlunxin.patches.patch_fla_utils import (
             _patch_xpu_get_device,
         )
