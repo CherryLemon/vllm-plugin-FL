@@ -47,8 +47,8 @@ packed sequence boundaries on device and chunks queries to bound intermediate
 memory. Other platforms retain public FlagGems-vllm FA2. This is a correctness
 path with no new device kernel; its performance is not qualified.
 
-MetaX's current plain-Triton TopK path fails during TTGIR lowering. Its BF16
-indexer selects existing PyTorch TopK/scatter/sort operations before execution,
+The MetaX and Kunlunxin plain-Triton TopK paths fail during compiler lowering.
+Their BF16 indexers select existing PyTorch TopK/scatter/sort operations before execution,
 under the common reference policy. Row bounds, short-row padding, valid `-inf`
 ties and MTP offsets are preserved; output indices use a canonical order.
-This correctness path has not been performance-qualified on C550.
+This correctness path has not been performance-qualified on C550 or Kunlunxin.

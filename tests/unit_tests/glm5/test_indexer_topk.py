@@ -88,6 +88,33 @@ def test_topk_policy_rejection_precedes_execution(monkeypatch):
         backend.topk_decode(*([None] * 8), _preflight=True)
 
 
+@pytest.mark.parametrize(
+    "vendor,fp8,expected",
+    [
+        ("kunlunxin", False, True),
+        ("metax", False, True),
+        ("nvidia", False, False),
+        ("nvidia", True, False),
+        ("kunlunxin", True, False),
+    ],
+)
+def test_topk_compiler_capability_selects_before_execution(
+    monkeypatch, vendor, fp8, expected
+):
+    monkeypatch.setattr(indexer_backend.current_platform, "vendor_name", vendor)
+    monkeypatch.setattr(indexer_backend.current_platform, "supports_fp8", lambda: fp8)
+    backend = indexer_backend.Glm5NextIndexerBackend()
+    assert backend.use_torch_topk is expected
+    if expected:
+        monkeypatch.setattr(
+            backend, "_flag", lambda *args: pytest.fail("resolved unsupported radix")
+        )
+        with policy_context(SelectionPolicy()):
+            for method in (backend.topk_prefill, backend.topk_decode):
+                description = method(*([None] * 8), _preflight=True)
+                assert description["selected"] == "glm5.torch"
+
+
 def test_topk_execution_error_propagates_once(monkeypatch):
     backend = indexer_backend.Glm5NextIndexerBackend()
     backend.use_torch_topk = True

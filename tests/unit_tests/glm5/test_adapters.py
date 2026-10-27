@@ -658,7 +658,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         ) + post.float() * x.float().unsqueeze(-2)
         return result.bfloat16() if materialize else result
 
-    def reference():
+    def reference(materialized_residual=None):
         if name == "mhc_pre":
             return pre_reference(residual)
         if name == "mhc_post":
@@ -669,7 +669,13 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
             # from the FP32 post value, before materializing residual_cur in
             # BF16. Weighted layer input still consumes that BF16 residual.
             projected = post_reference(False) if backend == "vendor:cuda" else None
-            return (r, *pre_reference(r, projected))
+            # The public FlagGems fused API runs pre on its returned BF16
+            # post result. Check that result independently below, then use
+            # that materialization as the next stage's input. A permitted
+            # BF16 post rounding difference must not be amplified into an
+            # unrelated FP32 mixing-weight failure.
+            pre_input = r if materialized_residual is None else materialized_residual
+            return (r, *pre_reference(pre_input, projected))
         gate = x[:, : hidden // 2].float().clamp(max=limit)
         up = x[:, hidden // 2 :].float().clamp(min=-limit, max=limit)
         return ((gate * torch.sigmoid(alpha * gate) * (up + beta)).bfloat16(),)
@@ -705,7 +711,10 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         return (compile_ops.forward_clamp(state, value),)
 
     def check(actual):
-        for output, expected in zip(actual, reference()):
+        materialized = (
+            actual[0] if name == "mhc_fused_post_pre" and backend == "flagos" else None
+        )
+        for output, expected in zip(actual, reference(materialized)):
             assert output.shape == expected.shape and output.dtype == expected.dtype
             assert output.stride() == expected.stride()
             # Retain the existing library mHC norm tolerances. FP32 mixing
@@ -740,6 +749,10 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
             output.fill_(torch.nan)
         graph.replay()
         check(outputs)
+        # The refreshed eager call consumes the same input values as replay.
+        # This also checks the BF16 boundary exactly across the two paths.
+        for output, eager in zip(outputs, call(*inputs)):
+            torch.testing.assert_close(output, eager, rtol=0, atol=0)
         selected = patch._portable_binding(op_name).selected_impl
         import vllm_fl.envs as fl_envs
 

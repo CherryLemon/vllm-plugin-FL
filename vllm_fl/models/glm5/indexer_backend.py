@@ -40,11 +40,11 @@ class Glm5NextIndexerBackend:
         from vllm_fl.dispatch.manager import OpManager
 
         self.use_fp8 = current_platform.supports_fp8()
-        # The current C550 plain-Triton TopK path fails during TTGIR lowering.
-        # Select existing Torch TopK before execution on the BF16 MetaX path.
+        # The MetaX and Kunlunxin compilers cannot lower the plain radix
+        # TopK kernel. Select the existing Torch composition before execution.
         self.use_torch_topk = (
             not self.use_fp8
-            and getattr(current_platform, "vendor_name", None) == "metax"
+            and getattr(current_platform, "vendor_name", None) in {"metax", "kunlunxin"}
         )
         self.bf16 = Bf16Indexer(self)
         self.is_nvidia = self.use_fp8 and use_nvidia_reference()

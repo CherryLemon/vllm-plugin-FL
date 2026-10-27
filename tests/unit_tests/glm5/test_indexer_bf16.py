@@ -22,6 +22,7 @@ from vllm_fl.platform import PlatformFL
         ("nvidia", (9, 0), True),
         ("nvidia", None, False),
         ("hygon", (9, 0), False),
+        ("kunlunxin", (9, 0), False),
         ("mthreads", (3, 1), True),
         ("mthreads", (2, 2), False),
         ("gcu", (4, 0), True),
