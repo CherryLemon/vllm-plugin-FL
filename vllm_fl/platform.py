@@ -561,6 +561,8 @@ class PlatformFL(Platform):
             return "vllm_fl.distributed.communicator.CommunicatorFL"  # noqa
         elif cls.vendor_name == "thead":
             return "vllm_fl.distributed.nccl_communicator.NcclCommunicatorFL"
+        elif cls.vendor_name == "ascend":
+            return "vllm_fl.distributed.device_communicators.npu_communicator.NPUCommunicator"
         else:
             logger.info("Using CudaCommunicator for communication.")
             return "vllm.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
