@@ -165,6 +165,7 @@ _PLATFORM_PROBE = textwrap.dedent(
         "is_rocm": cls().is_rocm(),
         "is_cuda": cls().is_cuda(),
         "is_cuda_alike": cls().is_cuda_alike(),
+        "custom_op_collectives": cls.use_custom_op_collectives(),
     }
     if vendor != "nvidia":
         payload["uuid"] = cls.get_device_uuid()
@@ -212,6 +213,7 @@ def test_vendor_probe_isolated_from_accelerator_runtime(
     assert payload["is_rocm"] is is_rocm
     assert payload["is_cuda"] is is_cuda
     assert payload["is_cuda_alike"] is is_cuda_alike
+    assert payload["custom_op_collectives"] is True
 
     if vendor != "nvidia":
         assert payload["uuid"] == "cuda-0"
