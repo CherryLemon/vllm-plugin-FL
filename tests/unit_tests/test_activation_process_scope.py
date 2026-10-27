@@ -122,12 +122,23 @@ def _run(ctx, target, timeout=180):
     process = ctx.Process(target=target, args=(child,))
     process.start()
     child.close()
-    assert parent.poll(timeout), "child process timed out"
-    result = parent.recv()
-    parent.close()
-    process.join(timeout)
-    assert process.exitcode == 0, f"child exited with {process.exitcode}"
-    return result
+    try:
+        assert parent.poll(timeout), "child process timed out"
+        try:
+            result = parent.recv()
+        except EOFError as error:
+            process.join(timeout)
+            raise AssertionError(
+                f"child exited without a result (exitcode={process.exitcode})"
+            ) from error
+        process.join(timeout)
+        assert process.exitcode == 0, f"child exited with {process.exitcode}"
+        return result
+    finally:
+        parent.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout)
 
 
 @pytest.mark.gpu
@@ -142,82 +153,41 @@ def test_spawn_worker_activates_real_plan_and_policy():
     assert result["order"] == ["flagos", "reference"]
 
 
-def _protect_real_activation_state(monkeypatch):
-    """Snapshot every class/module attribute the real GLM activation patches."""
-    from vllm import _custom_ops
-    from vllm.model_executor.layers.mhc import MHCFusedPostPreOp, MHCPostOp, MHCPreOp
-    from vllm.v1.attention.backends.mla import indexer as indexer_backend
-    from vllm.v1.worker import utils as worker_utils
+def _child_fork_after_activation(conn):
+    try:
+        from vllm_fl.models.glm5 import provider
 
-    for mhc_cls in (MHCPreOp, MHCPostOp, MHCFusedPostPreOp):
-        monkeypatch.setattr(mhc_cls, "forward_oot", mhc_cls.forward_oot)
-    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+        provider._has_vllm_native_extension = lambda: False
+        provider._has_nvidia_reference_kernels.cache_clear()
+        import vllm_fl
 
-    monkeypatch.setattr(
-        SiluAndMulWithClamp, "forward_oot", SiluAndMulWithClamp.forward_oot
-    )
-    monkeypatch.setattr(
-        indexer_backend.DeepseekV32IndexerBackend,
-        "indexes_kv_by_block_stride",
-        indexer_backend.DeepseekV32IndexerBackend.indexes_kv_by_block_stride,
-    )
-    monkeypatch.setattr(
-        worker_utils.AttentionGroup,
-        "create_metadata_builders",
-        worker_utils.AttentionGroup.create_metadata_builders,
-    )
-    monkeypatch.setattr(
-        indexer_backend.DeepseekV32IndexerMetadataBuilder,
-        "build",
-        indexer_backend.DeepseekV32IndexerMetadataBuilder.build,
-    )
-    monkeypatch.setattr(
-        worker_utils.KVBlockZeroer, "__init__", worker_utils.KVBlockZeroer.__init__
-    )
-    for name in ("concat_mla_q", "concat_and_cache_mla"):
-        if hasattr(_custom_ops, name):
-            monkeypatch.setattr(_custom_ops, name, getattr(_custom_ops, name))
+        vllm_fl.register_model()
+        from vllm_fl.activation import activate_for_model, get_active_plan
+
+        assert activate_for_model(_glm_config()) is not None
+        assert get_active_plan().name == "glm5_next"
+        result = _run(mp.get_context("fork"), _child_fork_rebind)
+        result["parent_active"] = get_active_plan().name
+        result["parent_order"] = _probe_state()["order"]
+        conn.send(result)
+    except Exception as error:
+        conn.send({"error": f"{type(error).__name__}: {error}"})
+    finally:
+        conn.close()
 
 
 @pytest.mark.gpu
-def test_fork_after_activation_is_idempotent_and_model_scoped(monkeypatch):
-    _protect_real_activation_state(monkeypatch)
-    from vllm_fl.models.glm5 import provider
-
-    monkeypatch.setattr(provider, "_has_vllm_native_extension", lambda: False)
-    provider._has_nvidia_reference_kernels.cache_clear()
-    import vllm_fl
-
-    vllm_fl.register_model()
-    from vllm_fl.activation import (
-        activate_for_model,
-        get_active_plan,
-        reset_activation_for_tests,
-    )
-
-    # reset_activation_for_tests clears the provider registry, so re-run the
-    # production registration before activating (mirrors a fresh process).
-    reset_activation_for_tests()
-    vllm_fl.register_model()
-    try:
-        assert activate_for_model(_glm_config()) is not None
-        assert get_active_plan().name == "glm5_next"
-
-        result = _run(mp.get_context("fork"), _child_fork_rebind)
-        assert "error" not in result, result
-        assert result["inherited"]["active"] == "glm5_next"
-        assert result["inherited"]["order"] == ["flagos", "reference"]
-        # Same plan in the child: idempotent, and state stays bound.
-        assert result["same_is_none"] is False
-        assert result["after"]["kpool_bound"] is True
-        assert result["after"]["indexer"] is False
-        assert result["after"]["private_indexer"] is True
-        # A different model in the child is rejected.
-        assert result["conflict"] is True
-        # Parent process state is untouched by the child.
-        assert get_active_plan().name == "glm5_next"
-        assert _probe_state()["order"] == ["flagos", "reference"]
-    finally:
-        reset_activation_for_tests()
-        # Leave the session with the production providers registered.
-        vllm_fl.register_model()
+def test_fork_after_activation_is_idempotent_and_model_scoped():
+    # Fork the real activated plan in a fresh parent, without inheriting LLVM
+    # compiler thread pools initialized by unrelated earlier GPU tests.
+    result = _run(mp.get_context("spawn"), _child_fork_after_activation)
+    assert "error" not in result, result
+    assert result["inherited"]["active"] == "glm5_next"
+    assert result["inherited"]["order"] == ["flagos", "reference"]
+    assert result["same_is_none"] is False
+    assert result["after"]["kpool_bound"] is True
+    assert result["after"]["indexer"] is False
+    assert result["after"]["private_indexer"] is True
+    assert result["conflict"] is True
+    assert result["parent_active"] == "glm5_next"
+    assert result["parent_order"] == ["flagos", "reference"]
