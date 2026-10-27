@@ -588,10 +588,60 @@ def test_opaque_mhc_fake_metadata_does_not_resolve_policy(tokens, monkeypatch):
     assert all(t.is_contiguous() for t in (*pre, *fused, output_post, clamp))
 
 
+def _mhc_post_reference(x, residual, post, comb, materialize=True):
+    # Device FP32 GEMM may reduce the mixing coefficients to TF32 precision.
+    # Keep this oracle independent and round on CPU before the device copy.
+    cpu_x, cpu_residual, cpu_post, cpu_comb = (
+        tensor.cpu().double() for tensor in (x, residual, post, comb)
+    )
+    result = torch.einsum("tij,tih->tjh", cpu_comb, cpu_residual)
+    result = result + cpu_post * cpu_x.unsqueeze(-2)
+    dtype = torch.bfloat16 if materialize else torch.float32
+    return result.to(dtype=dtype).to(device=residual.device)
+
+
+@pytest.mark.parametrize("materialize", [False, True])
+def test_mhc_post_reference_retains_signal_below_tf32_precision(
+    monkeypatch, materialize
+):
+    residual = torch.tensor([[[1.0], [-1.0]]], dtype=torch.bfloat16)
+    x = torch.ones(1, 1, dtype=torch.bfloat16)
+    post = torch.zeros(1, 2, 1, dtype=torch.float32)
+    comb = torch.tensor([[[0.25004, 0.24996], [0.24996, 0.25004]]], dtype=torch.float32)
+    inputs = (x, residual, post, comb)
+    before = [tensor.clone() for tensor in inputs]
+    original_einsum = torch.einsum
+    calls = []
+
+    def checked_einsum(equation, *operands):
+        assert all(
+            t.device.type == "cpu" and t.dtype == torch.float64 for t in operands
+        )
+        calls.append(equation)
+        return original_einsum(equation, *operands)
+
+    monkeypatch.setattr(torch, "einsum", checked_einsum)
+    actual = _mhc_post_reference(*inputs, materialize=materialize)
+    # These FP32 coefficients differ by exactly 671 * 2**-23. The BF16
+    # nearest-even result is 21 * 2**-18; both TF32 coefficients round to 1/4.
+    golden = 21 * 2**-18 if materialize else 671 * 2**-23
+    dtype = torch.bfloat16 if materialize else torch.float32
+    expected = torch.tensor([[[golden], [-golden]]], dtype=dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.stride() == expected.stride()
+    assert calls == ["tij,tih->tjh"]
+    lost_signal = original_einsum(
+        "tij,tih->tjh", torch.full_like(comb, 0.25).double(), residual.double()
+    )
+    assert torch.count_nonzero(lost_signal) == 0
+    for tensor, original in zip(inputs, before):
+        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre", "clamp"])
 @pytest.mark.parametrize("backend", ["flagos", "vendor:cuda"])
-def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
+def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
     if backend == "vendor:cuda" and not patch.use_nvidia_reference():
         pytest.skip("This parameter validates vLLM's native NVIDIA kernels")
     from vllm_fl.models.glm5 import compile_ops
@@ -653,10 +703,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
         return post_mix, comb_mix, value
 
     def post_reference(materialize=True):
-        result = torch.einsum(
-            "tij,tih->tjh", comb.float(), residual.float()
-        ) + post.float() * x.float().unsqueeze(-2)
-        return result.bfloat16() if materialize else result
+        return _mhc_post_reference(x, residual, post, comb, materialize)
 
     def reference() -> list[torch.Tensor]:
         if name == "mhc_pre":
@@ -704,82 +751,25 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
             )
         return (compile_ops.forward_clamp(state, value),)
 
-    def check(actual, phase):
+    def check(actual):
         expected_outputs = reference()
-        output_index = None
-        try:
-            assert len(actual) == len(expected_outputs)
-            for output_index, (output, expected) in enumerate(
-                zip(actual, expected_outputs)
-            ):
-                assert output.shape == expected.shape and output.dtype == expected.dtype
-                assert output.stride() == expected.stride()
-                # Retain the existing library mHC norm tolerances. FP32 mixing
-                # outputs use the independent reference's existing 2e-5 bound.
-                tolerance = 2e-5 if output.dtype == torch.float32 else 0.01
-                torch.testing.assert_close(
-                    output, expected, rtol=tolerance, atol=tolerance
-                )
-        except AssertionError:
-            # Preserve the actual device-generated inputs only after failure;
-            # the independent oracle and the captured graph stay untouched.
-            try:
-                directory = request.config.getoption(
-                    "test_diagnostics_dir", default=None
-                )
-                if directory is not None:
-                    from pathlib import Path
-
-                    def snapshot(tensors):
-                        return [
-                            {
-                                "value": tensor.detach().cpu().clone(),
-                                "shape": tuple(tensor.shape),
-                                "stride": tensor.stride(),
-                                "dtype": str(tensor.dtype),
-                                "device": str(tensor.device),
-                            }
-                            for tensor in tensors
-                        ]
-
-                    worker = getattr(request.config, "workerinput", {}).get(
-                        "workerid", "controller"
-                    )
-                    directory = Path(directory)
-                    directory.mkdir(parents=True, exist_ok=True)
-                    path = directory / (
-                        f"{worker}-{name}-{backend.replace(':', '_')}-{phase}.pt"
-                    )
-                    torch.save(
-                        {
-                            "nodeid": request.node.nodeid,
-                            "phase": phase,
-                            "output_index": output_index,
-                            "backend": backend,
-                            "seed": 731,
-                            "scalars": scalars,
-                            "activation": (limit, alpha, beta),
-                            "torch_version": str(torch.__version__),
-                            "inputs": snapshot(inputs),
-                            "before": snapshot(before),
-                            "actual": snapshot(actual),
-                            "expected": snapshot(expected_outputs),
-                        },
-                        path,
-                    )
-                    print(f"GLM failure tensors: {path}")
-            except Exception as error:
-                print(f"GLM failure tensor snapshot failed: {error!r}")
-            raise
+        assert len(actual) == len(expected_outputs)
+        for output, expected in zip(actual, expected_outputs):
+            assert output.shape == expected.shape and output.dtype == expected.dtype
+            assert output.stride() == expected.stride()
+            # Retain the existing library mHC norm tolerances. FP32 mixing
+            # outputs use the independent reference's existing 2e-5 bound.
+            tolerance = 2e-5 if output.dtype == torch.float32 else 0.01
+            torch.testing.assert_close(output, expected, rtol=tolerance, atol=tolerance)
 
     op_name = "silu_and_mul_with_clamp" if name == "clamp" else name
     policy = SelectionPolicy.from_dict(per_op_order={op_name: [backend]})
     inputs = (residual, x, fn, scale, base, post, comb, norm)
     before = [t.clone() for t in inputs]
     with policy_context(policy):
-        check(call(*inputs), "initial_eager")
+        check(call(*inputs))
         compiled = torch.compile(call, fullgraph=True, dynamic=True)
-        check(compiled(*inputs), "compiled")
+        check(compiled(*inputs))
         for _ in range(3):
             compiled(*inputs)
         torch.cuda.synchronize()
@@ -798,7 +788,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend, request):
         for output in outputs:
             output.fill_(torch.nan)
         graph.replay()
-        check(outputs, "refreshed_replay")
+        check(outputs)
         # The refreshed eager call consumes the same input values as replay.
         # This also checks the BF16 boundary exactly across the two paths.
         for output, eager in zip(outputs, call(*inputs)):
