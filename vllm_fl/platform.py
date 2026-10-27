@@ -727,7 +727,9 @@ class PlatformFL(Platform):
                 vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             )
-        return cls.vendor_name in ("nvidia", "thead", "iluvatar")
+        # HIP communicators also use ctypes. Keep them opaque to Dynamo,
+        # matching vLLM's ROCm platform even when is_cuda_alike() is False.
+        return cls.vendor_name in ("nvidia", "amd", "hygon", "thead", "iluvatar")
 
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:

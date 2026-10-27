@@ -86,6 +86,10 @@ class SiluAndMulFL(SiluAndMul):
             return _silu_and_mul_graph(x)
         return _silu_and_mul(self, x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # vLLM checks ROCm before OOT when selecting a CustomOp forward.
+        return self.forward_oot(x)
+
 
 class GeluAndMulFL(GeluAndMul):
     def __init__(self, approximate: str = "none"):
@@ -95,6 +99,9 @@ class GeluAndMulFL(GeluAndMul):
         if torch.compiler.is_compiling():
             return _gelu_and_mul_graph(x, self.approximate)
         return _gelu_and_mul(self, x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_oot(x)
 
 
 __all__ = ["SiluAndMulFL", "GeluAndMulFL", "SiluAndMulWithClampFL"]
