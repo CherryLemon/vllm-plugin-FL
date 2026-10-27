@@ -1,13 +1,28 @@
 """Check the real vLLM collective boundary without launching device collectives."""
 
-import ctypes
-from types import SimpleNamespace
+import os
+import subprocess
+import sys
+from pathlib import Path
 
-import torch
+
+def _contract_platform():
+    return "vllm.platforms.interface.UnspecifiedPlatform"
 
 
-def test_all_reduce_custom_op_keeps_ctypes_out_of_dynamo(monkeypatch):
+def _check_collective_compile():
+    import ctypes
+    from types import SimpleNamespace
+
+    import torch
+
     import vllm.distributed.parallel_state as parallel_state
+    import vllm.platforms as platforms
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    assert type(platforms.current_platform) is UnspecifiedPlatform
+    assert "vllm.platforms.cuda" not in sys.modules
+    assert "vllm._C_stable_libtorch" not in sys.modules
 
     calls = []
 
@@ -23,7 +38,7 @@ def test_all_reduce_custom_op_keeps_ctypes_out_of_dynamo(monkeypatch):
     group.unique_name = "fl_cpu_compile_regression"
     group.use_custom_op_call = True
     group.device_communicator = SimpleNamespace(all_reduce=all_reduce)
-    monkeypatch.setitem(parallel_state._groups, group.unique_name, lambda: group)
+    parallel_state._groups[group.unique_name] = lambda: group
     # Vendor builds normally register this op on their accelerator dispatch
     # key. Use the same implementation on CPU solely for this contract test.
     cpu_lib = torch.library.Library("vllm", "IMPL", "CPU")
@@ -53,3 +68,43 @@ def test_all_reduce_custom_op_keeps_ctypes_out_of_dynamo(monkeypatch):
     finally:
         torch._dynamo.reset()
         cpu_lib._destroy()
+        parallel_state._groups.pop(group.unique_name, None)
+
+
+def test_all_reduce_custom_op_keeps_ctypes_out_of_dynamo():
+    # The Kunlunxin SDK installs its torch.compile mock at Torch import time.
+    # Select actual compilation in a fresh interpreter, without changing the
+    # parent process's SDK defaults or loading a vendor platform/native ABI.
+    env = os.environ.copy()
+    env.update(
+        CUDA_VISIBLE_DEVICES="",
+        VLLM_PLUGINS="cpu_contract",
+        XMLIR_ENABLE_MOCK_TORCH_COMPILE="false",
+    )
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve())],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+if __name__ == "__main__":
+    from importlib import metadata
+
+    _real_entry_points = metadata.entry_points
+    _platform_entry = metadata.EntryPoint(
+        name="cpu_contract",
+        value="__main__:_contract_platform",
+        group="vllm.platform_plugins",
+    )
+
+    def _isolated_entry_points(*args, **kwargs):
+        if kwargs.get("group") == "vllm.platform_plugins":
+            return metadata.EntryPoints((_platform_entry,))
+        return _real_entry_points(*args, **kwargs)
+
+    metadata.entry_points = _isolated_entry_points
+    _check_collective_compile()

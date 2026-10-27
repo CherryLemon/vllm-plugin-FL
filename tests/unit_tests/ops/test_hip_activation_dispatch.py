@@ -128,18 +128,38 @@ def test_hip_activations_keep_oot_dispatch_and_native_controls():
                         torch.testing.assert_close(layer(x), layer.forward_native(x))
                         assert len(calls) == int(enabled)
                         calls.clear()
-                        compiled = torch.compile(layer, backend="eager", fullgraph=True)
+                        graphs = []
+
+                        def backend(graph, _example_inputs):
+                            graphs.append(graph)
+                            return graph.forward
+
+                        compiled = torch.compile(layer, backend=backend, fullgraph=True)
                         compiled(x)
                         calls.clear()
                         updated = x * 0.25 + 0.5
                         actual = compiled(updated)
                         torch.testing.assert_close(actual, layer.forward_native(updated))
                         assert len(calls) == int(enabled)
+                        assert len(graphs) == 1
+                        if enabled:
+                            op_name = (
+                                "silu_and_mul" if name == "SiluAndMul" else "gelu_and_mul"
+                            )
+                            op = getattr(torch.ops.vllm_fl, op_name)
+                            assert any(
+                                node.target in (op, op.default)
+                                for node in graphs[0].graph.nodes
+                            ), graphs[0].code
                         torch._dynamo.reset()
         """
     )
     env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES="", VLLM_PLUGINS="cpu_contract")
+    env.update(
+        CUDA_VISIBLE_DEVICES="",
+        VLLM_PLUGINS="cpu_contract",
+        XMLIR_ENABLE_MOCK_TORCH_COMPILE="false",
+    )
     result = subprocess.run(
         [sys.executable, "-c", probe, str(Path(__file__).resolve().parents[3])],
         env=env,
