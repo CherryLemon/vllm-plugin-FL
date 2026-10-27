@@ -658,7 +658,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         ) + post.float() * x.float().unsqueeze(-2)
         return result.bfloat16() if materialize else result
 
-    def reference(materialized_residual=None) -> list[torch.Tensor]:
+    def reference() -> list[torch.Tensor]:
         if name == "mhc_pre":
             return list(pre_reference(residual))
         if name == "mhc_post":
@@ -669,13 +669,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
             # from the FP32 post value, before materializing residual_cur in
             # BF16. Weighted layer input still consumes that BF16 residual.
             projected = post_reference(False) if backend == "vendor:cuda" else None
-            # The public FlagGems fused API runs pre on its returned BF16
-            # post result. Check that result independently below, then use
-            # that materialization as the next stage's input. A permitted
-            # BF16 post rounding difference must not be amplified into an
-            # unrelated FP32 mixing-weight failure.
-            pre_input = r if materialized_residual is None else materialized_residual
-            return [r, *pre_reference(pre_input, projected)]
+            return [r, *pre_reference(r, projected)]
         gate = x[:, : hidden // 2].float().clamp(max=limit)
         up = x[:, hidden // 2 :].float().clamp(min=-limit, max=limit)
         return [(gate * torch.sigmoid(alpha * gate) * (up + beta)).bfloat16()]
@@ -711,10 +705,7 @@ def test_opaque_glm_ops_inductor_and_refreshed_graph(name, backend):
         return (compile_ops.forward_clamp(state, value),)
 
     def check(actual):
-        materialized = (
-            actual[0] if name == "mhc_fused_post_pre" and backend == "flagos" else None
-        )
-        expected_outputs = reference(materialized)
+        expected_outputs = reference()
         assert len(actual) == len(expected_outputs)
         for output, expected in zip(actual, expected_outputs):
             assert output.shape == expected.shape and output.dtype == expected.dtype
