@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Default-off fresh-owner concat/pad preparation; no deferred KV state."""
 
-import os
+from vllm_fl.utils import use_flaggems_op
 
 import torch
 
 
 def maybe_prepare_mla_composite(impl, q):
-    if os.environ.get("HY4_MLA_COMPOSITE_STAGING") != "1":
+    if not use_flaggems_op("concat_pad_mla_q_and_sink", default=False):
         return None
     if (
         not isinstance(q, tuple)

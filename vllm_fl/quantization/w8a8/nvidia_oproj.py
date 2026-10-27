@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 
 import torch
 
@@ -19,8 +18,6 @@ from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
 )
 from vllm.platforms import PlatformEnum, current_platform
 from vllm_fl.utils import use_flaggems_op
-
-FEATURE = "HY4_INT8_OPROJ_DECODE"
 
 
 def int8_scaled_mm_decode(*args, **kwargs):
@@ -45,16 +42,12 @@ class FGVInt8OProjDecodeKernel(CutlassInt8ScaledMMLinearKernel):
         # Per-instance policy snapshot: serving configuration is frozen before
         # construction. Preserve the stock whitelist/blacklist resolver without
         # parsing its platform YAML on every eager/prefill attention forward.
-        self._hy4_gate_quant_allowed = os.environ.get(
-            "HY4_MLA_GATE_QUANT", "0"
-        ) == "1" and use_flaggems_op("mul_scaled_int8_quant")
+        self._hy4_gate_quant_allowed = use_flaggems_op(
+            "mul_scaled_int8_quant", default=False
+        )
 
     def input_quant_key(self):
-        return (
-            kInt8DynamicTokenSym
-            if os.environ.get("HY4_MLA_GATE_QUANT", "0") == "1"
-            else None
-        )
+        return kInt8DynamicTokenSym if self._hy4_gate_quant_allowed else None
 
     # Native weight postprocessing is inherited unchanged. Only a policy
     # bool is retained; no per-layer tensor/cache/stream is retained.
@@ -108,7 +101,7 @@ class FGVInt8OProjDecodeKernel(CutlassInt8ScaledMMLinearKernel):
 def maybe_select_nvidia_oproj_kernel(
     kernel, layer_name, input_size_per_partition, output_partition_sizes, params_dtype
 ):
-    if os.environ.get(FEATURE, "0") != "1":
+    if not use_flaggems_op("int8_scaled_mm_decode", default=False):
         return kernel
     if (
         current_platform._enum != PlatformEnum.CUDA

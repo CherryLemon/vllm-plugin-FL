@@ -15,9 +15,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-import os
 
 import torch
+from vllm_fl.utils import use_flaggems_op
 from compressed_tensors.quantization import QuantizationStrategy
 
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -72,7 +72,7 @@ class CompressedTensorsPackedW8A8Int8(CompressedTensorsW8A8Int8):
             weight_loader=weight_loader,
             **kwargs,
         )
-        if os.environ.get("HY4_INT8_OPROJ_DECODE", "0") == "1":
+        if use_flaggems_op("int8_scaled_mm_decode", default=False):
             from .nvidia_oproj import maybe_select_nvidia_oproj_kernel
 
             self.kernel = maybe_select_nvidia_oproj_kernel(
@@ -153,7 +153,7 @@ def install_packed_w8a8_scheme() -> bool:
             layer_name=layer_name,
         )
         if (
-            os.environ.get("HY4_INT8_OPROJ_DECODE", "0") == "1"
+            use_flaggems_op("int8_scaled_mm_decode", default=False)
             and isinstance(layer_name, str)
             and layer_name.endswith(".self_attn.o_proj")
         ):

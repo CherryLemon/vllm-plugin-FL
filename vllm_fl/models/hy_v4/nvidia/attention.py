@@ -14,11 +14,9 @@ subclasses the platform's sparse MLA backend to forward ``attn_sink``.
 """
 
 from typing import cast
-from .gate_overlap import GateOverlap
 from vllm_fl.quantization.w8a8.gate_quant_input import maybe_gate_quant_input
 
 import regex as re
-import os
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config, PreTrainedConfig
@@ -190,12 +188,7 @@ class Indexer(nn.Module):
         # FP8 naive cache: values in fp8 plus one fp32 scale per
         # ``quant_block_size`` elements.
         assert cache_config is not None, "HYV4 indexer requires cache_config"
-        cache_cls = DeepseekV32IndexerCache
-        if self.use_int8:
-            from .int8_indexer_backend import HYV4Int8IndexerCache
-
-            cache_cls = HYV4Int8IndexerCache
-        self.k_cache = cache_cls(
+        self.k_cache = DeepseekV32IndexerCache(
             head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
@@ -518,9 +511,6 @@ class HYV4MLAAttention(nn.Module):
         else:
             self.linear_gate = None
             self.use_hpc_gated_mla = False
-        self._hy4_gate_overlap = (
-            GateOverlap() if os.getenv("HY4_MLA_GATE_OVERLAP", "0") == "1" else None
-        )
         self.prefix = prefix
 
         # Per-head learnable attention sink. Created BEFORE ``MLAAttention`` so
@@ -754,25 +744,12 @@ class HYV4MLAAttention(nn.Module):
         attn_out = torch.empty(
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
-        gate_ticket = (
-            None
-            if self._hy4_gate_overlap is None
-            else self._hy4_gate_overlap.begin(self, hidden_states)
+        self._indexer_and_attn(
+            hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
         )
-        gate_factor = None
-        try:
-            self._indexer_and_attn(
-                hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
-            )
-        finally:
-            if gate_ticket is not None:
-                gate_factor = gate_ticket.finish()
 
         if self.gated_mla and self.linear_gate is not None:
-            if gate_factor is not None:
-                quantized = maybe_gate_quant_input(self.o_proj, attn_out, gate_factor)
-                attn_out = attn_out * gate_factor if quantized is None else quantized
-            elif self.use_hpc_gated_mla:
+            if self.use_hpc_gated_mla:
                 # Projection, sigmoid and the product in one launch. The gate
                 # is column-parallel and unbiased, so its local weight shard
                 # maps straight onto the local attn_out columns.

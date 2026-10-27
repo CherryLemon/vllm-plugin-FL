@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 
 import torch
+from vllm_fl.utils import use_flaggems_op
 from compressed_tensors.config import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy, QuantizationType
 
@@ -14,8 +14,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from .int8_mode import is_dynamic_token_int8
-
-FEATURE = "HY4_INT8_OPROJ_DECODE"
 
 
 class CompressedTensorsIntFormatOProjW8A8Int8(CompressedTensorsW8A8Int8):
@@ -71,7 +69,7 @@ def maybe_wrap_intformat_oproj_scheme(
 ):
     """Opt in only the native ordinary W8A8 o_proj scheme, by exact type."""
     if (
-        os.environ.get(FEATURE, "0") != "1"
+        not use_flaggems_op("int8_scaled_mm_decode", default=False)
         or quant_format != CompressionFormat.int_quantized.value
         or not isinstance(layer_name, str)
         or not layer_name.endswith(".self_attn.o_proj")

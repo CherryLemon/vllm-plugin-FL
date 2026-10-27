@@ -17,10 +17,10 @@ The subclass intentionally keeps the inherited ``get_name()``
 `_canonicalize_sparse_mla_kv_cache_dtype` promotes a quantized KV cache to
 ``fp8_ds_mla`` for it, and `FlashMLASparseImpl` asserts that layout — so a new
 name would silently change KV cache behaviour. Sink support and kernel wrappers
-remain unchanged; the optional builder below reuses current common request IDs.
+remain unchanged; metadata uses the native builder.
 """
 
-import os
+from vllm_fl.utils import use_flaggems_op
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,7 +30,6 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     FlashMLASparseImpl,
     FlashMLASparseMetadata,
-    FlashMLASparseMetadataBuilder,
 )
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
@@ -90,20 +89,6 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
-        if os.environ.get("HY4_BF16_MLA_PAD_SCRATCH") == "1":
-            from vllm.config import get_current_vllm_config
-
-            config = get_current_vllm_config()
-            parallel = config.parallel_config
-            self._hy4_bf16_mla_pad_parallel = (
-                parallel.tensor_parallel_size,
-                parallel.decode_context_parallel_size,
-                parallel.prefill_context_parallel_size,
-                config.speculative_config is None,
-                config.lora_config is None,
-            )
-            self._hy4_bf16_mla_pad_selector_version = 1
-            self._hy4_bf16_mla_pad_variant = "baseline"
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -231,7 +216,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         return out, lse
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
-        if os.environ.get("HY4_MLA_COMPOSITE_STAGING") == "1":
+        if use_flaggems_op("concat_pad_mla_q_and_sink", default=False):
             from .mla_composite_staging import maybe_prepare_mla_composite
 
             prepared = maybe_prepare_mla_composite(self, q)
@@ -337,49 +322,11 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         return output
 
 
-class HYV4FlashMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder):
-    """Reuse the current common producer's request IDs for speculative batches.
-
-    Only the request-ID producer changes. Native decode/prefill splitting and
-    every dynamic seq/slot/block field retain the parent builder unchanged.
-    Draft workspaces and reconstructed metadata without a live lease fall back.
-    """
-
-    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._hy4_spec_common_request_ids = (
-            os.environ.get("HY4_SPEC_COMMON_REQUEST_IDS", "0") == "1"
-        )
-
-    def _build_req_id_per_token(self, common_attn_metadata):
-        if (
-            self._hy4_spec_common_request_ids
-            and not self.use_pcp
-            and self.dcp_world_size == 1
-            and self.vllm_config.speculative_config is not None
-            and getattr(common_attn_metadata, "_vllm_fl_request_id_lease", None)
-            is not None
-        ):
-            from vllm_fl.worker.common_attention_metadata import (
-                request_id_per_token_from_common,
-            )
-
-            shared = request_id_per_token_from_common(common_attn_metadata)
-            if shared is not None:
-                return shared
-        return super()._build_req_id_per_token(common_attn_metadata)
-
-
 class HYV4FlashMLASparseBackend(FlashMLASparseBackend):
     """``FLASHMLA_SPARSE`` with attention-sink support for HY V4.
 
-    Keeps the parent's name and metadata. The builder preserves native behavior
-    unless the explicit speculative common-request-ID option is enabled.
+    Keeps the parent's name and native metadata builder.
     """
-
-    @staticmethod
-    def get_builder_cls() -> type[HYV4FlashMLASparseMetadataBuilder]:
-        return HYV4FlashMLASparseMetadataBuilder
 
     @staticmethod
     def get_impl_cls() -> type[HYV4FlashMLASparseImpl]:

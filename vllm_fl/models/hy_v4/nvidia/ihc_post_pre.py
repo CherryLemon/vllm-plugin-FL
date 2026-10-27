@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Default-off orchestration for the one intra-layer post/pre boundary."""
 
-import os
+from vllm_fl.utils import use_flaggems_op
 
 from torch.nn.modules import module as nn_module
 
 
 def maybe_ihc_post_pre(owner, output, residual, post_gates):
-    if os.environ.get("HY4_IHC_POST_PRE", "0") != "1":
+    if not use_flaggems_op("ihc_post_pre", default=False):
         return None
     from .hc import HYV4HCLayer, HYV4HCPostLayer, HYV4HCPreLayer
     from .triton_ihc import triton_ihc_supported

@@ -1,36 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Register Hy4-preview configuration and models with the vLLM 0.28 host."""
-
-import os
-
-
-def validate_native_graph_hooks(proposer_cls=None):
-    """Reject graph flags when the companion native integration is absent."""
-    flags = (
-        "HY4_MTP_DRAFT_FULL_GRAPH",
-        "HY4_MTP_FULL_DRAFT3_GRAPH",
-        "HY4_MTP_TAIL2_GRAPH",
-        "HY4_PREFILL_BREAKABLE_GRAPH",
-        "HY4_MTP_QSL_GPU_STAGING",
-        "FLAGOS_ASYNC_INPUT_STAGING",
-        "HY4_SPEC_COMMON_REQUEST_IDS",
-    )
-    if not any(os.environ.get(flag, "0") == "1" for flag in flags):
-        return
-    if proposer_cls is None:
-        from vllm.v1.spec_decode.llm_base_proposer import LLMBaseProposer
-
-        proposer_cls = LLMBaseProposer
-    if not hasattr(proposer_cls, "_hy4_call_model"):
-        raise RuntimeError(
-            "Hy4-preview graph/staging options require the companion "
-            "native vLLM 0.28 runner/proposer integration; keep these "
-            "options disabled with an unpatched vLLM wheel."
-        )
+"""Register Hy4-preview configuration and models with the native vLLM host."""
 
 
 def register_hy_v4():
-    validate_native_graph_hooks()
     from transformers import AutoConfig
     from vllm.model_executor.models import ModelRegistry
 

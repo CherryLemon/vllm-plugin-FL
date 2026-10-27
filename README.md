@@ -160,6 +160,48 @@ Operator adapters use the plugin dispatch manager, so backend selection,
 fallback, per-op policy, operator-list recording, and I/O diagnostics continue
 to follow the common FlagOS controls.
 
+### Hy4-preview text inference
+
+This branch ports the text model/configuration, weight mapping, attention sinks
+and bundled MTP block from the prior main-line adaptation. The existing
+`HYV4VLForConditionalGeneration` checkpoint identifier uses the causal text
+model and rejects media; no processor or vision encoder is installed.
+
+Use the native dependency declared by this branch (`vllm==0.28.0`). The model
+uses native sparse-MLA/indexer metadata and ordinary runner/proposer APIs; no
+native source patch or `_hy4_call_model` hook is required. `HY4_INDEXER_DTYPE`
+selects `auto`, `fp8` or `int8`; auto retains FP8 on NVIDIA SM90+ and selects
+INT8 elsewhere. INT8 requires the public `flag_gems.fused.int8_sparse_indexer`
+APIs in [FlagGems #7782](https://github.com/flagos-ai/FlagGems/pull/7782).
+
+```sh
+# Only needed when selecting the INT8 indexer.
+pip install --no-deps "flag_gems @ git+https://github.com/CherryLemon/FlagGems.git@a15441de4a9249485d5f58feff975d48b59f6620"
+```
+
+
+Optional iHC post/pre, MLA concat/pad, M-RoPE cache and INT8 O-projection
+consumers use the existing FlagGems operator controls (including whitelist and
+blacklist), with the provider default off. Their numerical APIs are delivered
+separately in [FlagGems-vllm #1002](https://github.com/flagos-ai/FlagGems-vllm/pull/1002);
+install its published revision:
+
+```sh
+pip install --no-deps "flaggems_vllm @ git+https://github.com/CherryLemon/FlagGems-vllm.git@ead30f59a34869f12b4837147fbb425581e47280"
+```
+The independent RMS API is in [#1001](https://github.com/flagos-ai/FlagGems-vllm/pull/1001).
+Unsupported shapes/providers retain their native call before numerical launch;
+selected launch failures propagate. MTP body/full/tail graph experiments,
+async input staging and private indexer candidates are excluded.
+
+Kernel ownership follows the implementation language: TileLang kernels stay
+in the framework; generic Triton kernels belong to FlagGems and framework-specific
+Triton kernels to its companion library. Existing native backend calls are reused.
+
+Current validation covers CPU contracts, native registration/import and Python
+wheel contents. Current combined-package GPU numerics, graph replay, serving,
+whole-model accuracy and performance remain unqualified.
+
 ### Operator profiling
 
 See the [operator profiling tools](./tools/operator_profile/README.md) for a

@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Default-off orchestration only; all numerical work lives in FlagGems-vllm."""
 
-import os
+from vllm_fl.utils import use_flaggems_op
 
 
 def maybe_mrope_direct_cache(rotary, positions, q_pe, k_pe):
-    if os.environ.get("HY4_MROPE_STRIDED_CACHE", "0") != "1":
+    if not use_flaggems_op("mrope_strided_cache", default=False):
         return None
     if (
         positions.ndim != 2

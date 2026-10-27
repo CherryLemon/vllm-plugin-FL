@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Thin optional gate producer/consumer for the stock QuantizedActivation ABI."""
 
-import os
-
 import torch
+from vllm_fl.utils import use_flaggems_op
 from torch.nn.modules import module as nn_module
 
 from vllm import _custom_ops as ops
@@ -27,8 +26,6 @@ from .nvidia_oproj import (
     _graph_or_startup_warm,
     int8_scaled_mm_decode,
 )
-
-FEATURE = "HY4_MLA_GATE_QUANT"
 
 
 def _native_dynamic_params(kernel, layer, device):
@@ -57,7 +54,7 @@ def _native_dynamic_params(kernel, layer, device):
 
 def maybe_gate_quant_input(linear, x, factor):
     """Decline before computation unless stock linear/CT/provider contracts hold."""
-    if os.environ.get(FEATURE, "0") != "1":
+    if not use_flaggems_op("mul_scaled_int8_quant", default=False):
         return None
     from flaggems_vllm.ops.mul_scaled_int8_quant import (
         mul_scaled_int8_quant,
@@ -65,7 +62,7 @@ def maybe_gate_quant_input(linear, x, factor):
     )
 
     if (
-        os.environ.get(FEATURE, "0") != "1"
+        not use_flaggems_op("mul_scaled_int8_quant", default=False)
         or not isinstance(linear, RowParallelLinear)
         or type(linear).forward is not RowParallelLinear.forward
         or not linear.input_is_parallel
@@ -106,7 +103,7 @@ def apply_prequantized_oproj(kernel, layer, activation, bias):
     q, scale = activation.data, activation.scale
     shape = activation.orig_shape
     if (
-        os.environ.get(FEATURE, "0") != "1"
+        not use_flaggems_op("mul_scaled_int8_quant", default=False)
         or activation.quant_key != kInt8DynamicTokenSym
         or activation.orig_dtype != torch.bfloat16
         or not isinstance(shape, tuple)

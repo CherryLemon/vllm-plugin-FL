@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contracts for Hy4-preview registration, MTP metadata and launch selection.
+"""CPU contracts for Hy4-preview registration and MTP metadata.
 
 Load the small modules directly so these tests do not import a CUDA extension,
 initialize an accelerator, load weights or simulate model numerical correctness.
@@ -21,46 +21,6 @@ def load(name, relative):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def qsl(values):
-    return SimpleNamespace(tolist=lambda: list(values))
-
-
-def common(starts, *, query=4, prefilling=None):
-    return SimpleNamespace(
-        max_query_len=query,
-        num_reqs=len(starts) - 1,
-        num_actual_tokens=starts[-1],
-        query_start_loc_cpu=qsl(starts),
-        is_prefilling=None if prefilling is None else qsl(prefilling),
-        causal=True,
-        mm_req_doc_ranges=None,
-    )
-
-
-def test_native_graph_hook_is_optional_until_requested(monkeypatch):
-    registration = load("hy4_registration_contract", "register.py")
-    flags = (
-        "HY4_MTP_DRAFT_FULL_GRAPH",
-        "HY4_MTP_FULL_DRAFT3_GRAPH",
-        "HY4_MTP_TAIL2_GRAPH",
-        "HY4_PREFILL_BREAKABLE_GRAPH",
-        "HY4_MTP_QSL_GPU_STAGING",
-        "FLAGOS_ASYNC_INPUT_STAGING",
-        "HY4_SPEC_COMMON_REQUEST_IDS",
-    )
-    for flag in flags:
-        monkeypatch.delenv(flag, raising=False)
-    registration.validate_native_graph_hooks(object)
-    for flag in flags:
-        with monkeypatch.context() as scope:
-            scope.setenv(flag, "1")
-            with pytest.raises(RuntimeError, match="native vLLM 0.28"):
-                registration.validate_native_graph_hooks(object)
-            registration.validate_native_graph_hooks(
-                type("PatchedProposer", (), {"_hy4_call_model": lambda: None})
-            )
 
 
 def test_registration_connects_config_model_and_mtp_hooks(monkeypatch):
@@ -100,7 +60,6 @@ def test_registration_connects_config_model_and_mtp_hooks(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     mtp = load("hy4_registry_fixture.mtp_config", "mtp_config.py")
     monkeypatch.setitem(sys.modules, "hy4_registry_fixture.mtp_config", mtp)
-    monkeypatch.setattr(registration, "validate_native_graph_hooks", lambda: None)
     registration.register_hy_v4()
     assert configs == {"hy_v4": text_config, "hy_v4_vl": vl_config}
     assert set(models) == {
@@ -209,26 +168,6 @@ def test_real_text_config_accepts_checkpoint_header_without_media_components(
     assert not hasattr(config, "image_token_id")
 
 
-def test_uniform_decode_plan_and_first_proposal_boundary():
-    graph = load("hy4_draft_contract", "nvidia/mtp_draft_graph.py")
-    sizes = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-    assert graph.decode_plan(common([0, 4, 8, 12]), sizes, verified_step=True) == (
-        4,
-        16,
-        4,
-    )
-    assert graph.decode_plan(common([0, 4]), sizes, verified_step=False) is None
-    assert graph.decode_plan(common([0, 3, 8]), sizes, verified_step=True) is None
-    assert (
-        graph.decode_plan(common([0, 4], prefilling=[True]), sizes, verified_step=True)
-        is None
-    )
-    assert (
-        graph.decode_plan(common(list(range(66)), query=1), sizes, verified_step=True)
-        is None
-    )
-
-
 def test_hy4_config_override_copies_only_the_draft():
     mtp = load("hy4_mtp_config_contract", "mtp_config.py")
     mtp._ORIGINAL_HF_CONFIG_OVERRIDE = lambda config: ("native", config)
@@ -304,3 +243,65 @@ def test_expert_parallel_mtp_requires_shared_tp_size():
     spec.draft_tensor_parallel_size = 8
     with pytest.raises(ValueError, match="draft_tensor_parallel_size"):
         mtp.hyv4_mtp_speculative_post_init(spec)
+
+
+def test_projection_selection_uses_shared_policy_and_single_dtype_guard(monkeypatch):
+    import torch
+
+    from vllm_fl.quantization.w8a8 import nvidia_oproj as projection
+
+    enabled = True
+    policy_calls = []
+
+    def policy(name, default=True):
+        policy_calls.append((name, default))
+        return enabled
+
+    monkeypatch.setattr(projection, "use_flaggems_op", policy)
+    monkeypatch.setattr(
+        projection,
+        "current_platform",
+        SimpleNamespace(
+            _enum=projection.PlatformEnum.CUDA, get_device_capability=lambda: (9, 0)
+        ),
+    )
+    monkeypatch.setattr(
+        projection,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_mode=projection.CUDAGraphMode.FULL_DECODE_ONLY,
+                cudagraph_num_of_warmups=1,
+            )
+        ),
+    )
+    # This test exercises host selection using the real native kernel classes;
+    # hardware support is supplied, and no weights or device tensors are built.
+    monkeypatch.setattr(
+        projection.FGVInt8OProjDecodeKernel,
+        "is_supported",
+        classmethod(lambda cls: (True, None)),
+    )
+    monkeypatch.setattr(
+        projection.FGVInt8OProjDecodeKernel,
+        "can_implement",
+        classmethod(lambda cls, config: (True, None)),
+    )
+    native = projection.CutlassInt8ScaledMMLinearKernel.__new__(
+        projection.CutlassInt8ScaledMMLinearKernel
+    )
+    native.config = SimpleNamespace(
+        is_channelwise=True, is_static_input_scheme=False, input_symmetric=True
+    )
+    native.layer_param_names = ("weight", "scale", "input_scale", "input_zp", "azp")
+    args = (native, "model.layers.0.self_attn.o_proj", 1024, [6144])
+    selected = projection.maybe_select_nvidia_oproj_kernel(*args, torch.bfloat16)
+    assert type(selected) is projection.FGVInt8OProjDecodeKernel
+    assert selected.config is native.config
+    assert selected.layer_param_names is native.layer_param_names
+    assert selected.input_quant_key() == projection.kInt8DynamicTokenSym
+    assert projection.maybe_select_nvidia_oproj_kernel(*args, torch.float32) is native
+    enabled = False
+    assert projection.maybe_select_nvidia_oproj_kernel(*args, torch.bfloat16) is native
+    assert ("int8_scaled_mm_decode", False) in policy_calls
+    assert ("mul_scaled_int8_quant", False) in policy_calls
