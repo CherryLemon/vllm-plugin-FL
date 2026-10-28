@@ -38,6 +38,7 @@ def test_hip_rotary_keeps_oot_dispatch_and_native_contracts():
         from vllm.config import CompilationConfig, CompilationMode
         from vllm.model_executor import custom_op
         from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+        from vllm.model_executor.layers.rotary_embedding import common as rotary_common
 
         torch.set_default_device("cpu")
         root = Path(sys.argv[1])
@@ -93,6 +94,10 @@ def test_hip_rotary_keeps_oot_dispatch_and_native_contracts():
             is_tpu=lambda: False, is_xpu=lambda: False,
             is_out_of_tree=lambda: True,
         )
+        # UnspecifiedPlatform is not CPU: the real inner ApplyRotaryEmb would
+        # otherwise import a GPU-only FlashAttention provider during construction.
+        # Isolate that unused capability while outer CustomOp still sees HIP.
+        cpu = types.SimpleNamespace(is_cpu=lambda: True)
         native_cuda_calls = []
 
         def unavailable_cuda(*args, **kwargs):
@@ -108,7 +113,12 @@ def test_hip_rotary_keeps_oot_dispatch_and_native_contracts():
         original_key = torch.linspace(3, -1, 24).reshape(1, 3, 8)
         with patch.object(custom_op, "current_platform", hip), patch.object(
             module, "current_platform", hip
-        ), patch.object(RotaryEmbedding, "forward_cuda", unavailable_cuda):
+        ), patch.object(rotary_common, "current_platform", cpu), patch.object(
+            rotary_common, "import_module",
+            side_effect=AssertionError("CPU RoPE probe requested GPU FlashAttention"),
+        ) as optional_attention_import, patch.object(
+            RotaryEmbedding, "forward_cuda", unavailable_cuda
+        ):
             for controls, enabled in (
                 (["all"], True), (["none"], False),
                 (["all", f"-{name}"], False),
@@ -126,6 +136,7 @@ def test_hip_rotary_keeps_oot_dispatch_and_native_contracts():
                                 8, rotary_dim, 8, 10000.0, neox, torch.float32
                             )
                             assert isinstance(layer, module.RotaryEmbeddingFL)
+                            assert layer.apply_rotary_emb.apply_rotary_emb_flash_attn is None
                             assert layer._forward_method.__name__ == (
                                 "forward_hip" if enabled else "forward_native"
                             )
@@ -189,6 +200,7 @@ def test_hip_rotary_keeps_oot_dispatch_and_native_contracts():
                 custom_op, "get_cached_compilation_config", lambda: config
             ), patch.object(RotaryEmbedding, "forward_hip", native_hip):
                 layer = RotaryEmbedding(8, 8, 8, 10000.0, True, torch.float32)
+                assert layer.apply_rotary_emb.apply_rotary_emb_flash_attn is None
                 calls.clear()
                 query = original_query.clone()
                 out_query, out_key = layer(positions, query)
@@ -209,6 +221,7 @@ def test_hip_rotary_keeps_oot_dispatch_and_native_contracts():
                 else:
                     raise AssertionError("native HIP error was swallowed")
                 assert len(native_hip_calls) == 1 and not calls
+            optional_attention_import.assert_not_called()
         """
     )
     env = os.environ.copy()
