@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -793,6 +794,22 @@ class TestRunner:
         if extra_env_override:
             env.update(extra_env_override)
 
+        case_log_dir = None
+        if (
+            tc.task == "serving"
+            and tc.model
+            and tc.case
+            and not any(
+                arg == "--basetemp" or arg.startswith("--basetemp=") for arg in cmd
+            )
+        ):
+            log_root = (
+                self.output_dir / f"test-results-{self.config.platform}-logs"
+            ).resolve()
+            log_root.mkdir(parents=True, exist_ok=True)
+            case_log_dir = Path(tempfile.mkdtemp(prefix="serving-", dir=log_root))
+            cmd.extend(["--basetemp", str(case_log_dir)])
+
         start = time.time()
         with ExitStack() as cleanup:
             if self.config.platform == "hygon" and tc.task in ("inference", "serving"):
@@ -816,6 +833,8 @@ class TestRunner:
         duration = time.time() - start
 
         passed = proc.returncode == 0
+        if passed and case_log_dir is not None:
+            shutil.rmtree(case_log_dir)
         message = "" if passed else f"pytest exited with code {proc.returncode}"
 
         return TestResult(
