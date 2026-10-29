@@ -29,7 +29,7 @@ from vllm.compilation.breakable_cudagraph import (
     is_breakable_cudagraph_enabled,
 )
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationMode,
@@ -45,10 +45,10 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
+    GraphCaptureContext,
     get_dcp_group,
     get_pp_group,
     get_tp_group,
-    GraphCaptureContext,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
@@ -169,6 +169,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
 from vllm.utils.torch_utils import (
+    PIN_MEMORY,
     get_dtype_size,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
@@ -255,8 +256,6 @@ from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunne
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.utils.torch_utils import PIN_MEMORY
-
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -266,18 +265,18 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
-
 from vllm.v1.worker.utils import (
     AttentionGroup,
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
+    is_residual_scattered_for_sp,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
+from vllm.v1.worker.workspace import lock_workspace
 
 # FL-specific imports
+from vllm_fl.compat.kv_cache import bind_kv_cache
 from vllm_fl.compilation.graph import GraphWrapper
 from vllm_fl.dispatch import prewarm_cached_ops
 from vllm_fl.dispatch.io_common import managed_inference_mode
@@ -291,9 +290,7 @@ from vllm_fl.worker.common_attention_metadata import (
     common_attention_metadata_enabled,
     compute_common_attention_metadata,
 )
-from vllm_fl.worker.kv_cache_utils import bind_kv_cache
-
-GraphWrapper = GraphWrapper
+from vllm_fl.worker.model_state import ModelRunnerState
 
 
 def _decoder_graph_wrappers():
@@ -589,6 +586,7 @@ class ModelRunnerFL(
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
+        self.model_state = ModelRunnerState(self)
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
@@ -1247,6 +1245,7 @@ class ModelRunnerFL(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        self.model_state.remove_requests(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1551,6 +1550,7 @@ class ModelRunnerFL(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
+            self.model_state.remove_requests((request.req_id,))
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
@@ -3632,6 +3632,8 @@ class ModelRunnerFL(
         self,
         scheduler_output: "SchedulerOutput",
         num_input_tokens: int,  # Padded
+        num_reqs: int,
+        num_reqs_padded: int,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[
         torch.Tensor | None,
@@ -3735,6 +3737,10 @@ class ModelRunnerFL(
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
+
+        model_kwargs.update(
+            self.model_state.prepare_inputs(num_reqs, num_reqs_padded, input_ids)
+        )
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
@@ -4537,7 +4543,11 @@ class ModelRunnerFL(
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
+                scheduler_output,
+                num_tokens_padded,
+                num_reqs,
+                num_reqs_padded,
+                intermediate_tensors,
             )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -5430,6 +5440,9 @@ class ModelRunnerFL(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                get_state_cls = getattr(self.model, "get_legacy_model_state_cls", None)
+                if get_state_cls is not None:
+                    self.model_state = get_state_cls()(self)
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
@@ -6220,6 +6233,12 @@ class ModelRunnerFL(
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
+            model_kwargs.update(
+                self.model_state.prepare_dummy_inputs(
+                    num_reqs, num_reqs_padded, num_scheduled_tokens
+                )
+            )
+
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
             elif self.uses_xdrope_dim > 0:
@@ -6680,7 +6699,7 @@ class ModelRunnerFL(
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
-            CUDAGraphWrapper.clear_all_graphs()
+            GraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
         self.compilation_config.static_forward_context.clear()

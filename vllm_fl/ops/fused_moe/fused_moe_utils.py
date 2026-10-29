@@ -86,6 +86,11 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
     elif runtime_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
     else:
+        # PlatformFL is intentionally OOT.  Unknown CUDA-alike vendors (for
+        # example Hygon) must not fall through to an unbound local or inherit
+        # NVIDIA-only FlashInfer candidates.  Triton is the portable fallback
+        # and keeps the backend choice fail-safe until a vendor adds a native
+        # expert implementation.
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.TRITON,
             UnquantizedMoeBackend.BATCHED_TRITON,
@@ -96,12 +101,21 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
 ## Adopt from select_unquantized_moe_backend
 def select_unquantized_moe_backend_oot(
     moe_config: FusedMoEConfig,
+    *,
+    prefer_flaggems_experts: bool = False,
 ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
     """
     Select the primary Unquantized MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
+
+    ``prefer_flaggems_experts`` is set only by the FusedMoEFL provider.  The
+    upstream-oracle fallback leaves it disabled so an OOT blacklist/whitelist
+    can genuinely return execution to vLLM's native expert implementation.
     """
 
+    # This module can be imported while vLLM is still resolving the OOT
+    # platform plugin.  Resolve the platform again at selection time instead
+    # of relying on the module-level object captured during plugin import.
     runtime_platform = _get_current_platform()
 
     if runtime_platform.is_cpu():
@@ -111,7 +125,7 @@ def select_unquantized_moe_backend_oot(
     if runtime_platform.is_tpu():
         return UnquantizedMoeBackend.TPU, None
 
-    if runtime_platform.device_type == "npu":
+    if getattr(runtime_platform, "device_type", None) == "npu":
         parallel = moe_config.moe_parallel_config
         if (
             moe_config.is_lora_enabled
@@ -152,7 +166,26 @@ def select_unquantized_moe_backend_oot(
         # apply() below dispatches NPU computation to packaged torch_npu ops.
         return UnquantizedMoeBackend.TRITON, TritonExpertsFL
 
-    if runtime_platform.is_out_of_tree() and use_flaggems():
+    # Keep the FlagGems Triton path for both the default and an explicitly
+    # requested Triton backend.  Other explicit choices remain authoritative;
+    # in particular, do not make AITER/FlashInfer unreachable on AMD/NVIDIA.
+    rocm_aiter_requested = (
+        runtime_platform.is_rocm()
+        and (
+            envs.is_set("VLLM_ROCM_USE_AITER") or envs.is_set("VLLM_ROCM_USE_AITER_MOE")
+        )
+        and envs.VLLM_ROCM_USE_AITER
+        and envs.VLLM_ROCM_USE_AITER_MOE
+    )
+    if (
+        prefer_flaggems_experts
+        and runtime_platform.is_out_of_tree()
+        and use_flaggems()
+        and (
+            moe_config.moe_backend == "triton"
+            or (moe_config.moe_backend == "auto" and not rocm_aiter_requested)
+        )
+    ):
         return UnquantizedMoeBackend.TRITON, TritonExpertsFL
 
     if moe_config.is_lora_enabled:
@@ -390,7 +423,7 @@ class TritonExpertsFL(TritonExperts):
                 expert_tokens_meta,
                 apply_router_weight_on_input,
             )
-        if runtime_platform.device_type == "npu":
+        if getattr(runtime_platform, "device_type", None) == "npu":
             if self._lora_context is not None or self.gemm1_clamp_limit is not None:
                 raise NotImplementedError(
                     "Ascend grouped MoE requires ordinary unquantized experts"

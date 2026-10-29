@@ -254,11 +254,15 @@ def register_model():
         register_glm5_next_support,
     )
     from vllm_fl.patches.qwen3_5_text import apply_qwen3_5_text_patches
+    from vllm_fl.patches.qwen3_8_flash_next import (
+        apply_qwen3_8_flash_next_patches,
+    )
 
     # GLM5-Next is intentionally registered only by its vLLM-0.24 adapter;
     # the plugin main branch is ABI-pinned to that release line.
     register_glm5_next_support()
     apply_qwen3_5_text_patches()
+    apply_qwen3_8_flash_next_patches()
 
     from vllm.platforms import current_platform
 
