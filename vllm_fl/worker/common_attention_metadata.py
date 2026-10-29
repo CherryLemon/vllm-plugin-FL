@@ -74,6 +74,7 @@ def _compute_slot_mapping_graph_kernel(
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     PAD_ID: tl.constexpr,
+    SAFE_MASKED_ADDRESS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     group_idx = tl.program_id(0)
@@ -91,14 +92,15 @@ def _compute_slot_mapping_graph_kernel(
     slot_mapping_ptr = tl.multiple_of(slot_mapping_ptr, 16)
 
     if req_idx == tl.num_programs(1) - 1:
-        actual_num_tokens = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
-        for i in range(actual_num_tokens, max_num_tokens, BLOCK_SIZE):
-            offsets = i + tl.arange(0, BLOCK_SIZE)
-            tl.store(
-                slot_mapping_ptr + offsets,
-                PAD_ID,
-                mask=offsets < max_num_tokens,
-            )
+        if not SAFE_MASKED_ADDRESS:
+            actual_num_tokens = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
+            for i in range(actual_num_tokens, max_num_tokens, BLOCK_SIZE):
+                offsets = i + tl.arange(0, BLOCK_SIZE)
+                tl.store(
+                    slot_mapping_ptr + offsets,
+                    PAD_ID,
+                    mask=offsets < max_num_tokens,
+                )
         return
 
     start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
@@ -115,8 +117,12 @@ def _compute_slot_mapping_graph_kernel(
         row_offset = req_idx * block_table_stride
         for i in range(0, block_table_width, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
+            if SAFE_MASKED_ADDRESS:
+                safe_offsets = tl.minimum(offsets, block_table_width - 1)
+            else:
+                safe_offsets = offsets
             tl.store(
-                block_table_ptr + row_offset + offsets,
+                block_table_ptr + row_offset + safe_offsets,
                 NULL_BLOCK_ID,
                 mask=offsets < block_table_width,
             )
@@ -145,6 +151,89 @@ def _compute_slot_mapping_graph_kernel(
         slot_ids = block_numbers * block_size + local_block_offsets
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit(do_not_specialize=["max_num_tokens"])
+def _compute_slot_mapping_kunlun_cp_kernel(
+    max_num_tokens,
+    query_start_loc_ptr,
+    positions_ptr,
+    block_table_ptrs,
+    block_table_strides,
+    block_table_widths,
+    block_sizes,
+    slot_mapping_ptrs,
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group_idx = tl.program_id(0)
+    req_idx = tl.program_id(1)
+    chunk_start = tl.program_id(2) * BLOCK_SIZE
+    start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
+    width = tl.load(block_table_widths + group_idx)
+    table = tl.load(block_table_ptrs + group_idx).to(tl.pointer_type(tl.int32))
+    stride = tl.load(block_table_strides + group_idx)
+    row_offset = req_idx * stride
+
+    if start_idx == end_idx and chunk_start < width:
+        offsets = chunk_start + tl.arange(0, BLOCK_SIZE)
+        safe_offsets = tl.minimum(offsets, width - 1)
+        tl.store(table + row_offset + safe_offsets, NULL_BLOCK_ID, offsets < width)
+    elif start_idx + chunk_start < end_idx:
+        offsets = start_idx + chunk_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < end_idx
+        safe_offsets = tl.minimum(offsets, max_num_tokens - 1)
+        pos = tl.load(positions_ptr + safe_offsets, mask=mask, other=0)
+        block_size = tl.load(block_sizes + group_idx)
+        virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+        block_indices = pos // virtual_block_size
+        block_numbers = tl.load(table + row_offset + block_indices).to(tl.int64)
+        virtual_offsets = pos - block_indices * virtual_block_size
+        is_local = (
+            virtual_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+        local_offsets = (
+            virtual_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+        slots = tl.where(is_local, block_numbers * block_size + local_offsets, PAD_ID)
+        slot_mapping = tl.load(slot_mapping_ptrs + group_idx).to(
+            tl.pointer_type(tl.int64)
+        )
+        tl.store(slot_mapping + safe_offsets, slots, mask=mask)
+
+
+@triton.jit(do_not_specialize=["max_num_tokens"])
+def _pad_slot_mapping_safe_kernel(
+    max_num_tokens,
+    query_start_loc_ptr,
+    slot_mapping_ptrs,
+    NUM_REQS: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group_idx = tl.program_id(0)
+    actual_num_tokens = tl.load(query_start_loc_ptr + NUM_REQS).to(tl.int64)
+    block_start = actual_num_tokens + tl.program_id(1) * BLOCK_SIZE
+    if block_start < max_num_tokens:
+        slot_mapping_ptr = tl.load(slot_mapping_ptrs + group_idx).to(
+            tl.pointer_type(tl.int64)
+        )
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        # Keep masked lanes inside the allocation on Kunlunxin. The final
+        # slot is padding whenever this branch executes.
+        safe_offsets = tl.minimum(offsets, max_num_tokens - 1)
+        tl.store(
+            slot_mapping_ptr + safe_offsets,
+            PAD_ID,
+            mask=offsets < max_num_tokens,
+        )
 
 
 @triton.jit
@@ -260,7 +349,10 @@ def compute_common_attention_metadata(
     """Populate fixed-address metadata buffers consumed by attention backends."""
     if block_table.block_tables:
         layout = _get_common_attention_metadata_layout(block_table)
-        _compute_slot_mapping_graph_kernel[(layout.num_groups, num_reqs + 1)](
+        safe_masked_address = (
+            getattr(current_platform, "vendor_name", None) == "kunlunxin"
+        )
+        kernel_args = (
             layout.max_num_batched_tokens,
             query_start_loc,
             positions,
@@ -269,6 +361,8 @@ def compute_common_attention_metadata(
             layout.block_table_widths,
             layout.block_sizes,
             layout.slot_mapping_ptrs,
+        )
+        kernel_kwargs = dict(
             TOTAL_CP_WORLD_SIZE=layout.total_cp_world_size,
             TOTAL_CP_RANK=layout.total_cp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=layout.cp_kv_cache_interleave_size,
@@ -276,6 +370,31 @@ def compute_common_attention_metadata(
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
         )
+        if safe_masked_address and layout.total_cp_world_size > 1 and num_reqs:
+            # The Kunlunxin compiler fails to lower CP arithmetic inside the
+            # dynamic request loop; a fixed grid handles each chunk separately.
+            max_width = max(
+                table.block_table.gpu.shape[1] for table in block_table.block_tables
+            )
+            chunks = triton.cdiv(max(layout.max_num_batched_tokens, max_width), 1024)
+            _compute_slot_mapping_kunlun_cp_kernel[
+                (layout.num_groups, num_reqs, chunks)
+            ](*kernel_args, **kernel_kwargs)
+        else:
+            _compute_slot_mapping_graph_kernel[(layout.num_groups, num_reqs + 1)](
+                *kernel_args, **kernel_kwargs, SAFE_MASKED_ADDRESS=safe_masked_address
+            )
+        if safe_masked_address and layout.max_num_batched_tokens:
+            _pad_slot_mapping_safe_kernel[
+                (layout.num_groups, triton.cdiv(layout.max_num_batched_tokens, 1024))
+            ](
+                layout.max_num_batched_tokens,
+                query_start_loc,
+                layout.slot_mapping_ptrs,
+                NUM_REQS=num_reqs,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
     _compute_num_computed_tokens_kernel[(triton.cdiv(num_reqs, 256),)](
         query_start_loc,
         seq_lens,

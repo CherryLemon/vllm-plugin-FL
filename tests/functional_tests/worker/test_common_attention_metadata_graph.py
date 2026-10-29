@@ -103,13 +103,21 @@ def _expected_slots(
     for group in table.block_tables:
         result = torch.full((group.max_num_batched_tokens,), -1, dtype=torch.int64)
         block_table = group.block_table.cpu
+        cp_world_size = group.pcp_world_size * group.dcp_world_size
+        cp_rank = group.pcp_rank * group.dcp_world_size + group.dcp_rank
+        interleave = group.cp_kv_cache_interleave_size
         for req_idx in range(len(query_start) - 1):
             for token_idx in range(query_start[req_idx], query_start[req_idx + 1]):
                 token_pos = pos[token_idx]
-                block_id = block_table[req_idx, token_pos // group.block_size]
-                result[token_idx] = (
-                    block_id * group.block_size + token_pos % group.block_size
-                )
+                virtual_size = group.block_size * cp_world_size
+                block_id = int(block_table[req_idx, token_pos // virtual_size])
+                virtual_offset = token_pos % virtual_size
+                if (virtual_offset // interleave) % cp_world_size == cp_rank:
+                    local_offset = (
+                        virtual_offset // (cp_world_size * interleave) * interleave
+                        + virtual_offset % interleave
+                    )
+                    result[token_idx] = block_id * group.block_size + local_offset
         expected.append(result)
     return expected
 
@@ -138,13 +146,23 @@ def _assert_matches_vllm_slot_mapping(
     num_computed_tokens: torch.Tensor,
 ) -> None:
     num_tokens = int(query_start_loc[num_reqs].cpu())
-    table.compute_slot_mapping(
-        num_reqs,
-        query_start_loc,
-        positions[:num_tokens],
-    )
-    current_platform.torch_device_fn.synchronize()
-    expected_slots = [group.slot_mapping.gpu.clone() for group in table.block_tables]
+    cpu_reference = _expected_slots(table, query_start_loc, positions)
+    if getattr(current_platform, "vendor_name", None) == "kunlunxin":
+        # The upstream CP reference kernel does not compile on this backend.
+        # Keep the same slot-by-slot check against the independent CPU oracle.
+        expected_slots = [ref.to(positions.device) for ref in cpu_reference]
+    else:
+        table.compute_slot_mapping(
+            num_reqs,
+            query_start_loc,
+            positions[:num_tokens],
+        )
+        current_platform.torch_device_fn.synchronize()
+        expected_slots = [
+            group.slot_mapping.gpu.clone() for group in table.block_tables
+        ]
+        for actual, expected in zip(expected_slots, cpu_reference):
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
     compute_common_attention_metadata(
         table,
@@ -289,8 +307,10 @@ def test_common_attention_metadata_graph_off_runs_eager(
     )
 
 
+@pytest.mark.parametrize("cp_rank", [0, 1])
 def test_common_attention_metadata_matches_vllm_with_hybrid_blocks_and_cp(
     device: torch.device,
+    cp_rank: int,
 ) -> None:
     table = MultiGroupBlockTable(
         max_num_reqs=2,
@@ -308,7 +328,7 @@ def test_common_attention_metadata_matches_vllm_with_hybrid_blocks_and_cp(
     table.commit_block_table(2)
     for group in table.block_tables:
         group.pcp_world_size = 2
-        group.pcp_rank = 1
+        group.pcp_rank = cp_rank
         group.dcp_world_size = 1
         group.dcp_rank = 0
 
@@ -328,6 +348,44 @@ def test_common_attention_metadata_matches_vllm_with_hybrid_blocks_and_cp(
         seq_lens,
         num_computed_tokens,
     )
+
+    if supports_accelerator_graph():
+        runner = CommonAttentionMetadataGraphRunner()
+        assert runner.run(
+            table,
+            2,
+            query_start_loc,
+            positions,
+            seq_lens,
+            num_computed_tokens,
+            use_graph=True,
+            capture=True,
+        )
+        query_start_loc.copy_(torch.tensor([0, 3, 7], dtype=torch.int32))
+        positions[:7].copy_(torch.tensor([1, 3, 5, 7, 9, 11, 13]))
+        seq_lens.copy_(torch.tensor([9, 17], dtype=torch.int32))
+        num_computed_tokens.fill_(-12345)
+        for group in table.block_tables:
+            group.slot_mapping.gpu.fill_(-12345)
+        assert runner.run(
+            table,
+            2,
+            query_start_loc,
+            positions,
+            seq_lens,
+            num_computed_tokens,
+            use_graph=True,
+        )
+        current_platform.torch_device_fn.synchronize()
+        for group, expected in zip(
+            table.block_tables, _expected_slots(table, query_start_loc, positions)
+        ):
+            torch.testing.assert_close(
+                group.slot_mapping.gpu.cpu(), expected, rtol=0, atol=0
+            )
+        torch.testing.assert_close(
+            num_computed_tokens.cpu(), torch.tensor([6, 13], dtype=torch.int32)
+        )
 
 
 def test_common_attention_metadata_graph_unavailable_falls_back_to_eager(
@@ -361,6 +419,49 @@ def test_common_attention_metadata_graph_unavailable_falls_back_to_eager(
         torch.tensor([4, 10], dtype=torch.int32, device=device),
         rtol=0,
         atol=0,
+    )
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_common_metadata_cp_handles_multiple_token_chunks_and_padded_rows(
+    device, cp_rank
+):
+    table = MultiGroupBlockTable(
+        max_num_reqs=3,
+        max_model_len=16400,
+        max_num_batched_tokens=1100,
+        pin_memory=False,
+        device=device,
+        block_sizes=[16, 32],
+        kernel_block_sizes=[16, 32],
+        max_num_blocks=[1025, 513],
+        cp_kv_cache_interleave_size=2,
+    )
+    for group in table.block_tables:
+        group.block_table.cpu.fill_(7)
+        group.pcp_world_size = 2
+        group.pcp_rank = cp_rank
+        group.dcp_world_size = 1
+        group.dcp_rank = 0
+    table.commit_block_table(3)
+    query = torch.tensor([0, 1030, 1100, 1100], dtype=torch.int32, device=device)
+    positions = torch.cat((torch.arange(1030), torch.arange(70))).to(device)
+    seq_lens = torch.tensor([1100, 100, 0], dtype=torch.int32, device=device)
+    computed = torch.empty_like(seq_lens)
+
+    compute_common_attention_metadata(table, 3, query, positions, seq_lens, computed)
+    current_platform.torch_device_fn.synchronize()
+
+    for group, expected in zip(
+        table.block_tables, _expected_slots(table, query, positions)
+    ):
+        torch.testing.assert_close(
+            group.slot_mapping.gpu.cpu(), expected, rtol=0, atol=0
+        )
+        assert torch.all(group.block_table.gpu[2] == NULL_BLOCK_ID)
+        assert torch.all(group.block_table.gpu[:2] == 7)
+    torch.testing.assert_close(
+        computed.cpu(), torch.tensor([70, 30, 0], dtype=torch.int32)
     )
 
 
@@ -435,6 +536,7 @@ def test_dummy_capture_initializes_metadata_without_model_warmups(device, mode_n
         pytest.skip("Accelerator graph capture is unavailable")
     mode = getattr(CUDAGraphMode, mode_name)
     runner = object.__new__(ModelRunnerFL)
+    runner.use_ascend_attention = False
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(num_ubatches=1),
